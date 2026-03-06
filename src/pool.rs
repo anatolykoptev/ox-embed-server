@@ -15,11 +15,12 @@ pub fn build_tensors(
 
     for (i, enc) in encodings.iter().enumerate() {
         let token_ids = enc.get_ids();
+        let attn_mask = enc.get_attention_mask();
         let len = token_ids.len().min(max_seq);
         let offset = i * max_seq;
         for j in 0..len {
             ids[offset + j] = token_ids[j] as i64;
-            mask[offset + j] = 1;
+            mask[offset + j] = attn_mask[j] as i64;
         }
     }
 
@@ -37,10 +38,11 @@ pub fn build_mask_f32(
     let mut mask = vec![0.0f32; total];
 
     for (i, enc) in encodings.iter().enumerate() {
-        let len = enc.get_ids().len().min(max_seq);
+        let attn_mask = enc.get_attention_mask();
+        let len = attn_mask.len().min(max_seq);
         let offset = i * max_seq;
         for j in 0..len {
-            mask[offset + j] = 1.0;
+            mask[offset + j] = attn_mask[j] as f32;
         }
     }
     mask
@@ -69,7 +71,7 @@ pub fn mean_pool_normalize(
 
     for i in 0..batch {
         let mut vec = vec![0.0f32; dim];
-        let mut count = 0.0f32;
+        let mut count = 0.0f64; // f64 to match Go's float64 accumulation
 
         for j in 0..max_seq {
             let m = mask[[i, j]];
@@ -83,16 +85,19 @@ pub fn mean_pool_normalize(
 
         // Average over non-padded tokens.
         if count > 0.0 {
+            let inv = (1.0 / count) as f32;
             for v in &mut vec {
-                *v /= count;
+                *v *= inv;
             }
         }
 
-        // L2 normalize.
-        let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+        // L2 normalize (accumulate in f64 to match Go's math.Sqrt(float64)).
+        let sum_sq: f64 = vec.iter().map(|&x| (x as f64) * (x as f64)).sum();
+        let norm = sum_sq.sqrt();
         if norm > 0.0 {
+            let inv = (1.0 / norm) as f32;
             for v in &mut vec {
-                *v /= norm;
+                *v *= inv;
             }
         }
 
