@@ -1,21 +1,13 @@
 # --- Build stage ---
-FROM rust:1.87-slim AS builder
+FROM rust:1.93-slim AS builder
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends pkg-config libssl-dev && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-
-# Cache dependencies: copy manifests and fetch
-COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo "fn main(){}" > src/main.rs && \
-    cargo build --release 2>/dev/null || true && \
-    rm -rf src
-
-# Build actual binary
-COPY src/ src/
-RUN touch src/main.rs && cargo build --release
+COPY . .
+RUN cargo build --release
 
 # --- Runtime stage ---
 FROM debian:trixie-slim
