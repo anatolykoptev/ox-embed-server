@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.4
 # --- Build stage ---
 FROM rust:1.93-slim AS builder
 
@@ -6,8 +7,26 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY . .
-RUN cargo build --release
+
+# Layer 1: dep-only build (cached until Cargo.toml / Cargo.lock changes).
+# Pre-compiles all crates.io dependencies against a stub binary so that
+# source-code changes don't invalidate this layer.
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir -p src && echo "fn main() {}" > src/main.rs
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/app/target,sharing=locked \
+    cargo build --release --locked && \
+    rm -rf src
+
+# Layer 2: real source. Rebuilds only the embed-server crate on code changes.
+# The binary must be copied OUT of the cache-mounted target/ dir before the
+# RUN ends, or the layer loses it.
+COPY src ./src
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/app/target,sharing=locked \
+    touch src/main.rs && \
+    cargo build --release --locked --bin embed-server && \
+    cp target/release/embed-server /binary
 
 # --- Runtime stage ---
 FROM debian:trixie-slim
@@ -27,7 +46,7 @@ RUN ORT_VER="1.24.3" && \
     ldconfig && \
     rm -rf /tmp/ort.tgz /tmp/onnxruntime-linux-*
 
-COPY --from=builder /app/target/release/embed-server /usr/local/bin/
+COPY --from=builder /binary /usr/local/bin/embed-server
 
 ENV ORT_DYLIB_PATH=/usr/lib/libonnxruntime.so
 
