@@ -8,12 +8,33 @@ mod types;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
+use tokio::signal::unix::{SignalKind, signal};
+use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::model::EmbedModel;
 use crate::types::{AppState, ModelEntry};
+
+/// Waits for SIGTERM or SIGINT, then cancels the token and sleeps for drain_timeout
+/// to allow in-flight HTTP requests to complete before axum closes the listener.
+async fn shutdown_signal(token: CancellationToken, drain_timeout: Duration) {
+    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+    tokio::select! {
+        _ = term.recv() => tracing::info!("SIGTERM received, starting graceful shutdown"),
+        _ = int.recv()  => tracing::info!("SIGINT received, starting graceful shutdown"),
+    }
+    token.cancel();
+    // Give in-flight HTTP requests drain_timeout to complete naturally.
+    // After this future returns, axum stops accepting new connections; when
+    // the last handler finishes, Arc<AppState> drops → batcher workers exit.
+    tracing::info!(secs = drain_timeout.as_secs(), "draining in-flight requests");
+    tokio::time::sleep(drain_timeout).await;
+    tracing::info!("drain complete");
+}
 
 #[tokio::main]
 async fn main() {
@@ -79,9 +100,14 @@ async fn main() {
         "app state ready"
     );
 
+    let drain_timeout = Duration::from_secs(cfg.drain_timeout_s);
+    let shutdown_token = CancellationToken::new();
+
     let state = Arc::new(AppState {
         models: model_entries,
         default_model: cfg.default_model,
+        shutdown: shutdown_token.clone(),
+        drain_timeout,
     });
 
     let metrics_handle = prom_handle.clone();
@@ -106,5 +132,8 @@ async fn main() {
     tracing::info!(addr = %addr, "embed-server listening");
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(shutdown_token, drain_timeout))
+        .await
+        .unwrap();
 }

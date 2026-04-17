@@ -16,6 +16,21 @@ pub async fn embeddings(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EmbedRequest>,
 ) -> impl IntoResponse {
+    // Reject new requests while draining.
+    if state.shutdown.is_cancelled() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("retry-after", "5")],
+            Json(ErrorResponse {
+                error: ErrorDetail {
+                    message: "server shutting down".to_string(),
+                    error_type: "rate_limited",
+                },
+            }),
+        )
+            .into_response();
+    }
+
     let t0 = std::time::Instant::now();
     let mut status = "error";
     let mut texts_count: usize = 0;

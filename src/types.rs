@@ -1,10 +1,12 @@
 //! HTTP request/response types and shared application state.
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 use crate::batcher::DynamicBatcher;
 use crate::model::EmbedModel;
@@ -21,6 +23,11 @@ pub struct ModelEntry {
 pub struct AppState {
     pub models: HashMap<String, ModelEntry>,
     pub default_model: String,
+    /// Cancelled on SIGTERM/SIGINT; handlers check this to reject new requests.
+    pub shutdown: CancellationToken,
+    /// How long to wait for in-flight requests before axum stops the listener.
+    #[allow(dead_code)]
+    pub drain_timeout: Duration,
 }
 
 // --- Request types ---
