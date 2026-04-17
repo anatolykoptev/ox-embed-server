@@ -75,8 +75,11 @@ Loses coalescing + backpressure but keeps metrics + /health + graceful SIGTERM.
 docker compose up -d --no-deps --force-recreate embed-server
 ```
 
-Then re-deploy the old Python sidecar from `~/src/embed-jina` (archived
-commit history intact). No rebuild of embed-server needed.
+Then re-deploy the old Python sidecar from the archive:
+`git clone git@github.com:anatolykoptev/ox-embed-jina.git ~/src/embed-jina &&
+git -C ~/src/embed-jina checkout retired-2026-04-17` — this restores the
+full pre-retirement state (batcher, metrics, graceful shutdown all intact).
+No rebuild of embed-server needed.
 
 ### Revert to earlier commit
 
