@@ -1,12 +1,12 @@
 mod api;
 mod config;
+mod metrics;
 mod model;
 mod pool;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::routing::{get, post};
 use axum::Router;
 
 use crate::api::AppState;
@@ -34,6 +34,9 @@ async fn main() {
         std::process::exit(1);
     });
 
+    let version = std::env::var("EMBED_VERSION").unwrap_or_else(|_| "dev".into());
+    let prom_handle = std::sync::Arc::new(metrics::init(&version));
+
     let mut models = HashMap::new();
     for def in &cfg.models {
         tracing::info!(model = %def.name, dir = %def.dir, "loading model");
@@ -55,9 +58,22 @@ async fn main() {
         default_model: cfg.default_model,
     });
 
+    let metrics_handle = prom_handle.clone();
     let app = Router::new()
-        .route("/health", get(|| async { "ok" }))
-        .route("/v1/embeddings", post(api::embeddings))
+        .route("/health", axum::routing::get(|| async { "ok" }))
+        .route(
+            "/metrics",
+            axum::routing::get(move || {
+                let h = metrics_handle.clone();
+                async move {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+                        h.render(),
+                    )
+                }
+            }),
+        )
+        .route("/v1/embeddings", axum::routing::post(api::embeddings))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", cfg.port);

@@ -91,6 +91,10 @@ pub async fn embeddings(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EmbedRequest>,
 ) -> impl IntoResponse {
+    let t0 = std::time::Instant::now();
+    let mut status = "error";
+    let mut texts_count: usize = 0;
+
     let model_name = req
         .model
         .unwrap_or_else(|| state.default_model.clone());
@@ -98,24 +102,30 @@ pub async fn embeddings(
     let model = match state.models.get(&model_name) {
         Some(m) => Arc::clone(m),
         None => {
+            crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
             return error_json(format!("model '{model_name}' not found")).into_response();
         }
     };
 
     let texts = req.input.into_vec();
     if texts.is_empty() {
+        crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
         return error_json("input must not be empty").into_response();
     }
+    texts_count = texts.len();
 
     // Run inference in blocking task to avoid starving tokio.
+    let infer_start = std::time::Instant::now();
     let result = tokio::task::spawn_blocking(move || model.embed(&texts))
         .await
         .map_err(|e| format!("spawn: {e}"));
+    let infer_elapsed = infer_start.elapsed();
 
     let vectors = match result {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
             tracing::error!(error = %e, "embed failed");
+            crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
@@ -128,6 +138,7 @@ pub async fn embeddings(
                 .into_response();
         }
         Err(e) => {
+            crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
@@ -141,6 +152,9 @@ pub async fn embeddings(
         }
     };
 
+    crate::metrics::record_inference(&model_name, infer_elapsed, vectors.len());
+    status = "ok";
+
     let data: Vec<EmbedData> = vectors
         .into_iter()
         .enumerate()
@@ -151,6 +165,7 @@ pub async fn embeddings(
         })
         .collect();
 
+    crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
     Json(EmbedResponse {
         object: "list",
         data,

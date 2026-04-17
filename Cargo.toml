@@ -14,3 +14,5 @@ ndarray = "0.17"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.17", default-features = false }
