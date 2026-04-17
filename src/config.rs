@@ -16,6 +16,13 @@ pub struct Config {
     pub models: Vec<ModelDef>,
     pub default_model: String,
     pub intra_threads: usize,
+    pub batching_enabled: bool,
+    pub batch_max: usize,
+    pub batch_wait_ms: u64,
+    pub max_queue_size: usize,
+    /// Graceful drain timeout for future shutdown support.
+    #[allow(dead_code)]
+    pub drain_timeout_s: u64,
 }
 
 impl Config {
@@ -53,7 +60,42 @@ impl Config {
             .parse::<usize>()
             .map_err(|e| format!("invalid EMBED_INTRA_THREADS: {e}"))?;
 
-        Ok(Config { port, models, default_model, intra_threads })
+        let batching_enabled = env::var("BATCHING_ENABLED")
+            .ok()
+            .map(|s| s.eq_ignore_ascii_case("true") || s == "1")
+            .unwrap_or(false);
+
+        let batch_max = env::var("BATCH_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(32usize);
+
+        let batch_wait_ms = env::var("BATCH_WAIT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10u64);
+
+        let max_queue_size = env::var("MAX_QUEUE_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(256usize);
+
+        let drain_timeout_s = env::var("DRAIN_TIMEOUT_S")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10u64);
+
+        Ok(Config {
+            port,
+            models,
+            default_model,
+            intra_threads,
+            batching_enabled,
+            batch_max,
+            batch_wait_ms,
+            max_queue_size,
+            drain_timeout_s,
+        })
     }
 }
 

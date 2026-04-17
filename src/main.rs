@@ -4,15 +4,16 @@ mod config;
 mod metrics;
 mod model;
 mod pool;
+mod types;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::Router;
 
-use crate::api::AppState;
 use crate::config::Config;
 use crate::model::EmbedModel;
+use crate::types::{AppState, ModelEntry};
 
 #[tokio::main]
 async fn main() {
@@ -38,24 +39,48 @@ async fn main() {
     let version = std::env::var("EMBED_VERSION").unwrap_or_else(|_| "dev".into());
     let prom_handle = std::sync::Arc::new(metrics::init(&version));
 
-    let mut models = HashMap::new();
+    let mut raw_models: HashMap<String, Arc<EmbedModel>> = HashMap::new();
     for def in &cfg.models {
         tracing::info!(model = %def.name, dir = %def.dir, "loading model");
         let m = EmbedModel::load(def, cfg.intra_threads).unwrap_or_else(|e| {
             eprintln!("failed to load model '{}': {e}", def.name);
             std::process::exit(1);
         });
-        models.insert(def.name.clone(), Arc::new(m));
+        raw_models.insert(def.name.clone(), Arc::new(m));
     }
 
     tracing::info!(
-        models = models.len(),
+        models = raw_models.len(),
         default = %cfg.default_model,
         "all models loaded"
     );
 
+    let mut model_entries: HashMap<String, ModelEntry> = HashMap::new();
+    for (name, model_arc) in raw_models {
+        let batcher = if cfg.batching_enabled {
+            let m = model_arc.clone();
+            let b = batcher::DynamicBatcher::with_name(
+                &name,
+                move |texts| m.embed(&texts),
+                cfg.batch_max,
+                cfg.batch_wait_ms,
+                cfg.max_queue_size,
+            );
+            Some(Arc::new(b))
+        } else {
+            None
+        };
+        model_entries.insert(name, ModelEntry { model: model_arc, batcher });
+    }
+
+    tracing::info!(
+        batching_enabled = cfg.batching_enabled,
+        models = model_entries.len(),
+        "app state ready"
+    );
+
     let state = Arc::new(AppState {
-        models,
+        models: model_entries,
         default_model: cfg.default_model,
     });
 
