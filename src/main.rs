@@ -15,7 +15,13 @@ use crate::model::EmbedModel;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt().json().init();
+    tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,ort::logging=warn".parse().unwrap()),
+        )
+        .init();
 
     // Initialize ort runtime explicitly (required for load-dynamic).
     if !ort::init().commit() {
@@ -31,7 +37,7 @@ async fn main() {
     let mut models = HashMap::new();
     for def in &cfg.models {
         tracing::info!(model = %def.name, dir = %def.dir, "loading model");
-        let m = EmbedModel::load(def).unwrap_or_else(|e| {
+        let m = EmbedModel::load(def, cfg.intra_threads).unwrap_or_else(|e| {
             eprintln!("failed to load model '{}': {e}", def.name);
             std::process::exit(1);
         });

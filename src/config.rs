@@ -15,6 +15,7 @@ pub struct Config {
     pub port: u16,
     pub models: Vec<ModelDef>,
     pub default_model: String,
+    pub intra_threads: usize,
 }
 
 impl Config {
@@ -47,7 +48,12 @@ impl Config {
             ));
         }
 
-        Ok(Config { port, models, default_model })
+        let intra_threads = env::var("EMBED_INTRA_THREADS")
+            .unwrap_or_else(|_| "4".into())
+            .parse::<usize>()
+            .map_err(|e| format!("invalid EMBED_INTRA_THREADS: {e}"))?;
+
+        Ok(Config { port, models, default_model, intra_threads })
     }
 }
 

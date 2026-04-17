@@ -27,25 +27,9 @@ pub fn build_tensors(
     (ids, mask, tti)
 }
 
-/// Build f32 attention mask for mean pooling.
-pub fn build_mask_f32(
-    encodings: &[Encoding],
-    batch: usize,
-    max_seq: usize,
-    _pad_id: u32,
-) -> Vec<f32> {
-    let total = batch * max_seq;
-    let mut mask = vec![0.0f32; total];
-
-    for (i, enc) in encodings.iter().enumerate() {
-        let attn_mask = enc.get_attention_mask();
-        let len = attn_mask.len().min(max_seq);
-        let offset = i * max_seq;
-        for j in 0..len {
-            mask[offset + j] = attn_mask[j] as f32;
-        }
-    }
-    mask
+/// Convert i64 attention mask to f32 for mean pooling.
+pub fn mask_i64_to_f32(mask_i64: &[i64]) -> Vec<f32> {
+    mask_i64.iter().map(|&v| v as f32).collect()
 }
 
 /// Mean-pool over non-padded tokens and L2-normalize each vector.

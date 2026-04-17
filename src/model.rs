@@ -22,7 +22,7 @@ pub struct EmbedModel {
 impl EmbedModel {
     /// Load model from a directory containing model_quantized.onnx
     /// and tokenizer.json.
-    pub fn load(def: &ModelDef) -> Result<Self, String> {
+    pub fn load(def: &ModelDef, intra_threads: usize) -> Result<Self, String> {
         let dir = Path::new(&def.dir);
 
         let onnx_path = dir.join("model_quantized.onnx");
@@ -41,7 +41,7 @@ impl EmbedModel {
         tracing::info!(path = %onnx_path.display(), "creating ONNX session");
         let session = Session::builder()
             .map_err(|e| format!("session builder: {e}"))?
-            .with_intra_threads(4)
+            .with_intra_threads(intra_threads)
             .map_err(|e| format!("set threads: {e}"))?
             .commit_from_file(&onnx_path)
             .map_err(|e| format!("load ONNX {}: {e}", onnx_path.display()))?;
@@ -91,12 +91,12 @@ impl EmbedModel {
             .min(self.max_len);
 
         let batch = encodings.len();
-        let (ids, mask, tti) =
+        let (ids, mask_i64, tti) =
             pool::build_tensors(&encodings, batch, max_seq, self.pad_id);
 
         let ids_arr = Array2::from_shape_vec([batch, max_seq], ids)
             .map_err(|e| format!("ids shape: {e}"))?;
-        let mask_arr = Array2::from_shape_vec([batch, max_seq], mask)
+        let mask_arr = Array2::from_shape_vec([batch, max_seq], mask_i64.clone())
             .map_err(|e| format!("mask shape: {e}"))?;
 
         let ids_tensor = Tensor::from_array(ids_arr)
@@ -104,27 +104,25 @@ impl EmbedModel {
         let mask_tensor = Tensor::from_array(mask_arr)
             .map_err(|e| format!("mask tensor: {e}"))?;
 
-        let inputs = if self.has_token_type_ids {
+        let mut session = self.session.lock().map_err(|e| format!("lock: {e}"))?;
+
+        let outputs = if self.has_token_type_ids {
             let tti_arr = Array2::from_shape_vec([batch, max_seq], tti)
                 .map_err(|e| format!("tti shape: {e}"))?;
             let tti_tensor = Tensor::from_array(tti_arr)
                 .map_err(|e| format!("tti tensor: {e}"))?;
-            ort::inputs! {
+            session.run(ort::inputs! {
                 "input_ids" => ids_tensor,
                 "attention_mask" => mask_tensor,
                 "token_type_ids" => tti_tensor,
-            }
+            })
         } else {
-            ort::inputs! {
+            session.run(ort::inputs! {
                 "input_ids" => ids_tensor,
                 "attention_mask" => mask_tensor,
-            }
-        };
-
-        let mut session = self.session.lock().map_err(|e| format!("lock: {e}"))?;
-        let outputs = session
-            .run(inputs)
-            .map_err(|e| format!("inference: {e}"))?;
+            })
+        }
+        .map_err(|e| format!("inference: {e}"))?;
 
         // Output shape: [batch, seq_len, dim]
         let raw = outputs[0]
@@ -133,7 +131,7 @@ impl EmbedModel {
 
         let mask_arr_f = Array2::from_shape_vec(
             [batch, max_seq],
-            pool::build_mask_f32(&encodings, batch, max_seq, self.pad_id),
+            pool::mask_i64_to_f32(&mask_i64),
         )
         .map_err(|e| format!("mask_f shape: {e}"))?;
 
