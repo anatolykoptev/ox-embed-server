@@ -1,4 +1,5 @@
 mod api;
+mod batcher;
 mod config;
 mod metrics;
 mod model;
