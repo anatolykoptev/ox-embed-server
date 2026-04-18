@@ -97,6 +97,9 @@ async fn run_worker(mut rx: mpsc::Receiver<Item>, embed_fn: EmbedFn, name: Arc<S
             let rem = deadline.checked_duration_since(Instant::now()).unwrap_or(Duration::ZERO);
             match tokio::time::timeout(rem, rx.recv()).await {
                 Ok(Some(item)) if cum + item.texts.len() <= max_batch => {
+                    // Client disconnected before the batch window closed — skip this item
+                    // without charging its tokens to the batch budget. Best-effort: the
+                    // sender may still close between this check and dispatch, and that's fine.
                     if item.reply.is_closed() { continue; }
                     cum += item.texts.len();
                     batch.push(item);
@@ -109,6 +112,8 @@ async fn run_worker(mut rx: mpsc::Receiver<Item>, embed_fn: EmbedFn, name: Arc<S
                 _ => break,
             }
         }
+        // Second check: sender may have closed during the coalesce window.
+        // Best-effort; see above.
         batch.retain(|it| !it.reply.is_closed());
         if batch.is_empty() { continue; }
         dispatch_batch(batch, embed_fn.clone(), name.clone()).await;
