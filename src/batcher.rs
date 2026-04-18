@@ -102,6 +102,27 @@ impl DynamicBatcher {
         drop(sender);
         let _ = tokio::time::timeout(timeout, worker).await;
     }
+
+    /// Test-only: enqueue an item with a caller-supplied reply sender.
+    ///
+    /// Lets tests construct requests whose reply channel is already closed
+    /// (by dropping the matching receiver before dispatch), so the
+    /// cancellation path can be exercised without relying on `JoinHandle::abort`
+    /// racing with the worker's `rx.recv`.
+    #[cfg(test)]
+    fn enqueue_for_test(
+        &self,
+        texts: Vec<String>,
+        reply: oneshot::Sender<Result<Vec<Vec<f32>>, String>>,
+    ) -> Result<(), BatchError> {
+        self.sender
+            .try_send(Item { texts, reply })
+            .map_err(|_| {
+                BatchError::QueueFull(QueueFullError {
+                    batcher_name: self.name.as_ref().clone(),
+                })
+            })
+    }
 }
 
 type EmbedFn = Arc<dyn Fn(Vec<String>) -> Result<Vec<Vec<f32>>, String> + Send + Sync + 'static>;
@@ -411,20 +432,29 @@ mod tests {
             50,
             16,
         ));
-        // Spawn a request, abort its JoinHandle before the batch window closes.
-        let b1 = b.clone();
-        let aborted = tokio::spawn(async move { b1.embed(vec!["cancelled".into()]).await });
-        // Give it a moment to enter the worker's inner loop, then abort.
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        aborted.abort();
-        // Wait for the batch window (50ms) to elapse so the worker dispatches.
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        // Second, healthy, request.
+
+        // Deterministic cancellation: build a oneshot pair, drop the receiver
+        // immediately so `reply.is_closed()` is true before the worker ever
+        // sees the item. No timing assumptions — the worker MUST see the
+        // closed reply by the time it dispatches.
+        let (cancelled_tx, cancelled_rx) = oneshot::channel();
+        drop(cancelled_rx);
+        assert!(
+            cancelled_tx.is_closed(),
+            "precondition: dropping rx should close tx"
+        );
+        b.enqueue_for_test(vec!["cancelled".into()], cancelled_tx)
+            .expect("enqueue cancelled item");
+
+        // Live request. Awaiting its result guarantees the worker has
+        // processed the queue past the cancelled item; whether the two
+        // coalesce into one batch or dispatch separately, the cancelled
+        // item is always dropped by `reply.is_closed()` checks.
         let r = b.embed(vec!["alive".into()]).await.unwrap();
         assert_eq!(r.len(), 1);
-        // Inference should have run ONLY for the second "alive" text (1 total).
-        // Pre-fix: count == 2.
-        // Post-fix: count == 1.
+
+        // Inference should have run ONLY for the live "alive" text (1 total).
+        // Pre-fix: count == 2. Post-fix: count == 1.
         assert_eq!(
             call_count.load(Ordering::SeqCst),
             1,
