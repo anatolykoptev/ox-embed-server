@@ -76,6 +76,19 @@ pub fn record_queue_rejected(model: &str) {
     .increment(1);
 }
 
+/// Increment count of batcher items skipped because the caller's reply
+/// channel was already closed (client disconnected before dispatch).
+///
+/// Call once per skipped item — both at the inner coalesce check and the
+/// pre-dispatch `retain` pass in `batcher::run_worker`.
+pub fn record_cancelled(model: &str) {
+    metrics::counter!(
+        "embed_batcher_cancelled_items_total",
+        "model" => model.to_string()
+    )
+    .increment(1);
+}
+
 /// Set current queue depth (will be used in R5/R6).
 #[allow(dead_code)]
 pub fn set_queue_depth(model: &str, depth: usize) {

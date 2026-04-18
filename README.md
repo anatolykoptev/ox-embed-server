@@ -60,6 +60,7 @@ Environment variables (parsed in `src/config.rs`):
 | `DRAIN_TIMEOUT_S` | `10` | SIGTERM drain window. |
 | `ORT_DYLIB_PATH` | `/usr/lib/libonnxruntime.so` | Required with `load-dynamic`. |
 | `EMBED_VERSION` | `dev` | Stamped into `embed_build_info`. |
+| `AUTO_TRUNCATE` | `true` | TEI-compat. Only literal `false` (case-insensitive) disables; `0`/`no`/`off`/empty leave it enabled. |
 
 Current production `EMBED_MODELS`:
 

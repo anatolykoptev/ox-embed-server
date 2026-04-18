@@ -102,6 +102,25 @@ impl DynamicBatcher {
         drop(sender);
         let _ = tokio::time::timeout(timeout, worker).await;
     }
+
+    /// Test-only: enqueue an item with a caller-supplied reply sender.
+    ///
+    /// Lets tests construct requests whose reply channel is already closed
+    /// (by dropping the matching receiver before dispatch), so the
+    /// cancellation path can be exercised without relying on `JoinHandle::abort`
+    /// racing with the worker's `rx.recv`.
+    #[cfg(test)]
+    fn enqueue_for_test(
+        &self,
+        texts: Vec<String>,
+        reply: oneshot::Sender<Result<Vec<Vec<f32>>, String>>,
+    ) -> Result<(), BatchError> {
+        self.sender.try_send(Item { texts, reply }).map_err(|_| {
+            BatchError::QueueFull(QueueFullError {
+                batcher_name: self.name.as_ref().clone(),
+            })
+        })
+    }
 }
 
 type EmbedFn = Arc<dyn Fn(Vec<String>) -> Result<Vec<Vec<f32>>, String> + Send + Sync + 'static>;
@@ -138,6 +157,7 @@ async fn run_worker(
                     // without charging its tokens to the batch budget. Best-effort: the
                     // sender may still close between this check and dispatch, and that's fine.
                     if item.reply.is_closed() {
+                        crate::metrics::record_cancelled(&name);
                         continue;
                     }
                     cum += item.texts.len();
@@ -153,6 +173,10 @@ async fn run_worker(
         }
         // Second check: sender may have closed during the coalesce window.
         // Best-effort; see above.
+        let cancelled_at_dispatch = batch.iter().filter(|it| it.reply.is_closed()).count();
+        for _ in 0..cancelled_at_dispatch {
+            crate::metrics::record_cancelled(&name);
+        }
         batch.retain(|it| !it.reply.is_closed());
         if batch.is_empty() {
             continue;
@@ -200,7 +224,21 @@ async fn dispatch_batch(items: Vec<Item>, embed_fn: EmbedFn, name: Arc<String>) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, OnceLock};
+
+    use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+
+    /// Install a Prometheus recorder the first time it's needed and cache
+    /// its handle. Subsequent calls return the same handle; the global
+    /// `metrics` recorder can only be installed once per process.
+    fn test_prometheus_handle() -> &'static PrometheusHandle {
+        static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+        HANDLE.get_or_init(|| {
+            PrometheusBuilder::new()
+                .install_recorder()
+                .expect("install Prometheus recorder for tests")
+        })
+    }
 
     fn log_batcher(
         name: &str,
@@ -411,20 +449,29 @@ mod tests {
             50,
             16,
         ));
-        // Spawn a request, abort its JoinHandle before the batch window closes.
-        let b1 = b.clone();
-        let aborted = tokio::spawn(async move { b1.embed(vec!["cancelled".into()]).await });
-        // Give it a moment to enter the worker's inner loop, then abort.
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        aborted.abort();
-        // Wait for the batch window (50ms) to elapse so the worker dispatches.
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        // Second, healthy, request.
+
+        // Deterministic cancellation: build a oneshot pair, drop the receiver
+        // immediately so `reply.is_closed()` is true before the worker ever
+        // sees the item. No timing assumptions — the worker MUST see the
+        // closed reply by the time it dispatches.
+        let (cancelled_tx, cancelled_rx) = oneshot::channel();
+        drop(cancelled_rx);
+        assert!(
+            cancelled_tx.is_closed(),
+            "precondition: dropping rx should close tx"
+        );
+        b.enqueue_for_test(vec!["cancelled".into()], cancelled_tx)
+            .expect("enqueue cancelled item");
+
+        // Live request. Awaiting its result guarantees the worker has
+        // processed the queue past the cancelled item; whether the two
+        // coalesce into one batch or dispatch separately, the cancelled
+        // item is always dropped by `reply.is_closed()` checks.
         let r = b.embed(vec!["alive".into()]).await.unwrap();
         assert_eq!(r.len(), 1);
-        // Inference should have run ONLY for the second "alive" text (1 total).
-        // Pre-fix: count == 2.
-        // Post-fix: count == 1.
+
+        // Inference should have run ONLY for the live "alive" text (1 total).
+        // Pre-fix: count == 2. Post-fix: count == 1.
         assert_eq!(
             call_count.load(Ordering::SeqCst),
             1,
@@ -436,5 +483,60 @@ mod tests {
             .expect("still has clones")
             .shutdown(Duration::from_millis(200))
             .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_items_increment_metric() {
+        let handle = test_prometheus_handle();
+        // Unique model name so the counter can be grepped in Prometheus
+        // exposition text without colliding with other tests.
+        let model = "t_cancel_metric";
+        let b = Arc::new(DynamicBatcher::with_name(
+            model,
+            |t: Vec<String>| Ok(t.iter().map(|_| vec![0.0f32; 4]).collect()),
+            32,
+            50,
+            16,
+        ));
+
+        // Snapshot the counter before we do anything.
+        let before = read_cancelled_counter(&handle.render(), model);
+
+        // Two cancelled items + one live item.
+        for _ in 0..2 {
+            let (tx, rx) = oneshot::channel();
+            drop(rx);
+            b.enqueue_for_test(vec!["cancelled".into()], tx)
+                .expect("enqueue");
+        }
+        let r = b.embed(vec!["alive".into()]).await.unwrap();
+        assert_eq!(r.len(), 1);
+
+        let after = read_cancelled_counter(&handle.render(), model);
+        assert_eq!(
+            after - before,
+            2,
+            "expected counter to increment by 2, went {before} -> {after}"
+        );
+
+        Arc::try_unwrap(b)
+            .ok()
+            .expect("still has clones")
+            .shutdown(Duration::from_millis(200))
+            .await;
+    }
+
+    /// Parse a specific `embed_batcher_cancelled_items_total{model="..."} N`
+    /// line out of a Prometheus text-exposition render. Returns 0 if the
+    /// metric isn't present yet (counter hasn't been touched for this model).
+    fn read_cancelled_counter(rendered: &str, model: &str) -> u64 {
+        let needle = format!("model=\"{model}\"");
+        rendered
+            .lines()
+            .filter(|l| l.starts_with("embed_batcher_cancelled_items_total"))
+            .find(|l| l.contains(&needle))
+            .and_then(|l| l.rsplit_once(' '))
+            .and_then(|(_, v)| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
     }
 }
