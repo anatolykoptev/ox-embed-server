@@ -23,8 +23,7 @@ pub struct Config {
     pub batch_max: usize,
     /// Primary batch budget: maximum total tokens per dispatched batch.
     /// Counted with padded-model accounting — see `DynamicBatcher::with_tokens`.
-    /// Default 16384 (TEI). Wired into the batcher in Phase B3.
-    #[allow(dead_code)]
+    /// Default 16384 (TEI).
     pub batch_max_tokens: usize,
     pub batch_wait_ms: u64,
     pub max_queue_size: usize,
