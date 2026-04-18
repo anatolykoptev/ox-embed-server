@@ -1,5 +1,7 @@
 mod api;
 mod batcher;
+mod cache;
+mod cache_flow;
 mod config;
 mod metrics;
 mod model;
@@ -14,6 +16,7 @@ use axum::Router;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_util::sync::CancellationToken;
 
+use crate::cache::EmbeddingCache;
 use crate::config::Config;
 use crate::model::EmbedModel;
 use crate::types::{AppState, ModelEntry};
@@ -118,11 +121,22 @@ async fn main() {
     let drain_timeout = Duration::from_secs(cfg.drain_timeout_s);
     let shutdown_token = CancellationToken::new();
 
+    // Process-local response cache sized from CACHE_MAX_ENTRIES (default
+    // 10_000). Setting CACHE_MAX_ENTRIES=0 produces a disabled shell
+    // (get/insert are no-ops) — the documented runtime kill-switch.
+    let cache = Arc::new(EmbeddingCache::new(cfg.cache_max_entries));
+    tracing::info!(
+        cache_max_entries = cfg.cache_max_entries,
+        cache_enabled = cache.is_enabled(),
+        "response cache ready"
+    );
+
     let state = Arc::new(AppState {
         models: model_entries,
         default_model: cfg.default_model,
         shutdown: shutdown_token.clone(),
         drain_timeout,
+        cache,
     });
 
     let metrics_handle = prom_handle.clone();

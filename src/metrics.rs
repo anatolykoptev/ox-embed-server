@@ -141,3 +141,35 @@ pub fn record_carry(model: &str) {
     )
     .increment(1);
 }
+
+/// Increment embedding-cache hit counter (one per request position; same
+/// text at N positions counts as N hits, matching the "positions-in-request"
+/// semantic used for miss accounting).
+pub fn record_cache_hit(model: &str) {
+    metrics::counter!(
+        "embed_cache_hit_total",
+        "model" => model.to_string()
+    )
+    .increment(1);
+}
+
+/// Increment embedding-cache miss counter (one per request position;
+/// duplicates-within-request count as multiple misses so hit ratio is
+/// measured per-text-in-request, not per-unique-text).
+pub fn record_cache_miss(model: &str) {
+    metrics::counter!(
+        "embed_cache_miss_total",
+        "model" => model.to_string()
+    )
+    .increment(1);
+}
+
+/// Set the current embedding-cache entry count.
+///
+/// Intentionally unlabelled (global gauge): the cache is keyed by
+/// `(model, text)` so a per-model size would require iterating the LRU
+/// each update. A single global counter updated on insert is cheap and
+/// sufficient for capacity monitoring.
+pub fn set_cache_size(size: usize) {
+    metrics::gauge!("embed_cache_size").set(size as f64);
+}

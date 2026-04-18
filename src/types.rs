@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::batcher::DynamicBatcher;
+use crate::cache::EmbeddingCache;
 use crate::model::EmbedModel;
 
 // --- State ---
@@ -28,6 +29,9 @@ pub struct AppState {
     /// How long to wait for in-flight requests before axum stops the listener.
     #[allow(dead_code)]
     pub drain_timeout: Duration,
+    /// Process-local LRU cache for deterministic embedding lookups.
+    /// Disabled (no-op) when constructed with capacity 0.
+    pub cache: Arc<EmbeddingCache>,
 }
 
 // --- Request types ---

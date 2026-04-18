@@ -6,6 +6,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 
+use crate::cache_flow::partition_hits_and_misses;
 use crate::types::{
     AppState, EmbedData, EmbedRequest, EmbedResponse, ErrorDetail, ErrorResponse, Usage, error_json,
 };
@@ -49,18 +50,69 @@ pub async fn embeddings(
         crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
         return error_json("input must not be empty").into_response();
     }
+    // Capture the original request size — this is what clients asked for
+    // and what `embed_texts_per_request` must reflect, regardless of how
+    // many turn into cache hits vs. misses.
     texts_count = texts.len();
 
-    // Tokenize before the batch path so the batcher can account for
-    // token counts (Phase B token-budget accounting) and to keep the
-    // blocking ONNX thread focused purely on inference.
+    // -- Cache partition pass --
     //
-    // Run on spawn_blocking: tokenization is CPU-bound and was the last
-    // sync path left on the tokio reactor. Under concurrent load, workers
-    // contended for CPU here, the batcher's 10ms window closed before
-    // stragglers arrived, and batches collapsed to single-item.
+    // Probe the response cache for each text and split into:
+    //   cached[i]  : Some(vec) for hits, None for misses.
+    //   pending    : text → positions-to-scatter, deduplicated across
+    //                the request (same text at multiple positions → one
+    //                entry with many positions).
+    //
+    // Hit/miss metrics are recorded per-original-position (duplicates
+    // count as multiple misses) so the hit ratio is per-text-in-request.
+    let (mut cached, pending) = partition_hits_and_misses(&state.cache, &model_name, &texts);
+
+    let hit_count = cached.iter().filter(|c| c.is_some()).count();
+    for _ in 0..hit_count {
+        crate::metrics::record_cache_hit(&model_name);
+    }
+    let miss_positions_total: usize = pending.values().map(Vec::len).sum();
+    for _ in 0..miss_positions_total {
+        crate::metrics::record_cache_miss(&model_name);
+    }
+
+    // All-hit short-circuit: every position served from cache, no
+    // tokenize or inference needed. Still records request-level metrics.
+    if pending.is_empty() {
+        let vectors: Vec<Vec<f32>> = cached.into_iter().map(|o| o.expect("all hits")).collect();
+        status = "ok";
+        crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
+        return Json(EmbedResponse {
+            object: "list",
+            data: vectors
+                .into_iter()
+                .enumerate()
+                .map(|(i, emb)| EmbedData {
+                    object: "embedding",
+                    embedding: emb,
+                    index: i,
+                })
+                .collect(),
+            model: model_name,
+            usage: Usage {
+                prompt_tokens: 0,
+                total_tokens: 0,
+            },
+        })
+        .into_response();
+    }
+
+    // Only the unique miss texts are tokenized + embedded. `pending_texts`
+    // is the aligned key order we'll use to zip miss vectors back to
+    // original positions.
+    let pending_texts: Vec<String> = pending.keys().cloned().collect();
+    let tokenize_input = pending_texts.clone();
+
+    // Tokenize only the unique miss texts. Runs on spawn_blocking because
+    // tokenization is CPU-bound and used to contend with the async runtime.
     let model = entry.model.clone();
-    let token_ids = match tokio::task::spawn_blocking(move || model.tokenize(&texts)).await {
+    let token_ids = match tokio::task::spawn_blocking(move || model.tokenize(&tokenize_input)).await
+    {
         Ok(Ok(ids)) => ids,
         Ok(Err(e)) => {
             tracing::error!(error = %e, "tokenize failed");
@@ -93,8 +145,13 @@ pub async fn embeddings(
     };
 
     // Run inference via batcher (if enabled) or legacy spawn_blocking path.
+    // Only the miss set flows through here.
+    //
+    // Cache inserts happen AFTER successful inference — if any error path
+    // below is taken, we never populate the cache with a partial result.
+    //
     // Note: batcher already calls record_inference inside dispatch_batch — do not call it here.
-    let vectors = if let Some(b) = &entry.batcher {
+    let miss_vectors = if let Some(b) = &entry.batcher {
         match b.embed_tokens(token_ids).await {
             Ok(v) => v,
             Err(crate::batcher::BatchError::QueueFull(e)) => {
@@ -184,6 +241,49 @@ pub async fn embeddings(
             }
         }
     };
+
+    // Sanity: inference returned exactly one vector per unique miss text.
+    // A length mismatch would indicate a batcher bug; fail loudly rather
+    // than silently producing a wrong response.
+    if miss_vectors.len() != pending_texts.len() {
+        tracing::error!(
+            expected = pending_texts.len(),
+            got = miss_vectors.len(),
+            "miss vector count mismatch"
+        );
+        crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: ErrorDetail {
+                    message: "internal error: vector count mismatch".to_string(),
+                    error_type: "server_error",
+                },
+            }),
+        )
+            .into_response();
+    }
+
+    // Scatter each miss vector into every original position it fills,
+    // and insert into the cache for future requests.
+    for (pending_text, vec) in pending_texts.iter().zip(miss_vectors) {
+        state.cache.insert(&model_name, pending_text, vec.clone());
+        let positions = pending
+            .get(pending_text)
+            .expect("pending_text came from pending.keys()");
+        for &pos in positions {
+            cached[pos] = Some(vec.clone());
+        }
+    }
+    // Refresh the cache-size gauge once per request after the insert
+    // batch settles. Single call after all inserts avoids N lock+read
+    // cycles — LRU size is monotone within a request (only grows).
+    crate::metrics::set_cache_size(state.cache.len());
+
+    let vectors: Vec<Vec<f32>> = cached
+        .into_iter()
+        .map(|o| o.expect("every position filled"))
+        .collect();
 
     status = "ok";
 
