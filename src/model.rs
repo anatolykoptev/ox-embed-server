@@ -197,15 +197,30 @@ mod truncation_tests {
     use super::*;
     use tokenizers::Tokenizer;
 
-    /// Load the real e5 tokenizer.json if present; skip test otherwise so
-    /// the suite still passes on dev boxes without the model bundle.
+    /// Load a real e5-compatible tokenizer.json for truncation tests.
+    ///
+    /// Path resolution order:
+    /// 1. `E5_TOKENIZER_PATH` env var (lets CI / other dev boxes point at
+    ///    wherever they've staged the model bundle).
+    /// 2. Default on-box path
+    ///    `/home/krolik/deploy/krolik-server/models/multilingual-e5-large/tokenizer.json`.
+    ///
+    /// When neither exists, the test returns `None` and the caller
+    /// early-returns after printing a visible skip notice. The skip line
+    /// is loud on purpose so the test doesn't silently vanish from CI
+    /// output the way `#[ignore]` would.
     fn load_tokenizer_or_skip() -> Option<Tokenizer> {
-        let p = "/home/krolik/deploy/krolik-server/models/multilingual-e5-large/tokenizer.json";
-        if !std::path::Path::new(p).exists() {
-            eprintln!("skipping: tokenizer.json not at {p}");
+        const DEFAULT_PATH: &str =
+            "/home/krolik/deploy/krolik-server/models/multilingual-e5-large/tokenizer.json";
+        let p = std::env::var("E5_TOKENIZER_PATH").unwrap_or_else(|_| DEFAULT_PATH.to_string());
+        if !std::path::Path::new(&p).exists() {
+            eprintln!(
+                "SKIP truncation test: tokenizer.json not found at {p} \
+                 (set E5_TOKENIZER_PATH to override)"
+            );
             return None;
         }
-        Some(Tokenizer::from_file(p).expect("load tokenizer"))
+        Some(Tokenizer::from_file(&p).expect("load tokenizer"))
     }
 
     #[test]
