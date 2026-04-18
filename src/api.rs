@@ -54,9 +54,15 @@ pub async fn embeddings(
     // Tokenize before the batch path so the batcher can account for
     // token counts (Phase B token-budget accounting) and to keep the
     // blocking ONNX thread focused purely on inference.
-    let token_ids = match entry.model.tokenize(&texts) {
-        Ok(ids) => ids,
-        Err(e) => {
+    //
+    // Run on spawn_blocking: tokenization is CPU-bound and was the last
+    // sync path left on the tokio reactor. Under concurrent load, workers
+    // contended for CPU here, the batcher's 10ms window closed before
+    // stragglers arrived, and batches collapsed to single-item.
+    let model = entry.model.clone();
+    let token_ids = match tokio::task::spawn_blocking(move || model.tokenize(&texts)).await {
+        Ok(Ok(ids)) => ids,
+        Ok(Err(e)) => {
             tracing::error!(error = %e, "tokenize failed");
             crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
             return (
@@ -64,7 +70,21 @@ pub async fn embeddings(
                 Json(ErrorResponse {
                     error: ErrorDetail {
                         message: e,
-                        error_type: "invalid_request_error",
+                        error_type: "server_error",
+                    },
+                }),
+            )
+                .into_response();
+        }
+        Err(join_err) => {
+            tracing::error!(error = %join_err, "tokenize task panicked");
+            crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: ErrorDetail {
+                        message: format!("tokenize task panicked: {join_err}"),
+                        error_type: "server_error",
                     },
                 }),
             )
