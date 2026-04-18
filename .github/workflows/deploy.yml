@@ -1,0 +1,81 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Dockerfile'
+      - '.dockerignore'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-embed-server
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          cat > ~/.ssh/config <<EOF
+          Host server
+            HostName $SSH_HOST
+            User $SSH_USER
+            IdentityFile ~/.ssh/id_ed25519
+            StrictHostKeyChecking no
+          EOF
+
+      - name: Pull latest source on server
+        run: |
+          ssh server 'cd /home/krolik/src/embed-server && git fetch --prune origin && git reset --hard origin/main && git log -1 --oneline'
+
+      - name: Rebuild and restart embed-server container
+        run: |
+          ssh server '
+            cd /home/krolik/krolik-server
+            docker compose build embed-server
+            docker compose up -d embed-server
+          '
+
+      - name: Wait for health
+        run: |
+          ssh server '
+            for i in $(seq 1 30); do
+              status=$(docker inspect -f "{{.State.Health.Status}}" embed-server 2>/dev/null || echo "missing")
+              echo "[attempt $i] container health: $status"
+              if [ "$status" = "healthy" ]; then exit 0; fi
+              sleep 2
+            done
+            echo "embed-server did not become healthy in time"
+            docker logs embed-server --tail 60
+            exit 1
+          '
+
+      - name: Smoke test /v1/embeddings
+        run: |
+          ssh server '
+            body=$(curl -sf -X POST http://127.0.0.1:8082/v1/embeddings \
+              -H "Content-Type: application/json" \
+              -d "{\"model\":\"multilingual-e5-large\",\"input\":[\"query: hello\"]}")
+            dim=$(echo "$body" | python3 -c "import sys,json;d=json.load(sys.stdin);print(len(d[\"data\"][0][\"embedding\"]))")
+            echo "embedding dim: $dim"
+            test "$dim" = "1024"
+          '
+
+      - name: Show post-deploy status
+        if: always()
+        run: |
+          ssh server 'docker ps --filter name=embed-server --format "{{.Names}}\t{{.Status}}"; docker logs embed-server --tail 10'
