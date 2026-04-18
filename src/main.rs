@@ -125,6 +125,9 @@ async fn main() {
     // 10_000). Setting CACHE_MAX_ENTRIES=0 produces a disabled shell
     // (get/insert are no-ops) — the documented runtime kill-switch.
     let cache = Arc::new(EmbeddingCache::new(cfg.cache_max_entries));
+    // Stamp the gauge with 0 so /metrics exposes `embed_cache_size` from startup,
+    // even before the first cache miss populates it.
+    crate::metrics::set_cache_size(0);
     tracing::info!(
         cache_max_entries = cfg.cache_max_entries,
         cache_enabled = cache.is_enabled(),

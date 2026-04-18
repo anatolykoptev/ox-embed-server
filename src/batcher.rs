@@ -1110,4 +1110,15 @@ mod tests {
             "gauge should reflect latest set value in:\n{text}"
         );
     }
+
+    #[test]
+    fn set_cache_size_zero_emits_metric_line() {
+        let h = test_prometheus_handle();
+        crate::metrics::set_cache_size(0);
+        let text = h.render();
+        assert!(
+            text.contains("embed_cache_size"),
+            "gauge line must be present after stamp: {text}"
+        );
+    }
 }
