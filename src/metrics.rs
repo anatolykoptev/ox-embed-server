@@ -141,3 +141,25 @@ pub fn record_carry(model: &str) {
     )
     .increment(1);
 }
+
+/// Increment embedding-cache hit counter (one per request position; same
+/// text at N positions counts as N hits, matching the "positions-in-request"
+/// semantic used for miss accounting).
+pub fn record_cache_hit(model: &str) {
+    metrics::counter!(
+        "embed_cache_hit_total",
+        "model" => model.to_string()
+    )
+    .increment(1);
+}
+
+/// Increment embedding-cache miss counter (one per request position;
+/// duplicates-within-request count as multiple misses so hit ratio is
+/// measured per-text-in-request, not per-unique-text).
+pub fn record_cache_miss(model: &str) {
+    metrics::counter!(
+        "embed_cache_miss_total",
+        "model" => model.to_string()
+    )
+    .increment(1);
+}

@@ -1,6 +1,7 @@
 mod api;
-mod cache;
 mod batcher;
+mod cache;
+mod cache_flow;
 mod config;
 mod metrics;
 mod model;
@@ -15,6 +16,7 @@ use axum::Router;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_util::sync::CancellationToken;
 
+use crate::cache::EmbeddingCache;
 use crate::config::Config;
 use crate::model::EmbedModel;
 use crate::types::{AppState, ModelEntry};
@@ -119,11 +121,23 @@ async fn main() {
     let drain_timeout = Duration::from_secs(cfg.drain_timeout_s);
     let shutdown_token = CancellationToken::new();
 
+    // Process-local response cache. D3 will plumb `CACHE_MAX_ENTRIES`
+    // through Config; for D2 we use a sensible baked-in default so the
+    // handler wiring can be exercised end-to-end first.
+    const D2_DEFAULT_CACHE_CAPACITY: usize = 10_000;
+    let cache = Arc::new(EmbeddingCache::new(D2_DEFAULT_CACHE_CAPACITY));
+    tracing::info!(
+        cache_max_entries = D2_DEFAULT_CACHE_CAPACITY,
+        cache_enabled = cache.is_enabled(),
+        "response cache ready"
+    );
+
     let state = Arc::new(AppState {
         models: model_entries,
         default_model: cfg.default_model,
         shutdown: shutdown_token.clone(),
         drain_timeout,
+        cache,
     });
 
     let metrics_handle = prom_handle.clone();
