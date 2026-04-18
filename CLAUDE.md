@@ -39,6 +39,7 @@ vs e5 ~28 rps.
 - `POST /v1/embeddings` — OpenAI-compat. Picks model by `model` field;
   returns 503 + `Retry-After: 1` when queue full, 503 + `Retry-After: 5`
   when shutting down.
+- `POST /v1/rerank` — Cohere-compatible, backed by BGE-reranker-v2-m3.
 - `GET /health` — plain `ok`.
 - `GET /metrics` — Prometheus text exposition. Key series:
   `embed_requests_total{model,status}`, `embed_request_duration_seconds`,
@@ -61,6 +62,7 @@ vs e5 ~28 rps.
 | `DRAIN_TIMEOUT_S` | `10` | SIGTERM drain window |
 | `ORT_DYLIB_PATH` | `/usr/lib/libonnxruntime.so` | required with `load-dynamic` feature |
 | `EMBED_VERSION` | `dev` | Stamped into `embed_build_info` |
+| `RERANKER_MODELS` | unset | `name:dir:max_len:padded` comma-separated. Example: `bge-reranker-v2-m3:/models-reranker:512:true` |
 
 ## Deploy
 

@@ -37,11 +37,63 @@ by default — currently `multilingual-e5-large`).
 
 - `POST /v1/embeddings` — OpenAI-compat. 503 + `Retry-After: 1` on full
   queue, 503 + `Retry-After: 5` during shutdown drain.
+- `POST /v1/rerank` — Cohere-compatible cross-encoder reranking. See below.
 - `GET /health` — `ok`.
 - `GET /metrics` — Prometheus text exposition. Series: `embed_requests_total`,
   `embed_request_duration_seconds`, `embed_inference_duration_seconds`,
   `embed_batch_size`, `embed_queue_depth`, `embed_queue_rejected_total`,
   `embed_build_info`.
+
+### `POST /v1/rerank` — cross-encoder reranking
+
+Given a query and a list of documents, returns each document's relevance score. Typical RAG flow: retrieve top-50 via `/v1/embeddings` → rerank via `/v1/rerank` → return top-5 to the LLM.
+
+Cohere-compatible JSON shape.
+
+**Request:**
+```json
+{
+  "model": "bge-reranker-v2-m3",
+  "query": "what is a cat",
+  "documents": ["a cat is a feline", "pasta is tasty", "cats purr"],
+  "top_n": 2
+}
+```
+- `model` — optional. If 1 reranker is configured, it's picked automatically. If 0 or 2+ rerankers, `model` is required.
+- `query` — required non-empty string.
+- `documents` — required non-empty array.
+- `top_n` — optional; if absent, all docs are returned. `top_n=0` yields an empty array; `top_n > len(documents)` is saturated.
+
+**Response:**
+```json
+{
+  "model": "bge-reranker-v2-m3",
+  "results": [
+    {"index": 0, "relevance_score": 5.81},
+    {"index": 2, "relevance_score": 3.12}
+  ]
+}
+```
+- Results sorted by `relevance_score` DESCENDING.
+- `index` is the 0-based position in the original `documents` array.
+- Scores are raw logits (any real number) — higher = more relevant. Not a calibrated probability.
+
+**Configure models via env:**
+```
+RERANKER_MODELS=bge-reranker-v2-m3:/models-reranker:512:true
+```
+Format: `name:dir:max_len:padded` (comma-separated for multiple).
+
+**Example:**
+```bash
+curl -s -X POST http://127.0.0.1:8082/v1/rerank \
+  -H "Content-Type: application/json" \
+  -d '{"model":"bge-reranker-v2-m3","query":"what is a cat","documents":["a cat is a feline","pasta is tasty"]}'
+```
+
+**Notes:**
+- The response cache (Phase D) is bypassed for `/v1/rerank` — query/doc pairs are near-unique and caching them would burn RAM for ~0 hit rate.
+- Each `(query, doc)` pair is tokenized together by the cross-encoder and scored; batcher coalesces pairs across requests the same way embeddings do.
 
 ## Configuration
 

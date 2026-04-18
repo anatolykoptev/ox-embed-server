@@ -29,3 +29,6 @@ panic = "abort"
 
 [profile.dev.package."*"]
 opt-level = 1
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["blocking", "json"] }

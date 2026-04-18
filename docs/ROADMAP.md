@@ -16,7 +16,7 @@ Status of the multi-model Rust inference sidecar on the `krolik` server. Updated
 |---|---|---|---|
 | `multilingual-e5-large` | `models/multilingual-e5-large/` | ~560 MB | ✅ live (default `/v1/embeddings`) |
 | `jina-code-v2` | `models/jina-code-v2/` | ~300 MB | ✅ live (`?model=jina-code-v2`) |
-| `bge-reranker-v2-m3` | `models/bge-reranker-v2-m3/model_quantized.onnx` | 544 MB | ✅ on disk + smoke-tested, **waiting for Phase E endpoint** |
+| `bge-reranker-v2-m3` | `models/bge-reranker-v2-m3/model_quantized.onnx` | 544 MB | ✅ live (`POST /v1/rerank`, Phase E) |
 | `splade-v3-distilbert` | `models/splade-v3-distilbert/model.onnx` | 346 MB | ✅ on disk, **waiting for Phase G endpoint** |
 | `gliner-small-v2.1` | `models/gliner-small-v2.1/pytorch_model.bin` | 583 MB | ⚠️ pytorch-only, needs re-export via `torch.onnx.export` |
 
@@ -34,6 +34,15 @@ Status of the multi-model Rust inference sidecar on the `krolik` server. Updated
 - +3 metrics: `embed_batch_tokens`, `embed_batch_padding_waste_ratio`, `embed_carry_events_total`.
 
 **Observed metrics (post-deploy)**: padding waste 5-10% — batcher correctly avoids long+short mixing.
+
+### Phase E — `/v1/rerank` endpoint + BGE reranker integration ([PR #12](https://github.com/anatolykoptev/ox-embed-server/pull/12))
+- `RerankerModel` struct (parallel to `EmbedModel`), reuses Phase B batcher semantics for `(query, doc)` pair coalescing.
+- `RERANKER_MODELS=bge-reranker-v2-m3:/models-reranker:512:true` env parsing.
+- Endpoint `POST /v1/rerank` — Cohere-compatible JSON: `{model?, query, documents, top_n?}` → `{model, results: [{index, relevance_score}]}` sorted DESC.
+- Response cache (Phase D) is bypassed — query/doc pairs are near-unique; caching would burn RAM for ~0 hit rate.
+- Unit + integration tests (`tests/rerank_smoke.rs`, guarded on `EMBED_SERVER_URL`).
+
+**Observed**: Live `/v1/rerank` endpoint serving `bge-reranker-v2-m3`; smoke-verified relevant docs outrank irrelevant (5.77 vs -11.00 spread on "cat" query).
 
 ---
 
@@ -59,21 +68,12 @@ Rough effort = **focused implementation hours** (not calendar time — each phas
 
 ---
 
-### Priority 2 — ~13-18 h
-
-#### Phase E — `/v1/rerank` endpoint + BGE reranker integration
-**Effort (embed-server)**: ~6-8 h
-**What**:
-- `RerankerModel` struct (parallel to `EmbedModel`), reuse Phase B batcher
-- Parse `RERANKER_MODELS=bge-reranker-v2-m3:/models-reranker:512:true`
-- Endpoint `POST /v1/rerank` (Cohere/Jina-compatible JSON: `{query, documents, top_k}` → `{results: [{index, relevance_score}]}`)
-- Smoke + integration tests against the on-disk model
-**Payoff**: Hit Rate 0.82 → 0.94, MRR 0.73 → 0.87 on public RAG benchmarks — direct quality lift for MemDB search and go-code semantic_search.
+### Priority 2 — ~7-10 h
 
 #### MemDB integration of reranker (separate repo, `anatolykoptev/MemDB`)
 **Effort**: ~3-4 h
 **What**: In `memdb-go`, after retrieving top-50 by embedding, POST to `http://embed-server:8082/v1/rerank`. Flag `MEMDB_RERANKER_ENABLED` for safe rollout.
-**Dependency**: Phase E must ship first.
+**Dependency**: Phase E shipped ✅.
 
 #### Phase C — Length bucketing
 **Effort**: ~4-6 h
@@ -104,8 +104,8 @@ Rough effort = **focused implementation hours** (not calendar time — each phas
 | Scope | Hours | Calendar |
 |---|---|---|
 | P1 only (polish + cache) | 5-7 h | ~1 day |
-| P1 + P2 (+ reranker + MemDB wire-up + bucketing) | 18-25 h | ~3 days |
-| Everything through P3 | 27-38 h | ~5-7 days |
+| P1 + P2 (+ MemDB wire-up + bucketing) | 12-17 h | ~2 days |
+| Everything through P3 | 21-30 h | ~4-5 days |
 
 ---
 
@@ -114,10 +114,6 @@ Rough effort = **focused implementation hours** (not calendar time — each phas
 **Reasons to prioritize P1 first**:
 - Smallest blast radius; closes reviewer findings; might recover the throughput we saw regress on bench.
 - Unlocks clean 24 h production metric window to judge Phase B in the real world.
-
-**Reasons to jump straight to P2 (reranker)**:
-- Only phase that produces a **new user-visible capability** — every other phase optimises something invisible.
-- The model is already on disk (`544 MB model_quantized.onnx`, smoke OK) — integration cost, not research cost.
 
 **Reasons to defer P3**:
 - SPLADE + GLiNER are nice-to-haves; neither has a blocking downstream consumer yet.
@@ -141,4 +137,4 @@ Rough effort = **focused implementation hours** (not calendar time — each phas
 - Effort estimates updated post-phase to reflect actual hours, for better future forecasting.
 - New follow-ups discovered during execution go to `TaskList` (ephemeral) or to `docs/plans/*` (persistent).
 
-Last refreshed: 2026-04-18 (after Phase B ship).
+Last refreshed: 2026-04-17 (after Phase E ship).
