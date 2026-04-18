@@ -266,7 +266,7 @@ pub async fn embeddings(
 
     // Scatter each miss vector into every original position it fills,
     // and insert into the cache for future requests.
-    for (pending_text, vec) in pending_texts.iter().zip(miss_vectors.into_iter()) {
+    for (pending_text, vec) in pending_texts.iter().zip(miss_vectors) {
         state.cache.insert(&model_name, pending_text, vec.clone());
         let positions = pending
             .get(pending_text)
