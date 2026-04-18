@@ -10,10 +10,37 @@ pub struct ModelDef {
     pub has_token_type_ids: bool,
 }
 
+/// Definition of a single cross-encoder reranker to load.
+///
+/// Far fewer fields than `ModelDef` because:
+///   - no `dim` — rerankers emit a scalar, not a vector;
+///   - no `pad_id` — discovered from the tokenizer at load time
+///     (see `RerankerModel::load`); different reranker families use
+///     different pad ids and we don't want to hand-maintain a table;
+///   - no `has_token_type_ids` — the production target (BGE, Jina,
+///     mxbai rerankers) all use XLM-RoBERTa which has none, and
+///     BERT-based rerankers mask `token_type_ids=0` anyway; ONNX graph
+///     introspection at session time would be cleaner still, but the
+///     ort 2.0-rc API doesn't expose it ergonomically.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RerankerModelDef {
+    pub name: String,
+    pub dir: String,
+    pub max_len: usize,
+    /// True for BERT-style padded models (which is every reranker we
+    /// ship). Kept as a config knob rather than hard-coded so tests and
+    /// future model families can flip it without a code change.
+    pub padded_model: bool,
+}
+
 /// Server configuration parsed from environment variables.
 pub struct Config {
     pub port: u16,
     pub models: Vec<ModelDef>,
+    /// Zero-or-more cross-encoder rerankers. Unlike `models`, an empty
+    /// list is valid (and the default when `RERANKER_MODELS` is unset):
+    /// the server still boots serving `/v1/embeddings` alone.
+    pub rerankers: Vec<RerankerModelDef>,
     pub default_model: String,
     pub intra_threads: usize,
     pub batching_enabled: bool,
@@ -123,9 +150,21 @@ impl Config {
         let cache_max_entries =
             parse_cache_max_entries(env::var("CACHE_MAX_ENTRIES").ok().as_deref());
 
+        // `RERANKER_MODELS` is optional: unset or empty → no rerankers,
+        // server boots serving only `/v1/embeddings`. `/v1/rerank` with
+        // any model name will 400. Errors here only on malformed entries
+        // (bad integer fields, wrong colon count) — a strict
+        // fail-at-boot contract matching `EMBED_MODELS`.
+        let rerankers = env::var("RERANKER_MODELS")
+            .ok()
+            .map(|s| parse_rerankers(&s))
+            .transpose()?
+            .unwrap_or_default();
+
         Ok(Config {
             port,
             models,
+            rerankers,
             default_model,
             intra_threads,
             batching_enabled,
@@ -215,6 +254,47 @@ fn parse_one_model(entry: &str) -> Result<ModelDef, String> {
     })
 }
 
+/// Parse `RERANKER_MODELS` into zero-or-more `RerankerModelDef`.
+///
+/// Format: `name:dir:max_len:padded`, comma-separated. Empty or
+/// whitespace-only input returns `Ok(vec![])` — the "unset → no
+/// rerankers" contract. Malformed entries return `Err`, aborting boot
+/// (same fail-loud stance as `EMBED_MODELS`).
+pub fn parse_rerankers(s: &str) -> Result<Vec<RerankerModelDef>, String> {
+    s.split(',')
+        .filter(|e| !e.trim().is_empty())
+        .map(parse_one_reranker)
+        .collect()
+}
+
+fn parse_one_reranker(entry: &str) -> Result<RerankerModelDef, String> {
+    let parts: Vec<&str> = entry.trim().split(':').collect();
+    if parts.len() != 4 {
+        return Err(format!(
+            "reranker entry must have 4 colon-separated fields (name:dir:max_len:padded), got {}: '{entry}'",
+            parts.len()
+        ));
+    }
+    let max_len = parts[2]
+        .parse::<usize>()
+        .map_err(|e| format!("invalid reranker max_len '{}': {e}", parts[2]))?;
+    let padded_model = match parts[3] {
+        "true" | "1" => true,
+        "false" | "0" => false,
+        v => {
+            return Err(format!(
+                "invalid reranker padded '{v}' (expected true|false|1|0)"
+            ));
+        }
+    };
+    Ok(RerankerModelDef {
+        name: parts[0].to_string(),
+        dir: parts[1].to_string(),
+        max_len,
+        padded_model,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,5 +354,63 @@ mod tests {
         assert_eq!(parse_cache_max_entries(Some("nope")), 10_000);
         assert_eq!(parse_cache_max_entries(Some("")), 10_000);
         assert_eq!(parse_cache_max_entries(Some("-1")), 10_000);
+    }
+
+    // -----------------------------------------------------------------
+    // E2: RERANKER_MODELS parser. Mirrors the EMBED_MODELS parse style
+    // but with 4 fields instead of 6 and an empty-list-is-valid contract.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_rerankers_empty_string_is_empty_list() {
+        // The "unset" path in `from_env` turns None → Ok(vec![]); this
+        // test covers the "set to empty string" edge (env quoting quirk).
+        assert_eq!(parse_rerankers("").unwrap(), vec![]);
+        assert_eq!(parse_rerankers("   ").unwrap(), vec![]);
+        // Trailing comma variants — `filter` drops empty splits.
+        assert_eq!(parse_rerankers(",,").unwrap(), vec![]);
+    }
+
+    #[test]
+    fn parse_rerankers_single_entry_round_trips() {
+        let got = parse_rerankers("bge-reranker-v2-m3:/models-reranker:512:true").unwrap();
+        assert_eq!(
+            got,
+            vec![RerankerModelDef {
+                name: "bge-reranker-v2-m3".into(),
+                dir: "/models-reranker".into(),
+                max_len: 512,
+                padded_model: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_rerankers_multiple_entries_parse_in_order() {
+        let got = parse_rerankers("bge:/a:256:true,jina:/b:512:false").unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].name, "bge");
+        assert_eq!(got[0].max_len, 256);
+        assert!(got[0].padded_model);
+        assert_eq!(got[1].name, "jina");
+        assert_eq!(got[1].max_len, 512);
+        assert!(!got[1].padded_model);
+        // Accept both spellings of the boolean — matches EMBED_MODELS'
+        // has_tti parser for consistency.
+        let got = parse_rerankers("a:/x:128:1,b:/y:64:0").unwrap();
+        assert!(got[0].padded_model);
+        assert!(!got[1].padded_model);
+    }
+
+    #[test]
+    fn parse_rerankers_garbage_errors() {
+        // Wrong field count.
+        assert!(parse_rerankers("toofew:/a:512").is_err());
+        assert!(parse_rerankers("way:too:many:colons:here:oops").is_err());
+        // Unparseable max_len.
+        assert!(parse_rerankers("bad:/a:notanumber:true").is_err());
+        // Invalid padded boolean.
+        let err = parse_rerankers("bad:/a:512:maybe").unwrap_err();
+        assert!(err.contains("padded"), "unexpected err: {err}");
     }
 }
