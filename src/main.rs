@@ -121,13 +121,12 @@ async fn main() {
     let drain_timeout = Duration::from_secs(cfg.drain_timeout_s);
     let shutdown_token = CancellationToken::new();
 
-    // Process-local response cache. D3 will plumb `CACHE_MAX_ENTRIES`
-    // through Config; for D2 we use a sensible baked-in default so the
-    // handler wiring can be exercised end-to-end first.
-    const D2_DEFAULT_CACHE_CAPACITY: usize = 10_000;
-    let cache = Arc::new(EmbeddingCache::new(D2_DEFAULT_CACHE_CAPACITY));
+    // Process-local response cache sized from CACHE_MAX_ENTRIES (default
+    // 10_000). Setting CACHE_MAX_ENTRIES=0 produces a disabled shell
+    // (get/insert are no-ops) — the documented runtime kill-switch.
+    let cache = Arc::new(EmbeddingCache::new(cfg.cache_max_entries));
     tracing::info!(
-        cache_max_entries = D2_DEFAULT_CACHE_CAPACITY,
+        cache_max_entries = cfg.cache_max_entries,
         cache_enabled = cache.is_enabled(),
         "response cache ready"
     );

@@ -40,6 +40,14 @@ pub struct Config {
     /// hatch, and we refuse to silently interpret other "falsy"
     /// strings the same way to avoid surprise disables.
     pub auto_truncate: bool,
+    /// Maximum entries in the process-local response cache.
+    ///
+    /// `0` disables caching (EmbeddingCache::new(0) returns a no-op
+    /// shell); use this as the runtime kill-switch without needing a
+    /// separate boolean flag. Default `10_000` — a modest memory
+    /// footprint (~40 MB for 1024-dim f32 vectors) that comfortably
+    /// covers MemDB's recurring search strings.
+    pub cache_max_entries: usize,
 }
 
 impl Config {
@@ -112,6 +120,9 @@ impl Config {
             .map(|s| !s.eq_ignore_ascii_case("false"))
             .unwrap_or(true);
 
+        let cache_max_entries =
+            parse_cache_max_entries(env::var("CACHE_MAX_ENTRIES").ok().as_deref());
+
         Ok(Config {
             port,
             models,
@@ -124,7 +135,20 @@ impl Config {
             max_queue_size,
             drain_timeout_s,
             auto_truncate,
+            cache_max_entries,
         })
+    }
+}
+
+/// Parse `CACHE_MAX_ENTRIES` env value. Unset, empty, or unparseable →
+/// 10_000 (sensible default). An explicit `0` is honoured as the
+/// documented disable signal (EmbeddingCache becomes a no-op shell).
+/// Exposed for testing; env lookup stays in `from_env`.
+fn parse_cache_max_entries(raw: Option<&str>) -> usize {
+    const DEFAULT: usize = 10_000;
+    match raw {
+        None => DEFAULT,
+        Some(s) => s.trim().parse::<usize>().unwrap_or(DEFAULT),
     }
 }
 
@@ -223,5 +247,32 @@ mod tests {
         // budget gate means no 2nd item ever joins a batch); fall back to default.
         assert_eq!(parse_batch_max_tokens(Some("0")), 16384);
         assert_eq!(parse_batch_max_tokens(Some("  0  ")), 16384);
+    }
+
+    #[test]
+    fn cache_max_entries_default_when_unset() {
+        assert_eq!(parse_cache_max_entries(None), 10_000);
+    }
+
+    #[test]
+    fn cache_max_entries_parses_valid_values() {
+        assert_eq!(parse_cache_max_entries(Some("500")), 500);
+        assert_eq!(parse_cache_max_entries(Some("50000")), 50_000);
+        // Surrounding whitespace tolerated (env quoting mishaps).
+        assert_eq!(parse_cache_max_entries(Some("  200  ")), 200);
+    }
+
+    #[test]
+    fn cache_max_entries_zero_is_explicit_disable() {
+        // 0 is THE documented disable signal — must round-trip, not fall
+        // back to the default like batch_max_tokens does.
+        assert_eq!(parse_cache_max_entries(Some("0")), 0);
+    }
+
+    #[test]
+    fn cache_max_entries_falls_back_on_garbage() {
+        assert_eq!(parse_cache_max_entries(Some("nope")), 10_000);
+        assert_eq!(parse_cache_max_entries(Some("")), 10_000);
+        assert_eq!(parse_cache_max_entries(Some("-1")), 10_000);
     }
 }

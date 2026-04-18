@@ -275,6 +275,10 @@ pub async fn embeddings(
             cached[pos] = Some(vec.clone());
         }
     }
+    // Refresh the cache-size gauge once per request after the insert
+    // batch settles. Single call after all inserts avoids N lock+read
+    // cycles — LRU size is monotone within a request (only grows).
+    crate::metrics::set_cache_size(state.cache.len());
 
     let vectors: Vec<Vec<f32>> = cached
         .into_iter()

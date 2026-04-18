@@ -1073,4 +1073,41 @@ mod tests {
             .shutdown(Duration::from_millis(200))
             .await;
     }
+
+    // -----------------------------------------------------------------
+    // D3: response-cache metric helpers. Rendered-text tests live here
+    // because batcher::tests owns the `test_prometheus_handle` singleton
+    // (the global recorder installs once per test binary).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn cache_hit_and_miss_metrics_increment() {
+        let h = test_prometheus_handle();
+        // Unique model label so no other test's increments bleed into
+        // the assertion.
+        crate::metrics::record_cache_hit("tmodel_cache_a");
+        crate::metrics::record_cache_hit("tmodel_cache_a");
+        crate::metrics::record_cache_miss("tmodel_cache_a");
+        let text = h.render();
+        assert!(
+            text.contains("embed_cache_hit_total{model=\"tmodel_cache_a\"} 2"),
+            "missing or wrong hit counter in:\n{text}"
+        );
+        assert!(
+            text.contains("embed_cache_miss_total{model=\"tmodel_cache_a\"} 1"),
+            "missing or wrong miss counter in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn cache_size_gauge_renders_latest_value() {
+        let h = test_prometheus_handle();
+        crate::metrics::set_cache_size(0);
+        crate::metrics::set_cache_size(42);
+        let text = h.render();
+        assert!(
+            text.contains("embed_cache_size 42"),
+            "gauge should reflect latest set value in:\n{text}"
+        );
+    }
 }

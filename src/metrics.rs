@@ -163,3 +163,13 @@ pub fn record_cache_miss(model: &str) {
     )
     .increment(1);
 }
+
+/// Set the current embedding-cache entry count.
+///
+/// Intentionally unlabelled (global gauge): the cache is keyed by
+/// `(model, text)` so a per-model size would require iterating the LRU
+/// each update. A single global counter updated on insert is cheap and
+/// sufficient for capacity monitoring.
+pub fn set_cache_size(size: usize) {
+    metrics::gauge!("embed_cache_size").set(size as f64);
+}
