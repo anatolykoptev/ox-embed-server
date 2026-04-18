@@ -1,4 +1,4 @@
-//! Process-local LRU cache for embeddings keyed by (model, sha256(text)).
+//! Process-local concurrent cache for embeddings keyed by (model, sha256(text)).
 //!
 //! Embeddings are deterministic: for a given (model, text) pair the output
 //! vector is always identical. MemDB re-queries the same search strings
@@ -8,11 +8,19 @@
 //! Scope (intentional):
 //! - Process-local (not distributed).
 //! - Not persisted across restarts.
-//! - Pure LRU — no TTL.
+//! - Size-bounded with TinyLFU admission + LRU-ish eviction via `moka`.
+//!   No TTL (embeddings are deterministic; size is the only bound).
 //!
 //! Threading:
-//! - Single `Mutex` around the LRU map is intentional. Probe and insert are
-//!   µs-scale; inference is performed OUTSIDE the lock by the caller.
+//! - `moka::sync::Cache` is internally sharded and lock-free on the fast
+//!   path. No single global `Mutex` around the map, so concurrent probes
+//!   under load don't contend the way a `Mutex<LruCache>` would.
+//!
+//! Admission policy (TinyLFU):
+//! - One-shot transient inputs get filtered out, so a flood of unique
+//!   requests won't evict high-frequency repeats. This yields better
+//!   hit rates than naive LRU on real-world workloads where a small
+//!   set of queries dominates.
 //!
 //! Disable semantic:
 //! - `EmbeddingCache::new(0)` constructs a cache with no backing store;
@@ -20,10 +28,8 @@
 //!   callers keep `Arc<EmbeddingCache>` in shared state regardless of
 //!   whether caching is enabled at runtime.
 
-use lru::LruCache;
+use moka::sync::Cache;
 use sha2::{Digest, Sha256};
-use std::num::NonZeroUsize;
-use std::sync::Mutex;
 
 /// Cache key: (model name, sha256 of the input text).
 ///
@@ -41,7 +47,7 @@ pub fn hash_text(text: &str) -> [u8; 32] {
 #[derive(Debug)]
 pub struct EmbeddingCache {
     /// `None` when the cache is disabled (constructed with capacity 0).
-    inner: Mutex<Option<LruCache<CacheKey, Vec<f32>>>>,
+    inner: Option<Cache<CacheKey, Vec<f32>>>,
 }
 
 impl EmbeddingCache {
@@ -52,50 +58,65 @@ impl EmbeddingCache {
         let inner = if max_entries == 0 {
             None
         } else {
-            // SAFETY: guarded by the `== 0` check above.
-            let cap = NonZeroUsize::new(max_entries).unwrap();
-            Some(LruCache::new(cap))
+            Some(Cache::builder().max_capacity(max_entries as u64).build())
         };
-        Self {
-            inner: Mutex::new(inner),
-        }
+        Self { inner }
     }
 
     /// Returns whether the cache is enabled (capacity > 0).
     pub fn is_enabled(&self) -> bool {
-        self.inner.lock().unwrap().is_some()
+        self.inner.is_some()
     }
 
     /// Look up an embedding. Returns a clone of the stored vector on hit,
-    /// None on miss or when the cache is disabled. Marks the entry as MRU.
+    /// None on miss or when the cache is disabled.
+    ///
+    /// moka's `get` returns `Option<V>` (value is cloned out of the shard
+    /// internally) rather than `Option<&V>`, so no explicit `.cloned()`.
+    /// It also updates frequency estimators for the TinyLFU admission
+    /// policy + recency tracker.
     pub fn get(&self, model: &str, text: &str) -> Option<Vec<f32>> {
+        let cache = self.inner.as_ref()?;
         let key = (model.to_string(), hash_text(text));
-        let mut guard = self.inner.lock().unwrap();
-        guard.as_mut()?.get(&key).cloned()
+        cache.get(&key)
     }
 
     /// Insert an embedding. No-op when the cache is disabled.
+    ///
+    /// Eviction (when over capacity) is performed asynchronously by a
+    /// background worker — the insert itself does not block on eviction.
+    /// For deterministic size assertions in tests, call
+    /// `run_pending_tasks_for_test` first.
     pub fn insert(&self, model: &str, text: &str, vec: Vec<f32>) {
+        let Some(cache) = self.inner.as_ref() else {
+            return;
+        };
         let key = (model.to_string(), hash_text(text));
-        let mut guard = self.inner.lock().unwrap();
-        if let Some(lru) = guard.as_mut() {
-            lru.put(key, vec);
-        }
+        cache.insert(key, vec);
     }
 
     /// Current entry count (0 when disabled).
+    ///
+    /// Note: moka reports `entry_count()` eventually-consistent — freshly
+    /// inserted entries may be counted slightly after they're visible to
+    /// `get`. For production telemetry this is the right signal (it
+    /// reflects after-eviction steady-state). Tests that need an exact
+    /// post-insert count should `run_pending_tasks_for_test()` first.
     pub fn len(&self) -> usize {
         self.inner
-            .lock()
-            .unwrap()
             .as_ref()
-            .map(|l| l.len())
+            .map(|c| c.entry_count() as usize)
             .unwrap_or(0)
     }
 
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    /// Drain the background maintenance queue so eviction and size
+    /// bookkeeping reflect writes-so-far. Test-only helper; production
+    /// code should never need this (moka drains continuously under load).
+    #[cfg(test)]
+    fn run_pending_tasks_for_test(&self) {
+        if let Some(c) = self.inner.as_ref() {
+            c.run_pending_tasks();
+        }
     }
 }
 
@@ -126,17 +147,35 @@ mod tests {
     }
 
     #[test]
-    fn lru_evicts_oldest() {
+    fn bounded_capacity_evicts_under_pressure() {
+        // moka with TinyLFU doesn't guarantee pure-LRU eviction order —
+        // cold-entry admission can reject the newcomer rather than evict
+        // an existing resident, so "a" might survive and "c" be rejected,
+        // or vice versa. What we DO guarantee: the cache never exceeds
+        // its configured capacity after pending work drains.
         let c = EmbeddingCache::new(2);
         c.insert("m", "a", vec![1.0]);
         c.insert("m", "b", vec![2.0]);
-        assert_eq!(c.len(), 2);
-        // Third insert evicts the LRU entry ("a").
         c.insert("m", "c", vec![3.0]);
-        assert_eq!(c.len(), 2);
-        assert_eq!(c.get("m", "a"), None, "a should have been evicted");
-        assert!(c.get("m", "b").is_some());
-        assert!(c.get("m", "c").is_some());
+        c.run_pending_tasks_for_test();
+
+        let present = ["a", "b", "c"]
+            .iter()
+            .filter(|t| c.get("m", t).is_some())
+            .count();
+        assert!(
+            present <= 2,
+            "cache must respect max_capacity=2, got {present} entries present"
+        );
+        assert!(
+            present >= 1,
+            "at least one of the inserted entries should be retained"
+        );
+        assert!(
+            c.len() <= 2,
+            "entry_count must not exceed capacity; got {}",
+            c.len()
+        );
     }
 
     #[test]
@@ -164,15 +203,14 @@ mod tests {
     }
 
     #[test]
-    fn get_marks_mru() {
-        // With capacity 2: insert a, b; get a; insert c → b should be evicted (not a).
-        let c = EmbeddingCache::new(2);
-        c.insert("m", "a", vec![1.0]);
-        c.insert("m", "b", vec![2.0]);
-        assert!(c.get("m", "a").is_some(), "touch makes a MRU");
-        c.insert("m", "c", vec![3.0]);
-        assert!(c.get("m", "a").is_some(), "a survives as MRU");
-        assert_eq!(c.get("m", "b"), None, "b evicted as LRU");
-        assert!(c.get("m", "c").is_some());
+    fn repeated_get_returns_same_value() {
+        // moka updates frequency estimators on read; make sure repeated
+        // reads still return Some with the same value (no internal
+        // invalidation on touch).
+        let c = EmbeddingCache::new(4);
+        c.insert("m", "a", vec![1.0, 2.0]);
+        assert_eq!(c.get("m", "a"), Some(vec![1.0, 2.0]));
+        assert_eq!(c.get("m", "a"), Some(vec![1.0, 2.0]));
+        assert_eq!(c.get("m", "a"), Some(vec![1.0, 2.0]));
     }
 }
