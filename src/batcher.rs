@@ -4,7 +4,6 @@
 //! (port of HuggingFace text-embeddings-inference `core/src/queue.rs`).
 //! The batcher accepts pre-tokenized input_ids and caps batches by the
 //! padded total tokens `max(seq_len_in_batch) * n_items`, not by item count.
-#![allow(dead_code)]
 use std::cmp::max;
 use std::fmt;
 use std::sync::Arc;
@@ -69,6 +68,8 @@ impl Item {
 pub struct DynamicBatcher {
     name: Arc<String>,
     sender: mpsc::Sender<Item>,
+    // Kept so `shutdown` can await worker drain; unused outside tests today.
+    #[allow(dead_code)]
     worker: JoinHandle<()>,
 }
 
@@ -170,6 +171,8 @@ impl DynamicBatcher {
         }
     }
 
+    // Graceful drain used by tests; production shutdown goes via drop-tokens path.
+    #[allow(dead_code)]
     pub async fn shutdown(self, timeout: Duration) {
         let DynamicBatcher { sender, worker, .. } = self;
         drop(sender);
