@@ -98,3 +98,46 @@ pub fn set_queue_depth(model: &str, depth: usize) {
     )
     .set(depth as f64);
 }
+
+/// Record padded-compute tokens for one dispatched batch.
+///
+/// For padded models this is `max_len * items` (the actual compute unit
+/// count); for non-padded models it's `total_tokens` (raw sum). The
+/// caller decides which value to pass based on the `padded_model` flag.
+pub fn record_batch_tokens(model: &str, tokens: usize) {
+    metrics::histogram!(
+        "embed_batch_tokens",
+        "model" => model.to_string()
+    )
+    .record(tokens as f64);
+}
+
+/// Record padding-waste ratio for one dispatched batch.
+///
+/// Ratio is `(padded - raw) / padded`, clamped to [0.0, 1.0]. 0 means
+/// every sequence in the batch was the same length (no padding); → 1
+/// means the batch was mostly padding. Caller passes `padded == raw`
+/// for non-padded models so the ratio is always 0 there.
+pub fn record_padding_waste(model: &str, padded: usize, raw: usize) {
+    let ratio = if padded == 0 {
+        0.0
+    } else {
+        ((padded.saturating_sub(raw)) as f64 / padded as f64).clamp(0.0, 1.0)
+    };
+    metrics::histogram!(
+        "embed_batch_padding_waste_ratio",
+        "model" => model.to_string()
+    )
+    .record(ratio);
+}
+
+/// Increment the carry-events counter (token-budget overflow deferred
+/// an item into the next batch). A rising rate here is a signal that
+/// clients send heterogeneous sizes — consider length-bucketing.
+pub fn record_carry(model: &str) {
+    metrics::counter!(
+        "embed_carry_events_total",
+        "model" => model.to_string()
+    )
+    .increment(1);
+}

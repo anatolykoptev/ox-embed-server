@@ -282,6 +282,7 @@ async fn run_worker(
                         batch.push(item);
                     } else {
                         // Overflow: defer to the next batch (don't drop).
+                        crate::metrics::record_carry(&name);
                         carry = Some(item);
                         break;
                     }
@@ -299,6 +300,19 @@ async fn run_worker(
         if batch.is_empty() {
             continue;
         }
+        // Token-budget observability (per dispatched batch). `accum`
+        // reflects the intended admit set — including any items later
+        // filtered by the cancellation retain above — which gives a
+        // faithful view of budget pressure. For non-padded models the
+        // padded value degenerates to raw, so the ratio is always 0.
+        let raw_tokens = accum.total_tokens;
+        let padded_tokens = if cfg.padded_model {
+            accum.max_len.saturating_mul(accum.items)
+        } else {
+            raw_tokens
+        };
+        crate::metrics::record_batch_tokens(&name, padded_tokens);
+        crate::metrics::record_padding_waste(&name, padded_tokens, raw_tokens);
         dispatch_batch(batch, embed_fn.clone(), name.clone()).await;
     }
 }
@@ -956,5 +970,66 @@ mod tests {
             reply: oneshot::channel().0,
         };
         assert!(!accum.fits(&one, &cfg));
+    }
+
+    // -----------------------------------------------------------------
+    // B4: token-budget observability metrics. One scenario drives all
+    // three (batch_tokens histogram, padding_waste_ratio histogram,
+    // carry_events_total counter) via the Prometheus text exposition.
+    // -----------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn token_budget_metrics_are_recorded() {
+        let handle = test_prometheus_handle();
+        // Unique model name to avoid cross-test interference.
+        let name = "t_budget_metrics";
+        // max_batch_tokens=1000 padded. First 500 tokens, then 10× 50-tok
+        // forces at least one carry and one short-second-batch dispatch.
+        let b = Arc::new(DynamicBatcher::with_tokens(
+            name,
+            |ids: Vec<Vec<u32>>| Ok(ids.iter().map(|_| vec![0.0f32; 4]).collect()),
+            /*max_batch_tokens*/ 1000,
+            /*max_batch_items*/ 100,
+            /*padded_model*/ true,
+            /*wait_ms*/ 50,
+            /*max_queue*/ 16,
+        ));
+        let b_first = b.clone();
+        let first = tokio::spawn(async move { b_first.embed_tokens(vec![vec![0u32; 500]]).await });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let mut rest = vec![];
+        for _ in 0..10 {
+            let bc = b.clone();
+            rest.push(tokio::spawn(async move {
+                bc.embed_tokens(vec![vec![0u32; 50]]).await
+            }));
+        }
+        let _ = first.await;
+        for h in rest {
+            let _ = h.await;
+        }
+        // Allow final dispatch to flush.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let text = handle.render();
+        // Three metrics must appear with this model name.
+        assert!(
+            text.contains(&format!("embed_batch_tokens_count{{model=\"{name}\"}}")),
+            "missing batch_tokens: {text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "embed_batch_padding_waste_ratio_count{{model=\"{name}\"}}"
+            )),
+            "missing padding_waste: {text}"
+        );
+        assert!(
+            text.contains(&format!("embed_carry_events_total{{model=\"{name}\"}}")),
+            "missing carry: {text}"
+        );
+        Arc::try_unwrap(b)
+            .ok()
+            .expect("still has clones")
+            .shutdown(Duration::from_millis(200))
+            .await;
     }
 }
