@@ -19,6 +19,21 @@ Single sidecar serving both `multilingual-e5-large` (1024 dim) and
 | `src/config.rs` | ~120 | Env parsing (`EMBED_MODELS`, batching knobs) |
 | `bench.py` | — | Load harness (rtk proxy for untruncated output) |
 
+## Models
+
+Two models loaded concurrently in one process. Request selects via
+`model` field; `EMBED_DEFAULT_MODEL` (default: first `EMBED_MODELS`
+entry) is used when absent.
+
+| Name | Dim | max_len | Notes |
+|---|---:|---:|---|
+| `multilingual-e5-large` | 1024 | 256 | Default. Multilingual general-purpose. |
+| `jina-code-v2` | 768 | 512 | Code / long-context. ~2-3x faster on ARM. |
+
+Perf deltas (ARM Neoverse-N1): 16 short texts single batch — jina
+~118 ms/req vs e5 ~357 ms/req. conc=16 single-query — jina ~75 rps
+vs e5 ~28 rps.
+
 ## API
 
 - `POST /v1/embeddings` — OpenAI-compat. Picks model by `model` field;
@@ -60,6 +75,28 @@ code changes don't need it thanks to the dummy-main dep layer in the
 Dockerfile. Code-only rebuild: ~40s. Warm no-change rebuild: ~2s. Cold
 rebuild (after Cargo.toml): ~3 min.
 
+## Batcher carry-over (commit `3598b48`, Apr 2026)
+
+`run_worker` holds an internal `carry: Option<Item>`. When a second item
+pulled from the channel would push the coalesced batch past `BATCH_MAX`,
+it is deferred to the next batch instead of being rejected. Previous
+behaviour replied with `item exceeded max_batch after coalesce` and
+dropped the item; that error should no longer occur on `master`. If seen
+in logs, the running image predates `3598b48` — rebuild and redeploy.
+Regression test: `coalesce_overflow_defers_to_next_batch`.
+
+## Releases (release-please)
+
+`.github/workflows/release-please.yml` runs release-please on pushes to
+`master`. Config: `release-please-config.json`
+(`release-type: rust`, `include-v-in-tag: true`) and
+`.release-please-manifest.json` (seed `0.1.0`). Conventional commit
+prefixes: `fix:`/`perf:` → patch, `feat:` → minor, `feat!:` or
+`BREAKING CHANGE:` → major, others → no bump. The bot opens and
+updates a single release PR; merging it creates the `vX.Y.Z` tag,
+GitHub release, and version bump in `Cargo.toml` + manifest. First
+PR (#1) targets `v0.2.0`. Do not tag manually.
+
 ## Gotchas
 
 - `ort` with `load-dynamic` — `libonnxruntime.so` loaded at startup, not linked.
@@ -89,3 +126,6 @@ See `docs/benchmarks/` for baseline + post-migration details.
   served by Python `embed-jina`. BUG-001 workaround proven unnecessary for
   the current model file. Added DynamicBatcher, Prometheus metrics, bounded
   queue + 503 backpressure, graceful SIGTERM. Python `embed-jina` retired.
+- Apr 2026: batcher carry-over fix (`3598b48`) — coalesce-overflow items
+  deferred instead of dropped. Added release-please workflow (`d217c60`);
+  first release PR targets `v0.2.0`.
