@@ -3,11 +3,28 @@ use std::sync::Mutex;
 
 use ndarray::Array2;
 use ort::session::Session;
+use ort::session::builder::GraphOptimizationLevel;
 use ort::value::Tensor;
 use tokenizers::Tokenizer;
 
 use crate::config::ModelDef;
 use crate::pool;
+
+/// Parse the `ORT_OPT_LEVEL` env var (0..=3) into an ort
+/// `GraphOptimizationLevel`. Defaults to `Level3` (all optimizations) when
+/// the variable is unset or unparseable.
+fn parse_opt_level() -> GraphOptimizationLevel {
+    let raw = std::env::var("ORT_OPT_LEVEL")
+        .ok()
+        .and_then(|s| s.parse::<u8>().ok())
+        .unwrap_or(3);
+    match raw {
+        0 => GraphOptimizationLevel::Disable,
+        1 => GraphOptimizationLevel::Level1,
+        2 => GraphOptimizationLevel::Level2,
+        _ => GraphOptimizationLevel::Level3,
+    }
+}
 
 /// Wraps an ONNX session + tokenizer for a single embedding model.
 pub struct EmbedModel {
@@ -38,9 +55,16 @@ impl EmbedModel {
             ));
         }
 
-        tracing::info!(path = %onnx_path.display(), "creating ONNX session");
+        let opt_level = parse_opt_level();
+        tracing::info!(
+            path = %onnx_path.display(),
+            ?opt_level,
+            "creating ONNX session"
+        );
         let session = Session::builder()
             .map_err(|e| format!("session builder: {e}"))?
+            .with_optimization_level(opt_level)
+            .map_err(|e| format!("set opt level: {e}"))?
             .with_intra_threads(intra_threads)
             .map_err(|e| format!("set threads: {e}"))?
             .commit_from_file(&onnx_path)
@@ -136,5 +160,61 @@ impl EmbedModel {
         .map_err(|e| format!("mask_f shape: {e}"))?;
 
         pool::mean_pool_normalize(&raw, &mask_arr_f, batch, max_seq, self.dim)
+    }
+}
+
+#[cfg(test)]
+mod opt_level_tests {
+    use super::*;
+
+    /// Temporarily set (or unset) an env var for the duration of `f`,
+    /// restoring the previous value afterwards. Tests that touch env vars
+    /// should be serialized if run in parallel — we scope to a single
+    /// variable here and restore on exit, which is good enough for this
+    /// test module.
+    fn with_env<F: FnOnce()>(key: &str, val: Option<&str>, f: F) {
+        let prev = std::env::var(key).ok();
+        match val {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+        f();
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    #[test]
+    fn parse_opt_level_defaults_to_level3_when_unset() {
+        with_env("ORT_OPT_LEVEL", None, || {
+            assert_eq!(parse_opt_level(), GraphOptimizationLevel::Level3);
+        });
+    }
+
+    #[test]
+    fn parse_opt_level_reads_env_var() {
+        with_env("ORT_OPT_LEVEL", Some("0"), || {
+            assert_eq!(parse_opt_level(), GraphOptimizationLevel::Disable);
+        });
+        with_env("ORT_OPT_LEVEL", Some("1"), || {
+            assert_eq!(parse_opt_level(), GraphOptimizationLevel::Level1);
+        });
+        with_env("ORT_OPT_LEVEL", Some("2"), || {
+            assert_eq!(parse_opt_level(), GraphOptimizationLevel::Level2);
+        });
+        with_env("ORT_OPT_LEVEL", Some("3"), || {
+            assert_eq!(parse_opt_level(), GraphOptimizationLevel::Level3);
+        });
+    }
+
+    #[test]
+    fn parse_opt_level_falls_back_on_garbage() {
+        with_env("ORT_OPT_LEVEL", Some("not-a-number"), || {
+            assert_eq!(parse_opt_level(), GraphOptimizationLevel::Level3);
+        });
+        with_env("ORT_OPT_LEVEL", Some("99"), || {
+            assert_eq!(parse_opt_level(), GraphOptimizationLevel::Level3);
+        });
     }
 }
