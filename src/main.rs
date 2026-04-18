@@ -1,4 +1,5 @@
 mod api;
+mod api_rerank;
 mod batcher;
 mod cache;
 mod cache_flow;
@@ -313,6 +314,7 @@ async fn main() {
             }),
         )
         .route("/v1/embeddings", axum::routing::post(api::embeddings))
+        .route("/v1/rerank", axum::routing::post(api_rerank::rerank))
         .with_state(router_state);
 
     let addr = format!("0.0.0.0:{}", cfg.port);
