@@ -167,11 +167,7 @@ impl EmbedModel {
 mod opt_level_tests {
     use super::*;
 
-    /// Temporarily set (or unset) an env var for the duration of `f`,
-    /// restoring the previous value afterwards. Tests that touch env vars
-    /// should be serialized if run in parallel — we scope to a single
-    /// variable here and restore on exit, which is good enough for this
-    /// test module.
+    /// Sets/unsets an env var around a closure and restores the previous value.
     fn with_env<F: FnOnce()>(key: &str, val: Option<&str>, f: F) {
         let prev = std::env::var(key).ok();
         match val {
@@ -186,35 +182,33 @@ mod opt_level_tests {
     }
 
     #[test]
-    fn parse_opt_level_defaults_to_level3_when_unset() {
+    fn parse_opt_level_env_mapping() {
+        // Run cases sequentially in one thread to avoid env-var races with
+        // other tests (Rust test runner is multi-threaded by default).
         with_env("ORT_OPT_LEVEL", None, || {
             assert_eq!(parse_opt_level(), GraphOptimizationLevel::Level3);
         });
-    }
-
-    #[test]
-    fn parse_opt_level_reads_env_var() {
-        with_env("ORT_OPT_LEVEL", Some("0"), || {
-            assert_eq!(parse_opt_level(), GraphOptimizationLevel::Disable);
-        });
-        with_env("ORT_OPT_LEVEL", Some("1"), || {
-            assert_eq!(parse_opt_level(), GraphOptimizationLevel::Level1);
-        });
-        with_env("ORT_OPT_LEVEL", Some("2"), || {
-            assert_eq!(parse_opt_level(), GraphOptimizationLevel::Level2);
-        });
-        with_env("ORT_OPT_LEVEL", Some("3"), || {
-            assert_eq!(parse_opt_level(), GraphOptimizationLevel::Level3);
-        });
-    }
-
-    #[test]
-    fn parse_opt_level_falls_back_on_garbage() {
-        with_env("ORT_OPT_LEVEL", Some("not-a-number"), || {
-            assert_eq!(parse_opt_level(), GraphOptimizationLevel::Level3);
-        });
-        with_env("ORT_OPT_LEVEL", Some("99"), || {
-            assert_eq!(parse_opt_level(), GraphOptimizationLevel::Level3);
-        });
+        for (val, want) in [
+            ("0", GraphOptimizationLevel::Disable),
+            ("1", GraphOptimizationLevel::Level1),
+            ("2", GraphOptimizationLevel::Level2),
+            ("3", GraphOptimizationLevel::Level3),
+        ] {
+            with_env("ORT_OPT_LEVEL", Some(val), || {
+                assert_eq!(
+                    parse_opt_level(),
+                    want,
+                    "value {:?} should map to {:?}",
+                    val,
+                    want
+                );
+            });
+        }
+        // Garbage / out-of-range → Level3 fallback.
+        for garbage in ["not-a-number", "99", ""] {
+            with_env("ORT_OPT_LEVEL", Some(garbage), || {
+                assert_eq!(parse_opt_level(), GraphOptimizationLevel::Level3);
+            });
+        }
     }
 }
