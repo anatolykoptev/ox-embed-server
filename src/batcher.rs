@@ -4,7 +4,6 @@
 //! (port of HuggingFace text-embeddings-inference `core/src/queue.rs`).
 //! The batcher accepts pre-tokenized input_ids and caps batches by the
 //! padded total tokens `max(seq_len_in_batch) * n_items`, not by item count.
-#![allow(dead_code)]
 use std::cmp::max;
 use std::fmt;
 use std::sync::Arc;
@@ -69,6 +68,8 @@ impl Item {
 pub struct DynamicBatcher {
     name: Arc<String>,
     sender: mpsc::Sender<Item>,
+    // Kept so `shutdown` can await worker drain; unused outside tests today.
+    #[allow(dead_code)]
     worker: JoinHandle<()>,
 }
 
@@ -141,6 +142,14 @@ impl DynamicBatcher {
         &self,
         token_ids: Vec<Vec<u32>>,
     ) -> Result<Vec<Vec<f32>>, BatchError> {
+        // Short-circuit empty input: don't enqueue, don't invoke embed_fn.
+        // The HTTP layer rejects this upstream, but embed_tokens is a public
+        // API and a zero-text Item would poison accum accounting (0-texts
+        // Items never fit under the strict `<` budget gate) while still
+        // consuming a queue slot.
+        if token_ids.is_empty() {
+            return Ok(vec![]);
+        }
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .sender
@@ -162,6 +171,8 @@ impl DynamicBatcher {
         }
     }
 
+    // Graceful drain used by tests; production shutdown goes via drop-tokens path.
+    #[allow(dead_code)]
     pub async fn shutdown(self, timeout: Duration) {
         let DynamicBatcher { sender, worker, .. } = self;
         drop(sender);
@@ -292,11 +303,14 @@ async fn run_worker(
         }
         // Second check: sender may have closed during the coalesce window.
         // Best-effort; accum/batch lengths don't matter post-dispatch.
-        let cancelled_at_dispatch = batch.iter().filter(|it| it.reply.is_closed()).count();
-        for _ in 0..cancelled_at_dispatch {
+        // Fused single pass: retain live items, then charge the diff to
+        // the cancelled-items counter (vs. two walks of the vec).
+        let before = batch.len();
+        batch.retain(|it| !it.reply.is_closed());
+        let cancelled = before - batch.len();
+        for _ in 0..cancelled {
             crate::metrics::record_cancelled(&name);
         }
-        batch.retain(|it| !it.reply.is_closed());
         if batch.is_empty() {
             continue;
         }
@@ -348,6 +362,7 @@ async fn dispatch_batch(items: Vec<Item>, embed_fn: EmbedFn, name: Arc<String>) 
                 return;
             }
             crate::metrics::record_inference(&name, start.elapsed(), total);
+            // Relies on embed_fn preserving input order — checked by vecs.len() == total above.
             for (reply, &n) in replies.into_iter().zip(counts.iter()) {
                 let _ = reply.send(Ok(vecs.drain(..n).collect()));
             }
@@ -457,6 +472,32 @@ mod tests {
         let captured = got.lock().unwrap().clone();
         assert_eq!(captured.len(), 1, "expected exactly one batch call");
         assert_eq!(captured[0], vec![vec![1u32, 2, 3], vec![4, 5]]);
+        b.shutdown(Duration::from_millis(200)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn embed_tokens_empty_input_returns_empty_output() {
+        // embed_tokens(vec![]) must short-circuit: no enqueue, no embed_fn call.
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let c = called.clone();
+        let b = DynamicBatcher::with_tokens(
+            "t_empty",
+            move |_| {
+                c.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(vec![])
+            },
+            1000,
+            10,
+            true,
+            50,
+            16,
+        );
+        let r = b.embed_tokens(vec![]).await.unwrap();
+        assert!(r.is_empty());
+        assert!(
+            !called.load(std::sync::atomic::Ordering::SeqCst),
+            "empty input must not invoke embed_fn"
+        );
         b.shutdown(Duration::from_millis(200)).await;
     }
 
