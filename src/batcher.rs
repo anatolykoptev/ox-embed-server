@@ -115,13 +115,11 @@ impl DynamicBatcher {
         texts: Vec<String>,
         reply: oneshot::Sender<Result<Vec<Vec<f32>>, String>>,
     ) -> Result<(), BatchError> {
-        self.sender
-            .try_send(Item { texts, reply })
-            .map_err(|_| {
-                BatchError::QueueFull(QueueFullError {
-                    batcher_name: self.name.as_ref().clone(),
-                })
+        self.sender.try_send(Item { texts, reply }).map_err(|_| {
+            BatchError::QueueFull(QueueFullError {
+                batcher_name: self.name.as_ref().clone(),
             })
+        })
     }
 }
 
