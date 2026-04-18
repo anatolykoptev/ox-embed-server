@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.0](https://github.com/anatolykoptev/ox-embed-server/compare/embed-server-v0.2.0...embed-server-v0.3.0) (2026-04-18)
+
+
+### Features
+
+* **embed:** Phase A throughput warm-up (cancel-check, ORT opt, auto-truncate) ([c210bc8](https://github.com/anatolykoptev/ox-embed-server/commit/c210bc84b00dd154c97a0b01cd564b73e23f2ae0))
+* **embed:** Phase B token-budget batcher (2x+ throughput on mixed loads) ([1dd856b](https://github.com/anatolykoptev/ox-embed-server/commit/1dd856b4e89b0060c23eba999544f9ede05052ab))
+
+
+### Performance Improvements
+
+* **api:** tokenize off tokio runtime ([604ed27](https://github.com/anatolykoptev/ox-embed-server/commit/604ed27f35d934830c8be8ca2fa8c923a61b3d3c))
+
 ## [0.2.0](https://github.com/anatolykoptev/ox-embed-server/compare/embed-server-v0.1.0...embed-server-v0.2.0) (2026-04-18)
 
 
