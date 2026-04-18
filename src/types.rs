@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::batcher::DynamicBatcher;
 use crate::cache::EmbeddingCache;
 use crate::model::EmbedModel;
+use crate::model_reranker::RerankerModel;
 
 // --- State ---
 
@@ -20,9 +21,29 @@ pub struct ModelEntry {
     pub batcher: Option<Arc<DynamicBatcher>>,
 }
 
+/// Entry for a single cross-encoder reranker: its inference handle plus
+/// the batcher adapter wired in `main.rs`. The batcher's `Vec<Vec<f32>>`
+/// contract is bent to fit a scalar-per-pair model by returning
+/// 1-element inner vecs — see the adapter comment in `main.rs`.
+pub struct RerankerEntry {
+    #[allow(dead_code)] // consumed by /v1/rerank handler (E3)
+    pub model: Arc<RerankerModel>,
+    /// Reranker batching reuses the same `BATCHING_ENABLED` switch as
+    /// embeddings: when true the handler dispatches through this batcher,
+    /// when false `main.rs` leaves it `None` and the handler (E3) falls
+    /// back to a direct `spawn_blocking(score_pairs)` call.
+    #[allow(dead_code)] // consumed by /v1/rerank handler (E3)
+    pub batcher: Option<Arc<DynamicBatcher>>,
+}
+
 /// Shared application state.
 pub struct AppState {
     pub models: HashMap<String, ModelEntry>,
+    /// Zero-or-more cross-encoder rerankers keyed by model name. An
+    /// empty map is valid — the server still serves `/v1/embeddings`;
+    /// `/v1/rerank` with any model name will 404/400 (E3).
+    #[allow(dead_code)] // consumed by /v1/rerank handler (E3)
+    pub rerankers: HashMap<String, RerankerEntry>,
     pub default_model: String,
     /// Cancelled on SIGTERM/SIGINT; handlers check this to reject new requests.
     pub shutdown: CancellationToken,

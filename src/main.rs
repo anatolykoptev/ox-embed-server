@@ -21,7 +21,8 @@ use crate::batcher::DynamicBatcher;
 use crate::cache::EmbeddingCache;
 use crate::config::Config;
 use crate::model::EmbedModel;
-use crate::types::{AppState, ModelEntry};
+use crate::model_reranker::RerankerModel;
+use crate::types::{AppState, ModelEntry, RerankerEntry};
 
 /// Waits for SIGTERM or SIGINT, then cancels the token and sleeps for drain_timeout
 /// to allow in-flight HTTP requests to complete before axum closes the listener.
@@ -69,8 +70,13 @@ async fn drain_batchers(state: Arc<AppState>, timeout: Duration) {
         }
     };
 
-    // Collect owned DynamicBatcher instances (consuming each Arc).
-    let mut owned: Vec<DynamicBatcher> = Vec::with_capacity(app_state.models.len());
+    // Collect owned DynamicBatcher instances (consuming each Arc). Both
+    // embed-model batchers and reranker batchers drain through the same
+    // `DynamicBatcher::shutdown(timeout)` path — the batcher doesn't
+    // care which kind of inference the adapter closure runs inside
+    // `spawn_blocking`.
+    let mut owned: Vec<DynamicBatcher> =
+        Vec::with_capacity(app_state.models.len() + app_state.rerankers.len());
     for (name, entry) in app_state.models.iter_mut() {
         let Some(arc) = entry.batcher.take() else {
             continue;
@@ -82,6 +88,21 @@ async fn drain_batchers(state: Arc<AppState>, timeout: Duration) {
                     model = %name,
                     strong = Arc::strong_count(&still_shared),
                     "batcher Arc still shared, skipping shutdown for this model"
+                );
+            }
+        }
+    }
+    for (name, entry) in app_state.rerankers.iter_mut() {
+        let Some(arc) = entry.batcher.take() else {
+            continue;
+        };
+        match Arc::try_unwrap(arc) {
+            Ok(b) => owned.push(b),
+            Err(still_shared) => {
+                tracing::warn!(
+                    reranker = %name,
+                    strong = Arc::strong_count(&still_shared),
+                    "reranker batcher Arc still shared, skipping shutdown"
                 );
             }
         }
@@ -183,9 +204,64 @@ async fn main() {
         );
     }
 
+    // Load every configured reranker the same way embedding models are
+    // loaded, before building AppState. An empty `cfg.rerankers` is a
+    // valid no-op — the server boots serving only `/v1/embeddings`.
+    let mut reranker_entries: HashMap<String, RerankerEntry> = HashMap::new();
+    for def in &cfg.rerankers {
+        tracing::info!(reranker = %def.name, dir = %def.dir, "loading reranker");
+        let m = RerankerModel::load(
+            &def.name,
+            &def.dir,
+            def.max_len,
+            def.padded_model,
+            cfg.intra_threads,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("failed to load reranker '{}': {e}", def.name);
+            std::process::exit(1);
+        });
+        let model_arc = Arc::new(m);
+
+        // Adapter bridging `RerankerModel::score_pairs -> Vec<f32>` into
+        // `DynamicBatcher`'s `Fn(Vec<Vec<u32>>) -> Vec<Vec<f32>>` contract.
+        // We wrap each scalar score as a 1-element Vec so the batcher's
+        // per-item "one vector per text" semantics still holds (the E3
+        // handler unwraps each inner Vec and takes element 0). The
+        // `into_iter`/`.map` form avoids the pointless copy that
+        // `.iter().map(|&s| vec![s])` would produce.
+        let batcher = if cfg.batching_enabled {
+            let rr = model_arc.clone();
+            let b = batcher::DynamicBatcher::with_tokens(
+                &def.name,
+                move |token_ids| {
+                    rr.score_pairs(&token_ids)
+                        .map(|scores| scores.into_iter().map(|s| vec![s]).collect())
+                },
+                cfg.batch_max_tokens,
+                cfg.batch_max,
+                def.padded_model,
+                cfg.batch_wait_ms,
+                cfg.max_queue_size,
+            );
+            Some(Arc::new(b))
+        } else {
+            None
+        };
+
+        reranker_entries.insert(
+            def.name.clone(),
+            RerankerEntry {
+                model: model_arc,
+                batcher,
+            },
+        );
+    }
+
     tracing::info!(
         batching_enabled = cfg.batching_enabled,
         models = model_entries.len(),
+        rerankers = reranker_entries.len(),
         "app state ready"
     );
 
@@ -207,6 +283,7 @@ async fn main() {
 
     let state = Arc::new(AppState {
         models: model_entries,
+        rerankers: reranker_entries,
         default_model: cfg.default_model,
         shutdown: shutdown_token.clone(),
         drain_timeout,
