@@ -68,13 +68,9 @@ pub async fn embeddings(
     let (mut cached, pending) = partition_hits_and_misses(&state.cache, &model_name, &texts);
 
     let hit_count = cached.iter().filter(|c| c.is_some()).count();
-    for _ in 0..hit_count {
-        crate::metrics::record_cache_hit(&model_name);
-    }
+    crate::metrics::record_cache_hit_n(&model_name, hit_count as u64);
     let miss_positions_total: usize = pending.values().map(Vec::len).sum();
-    for _ in 0..miss_positions_total {
-        crate::metrics::record_cache_miss(&model_name);
-    }
+    crate::metrics::record_cache_miss_n(&model_name, miss_positions_total as u64);
 
     // All-hit short-circuit: every position served from cache, no
     // tokenize or inference needed. Still records request-level metrics.

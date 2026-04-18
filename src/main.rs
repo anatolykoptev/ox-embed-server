@@ -16,6 +16,7 @@ use axum::Router;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_util::sync::CancellationToken;
 
+use crate::batcher::DynamicBatcher;
 use crate::cache::EmbeddingCache;
 use crate::config::Config;
 use crate::model::EmbedModel;
@@ -40,6 +41,75 @@ async fn shutdown_signal(token: CancellationToken, drain_timeout: Duration) {
     );
     tokio::time::sleep(drain_timeout).await;
     tracing::info!("drain complete");
+}
+
+/// Cleanly join every model's batcher worker after axum's HTTP drain has
+/// returned. By this point no handler holds an `Arc<AppState>` clone, so
+/// `Arc::try_unwrap` on the local `state` and on each `Arc<DynamicBatcher>`
+/// should succeed, letting us invoke `DynamicBatcher::shutdown(self, …)` —
+/// which drops the channel and awaits the `JoinHandle`, guaranteeing the
+/// worker finishes its current batch instead of being cut mid-forward-pass.
+///
+/// Defensive: if the strong count is still > 1 (somebody leaked a clone),
+/// we log a warn and skip rather than block or panic. Budget is `timeout`
+/// total across all batchers (they drain concurrently via `JoinSet`).
+///
+/// Production-only code path — the test-suite exercises `DynamicBatcher::shutdown`
+/// directly; this function wires it into the SIGTERM flow (follow-up task #20).
+async fn drain_batchers(state: Arc<AppState>, timeout: Duration) {
+    let mut app_state = match Arc::try_unwrap(state) {
+        Ok(s) => s,
+        Err(arc) => {
+            tracing::warn!(
+                strong = Arc::strong_count(&arc),
+                "AppState still shared after HTTP drain, skipping batcher shutdown"
+            );
+            return;
+        }
+    };
+
+    // Collect owned DynamicBatcher instances (consuming each Arc).
+    let mut owned: Vec<DynamicBatcher> = Vec::with_capacity(app_state.models.len());
+    for (name, entry) in app_state.models.iter_mut() {
+        let Some(arc) = entry.batcher.take() else {
+            continue;
+        };
+        match Arc::try_unwrap(arc) {
+            Ok(b) => owned.push(b),
+            Err(still_shared) => {
+                tracing::warn!(
+                    model = %name,
+                    strong = Arc::strong_count(&still_shared),
+                    "batcher Arc still shared, skipping shutdown for this model"
+                );
+            }
+        }
+    }
+
+    if owned.is_empty() {
+        tracing::info!("no batchers to drain");
+        return;
+    }
+
+    tracing::info!(
+        count = owned.len(),
+        secs = timeout.as_secs(),
+        "draining batcher workers"
+    );
+
+    // Drain all batchers concurrently; each respects its own `timeout`.
+    let mut set = tokio::task::JoinSet::new();
+    for b in owned {
+        set.spawn(async move {
+            b.shutdown(timeout).await;
+        });
+    }
+    while let Some(res) = set.join_next().await {
+        if let Err(e) = res {
+            tracing::warn!(error = %e, "batcher drain task panicked");
+        }
+    }
+    tracing::info!("batcher drain complete");
 }
 
 #[tokio::main]
@@ -125,6 +195,9 @@ async fn main() {
     // 10_000). Setting CACHE_MAX_ENTRIES=0 produces a disabled shell
     // (get/insert are no-ops) — the documented runtime kill-switch.
     let cache = Arc::new(EmbeddingCache::new(cfg.cache_max_entries));
+    // Stamp the gauge with 0 so /metrics exposes `embed_cache_size` from startup,
+    // even before the first cache miss populates it.
+    crate::metrics::set_cache_size(0);
     tracing::info!(
         cache_max_entries = cfg.cache_max_entries,
         cache_enabled = cache.is_enabled(),
@@ -140,6 +213,10 @@ async fn main() {
     });
 
     let metrics_handle = prom_handle.clone();
+    // Clone the Arc for the router (`.with_state` consumes it) — we retain
+    // the original binding so we can drain batcher workers once axum's HTTP
+    // drain returns.
+    let router_state = state.clone();
     let app = Router::new()
         .route("/health", axum::routing::get(|| async { "ok" }))
         .route(
@@ -158,7 +235,7 @@ async fn main() {
             }),
         )
         .route("/v1/embeddings", axum::routing::post(api::embeddings))
-        .with_state(state);
+        .with_state(router_state);
 
     let addr = format!("0.0.0.0:{}", cfg.port);
     tracing::info!(addr = %addr, "embed-server listening");
@@ -168,4 +245,9 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal(shutdown_token, drain_timeout))
         .await
         .unwrap();
+
+    // HTTP listener has closed and all handlers have returned — no `State<Arc<AppState>>`
+    // clones remain. Now cleanly join every batcher worker so no batch is cut
+    // mid-forward-pass. Uses the same drain_timeout budget (task #20).
+    drain_batchers(state, drain_timeout).await;
 }

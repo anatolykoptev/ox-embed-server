@@ -68,8 +68,7 @@ impl Item {
 pub struct DynamicBatcher {
     name: Arc<String>,
     sender: mpsc::Sender<Item>,
-    // Kept so `shutdown` can await worker drain; unused outside tests today.
-    #[allow(dead_code)]
+    // Held so `shutdown` can await the worker's `JoinHandle` on SIGTERM drain.
     worker: JoinHandle<()>,
 }
 
@@ -171,8 +170,9 @@ impl DynamicBatcher {
         }
     }
 
-    // Graceful drain used by tests; production shutdown goes via drop-tokens path.
-    #[allow(dead_code)]
+    /// Graceful drain: drop the channel so the worker sees all items through,
+    /// then wait up to `timeout` for its `JoinHandle` to finish. Called on
+    /// SIGTERM from `main::drain_batchers` after axum's HTTP drain returns.
     pub async fn shutdown(self, timeout: Duration) {
         let DynamicBatcher { sender, worker, .. } = self;
         drop(sender);
@@ -1108,6 +1108,43 @@ mod tests {
         assert!(
             text.contains("embed_cache_size 42"),
             "gauge should reflect latest set value in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn set_cache_size_zero_emits_metric_line() {
+        let h = test_prometheus_handle();
+        crate::metrics::set_cache_size(0);
+        let text = h.render();
+        assert!(
+            text.contains("embed_cache_size"),
+            "gauge line must be present after stamp: {text}"
+        );
+    }
+
+    #[test]
+    fn record_cache_hit_n_bulk_increments() {
+        let h = test_prometheus_handle();
+        let name = "tmodel_bulkn_hit"; // unique label; avoid collision with other tests
+        crate::metrics::record_cache_hit_n(name, 5);
+        let text = h.render();
+        let expected = format!("embed_cache_hit_total{{model=\"{name}\"}} 5");
+        assert!(
+            text.contains(&expected),
+            "expected `{expected}` in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn record_cache_miss_n_bulk_increments() {
+        let h = test_prometheus_handle();
+        let name = "tmodel_bulkn_miss";
+        crate::metrics::record_cache_miss_n(name, 3);
+        let text = h.render();
+        let expected = format!("embed_cache_miss_total{{model=\"{name}\"}} 3");
+        assert!(
+            text.contains(&expected),
+            "expected `{expected}` in:\n{text}"
         );
     }
 }
