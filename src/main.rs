@@ -5,6 +5,7 @@ mod cache_flow;
 mod config;
 mod metrics;
 mod model;
+mod model_reranker;
 mod pool;
 mod types;
 
