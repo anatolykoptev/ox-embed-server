@@ -23,6 +23,10 @@ pub struct Config {
     /// Graceful drain timeout for future shutdown support.
     #[allow(dead_code)]
     pub drain_timeout_s: u64,
+    /// When true (default, TEI-compat), tokenizer silently truncates
+    /// overlong inputs to model `max_len`. Set `AUTO_TRUNCATE=false`
+    /// to disable and keep the old strict behaviour.
+    pub auto_truncate: bool,
 }
 
 impl Config {
@@ -38,16 +42,16 @@ impl Config {
             .parse::<u16>()
             .map_err(|e| format!("invalid EMBED_PORT: {e}"))?;
 
-        let models_str = env::var("EMBED_MODELS")
-            .map_err(|_| "EMBED_MODELS env var is required")?;
+        let models_str =
+            env::var("EMBED_MODELS").map_err(|_| "EMBED_MODELS env var is required")?;
 
         let models = parse_models(&models_str)?;
         if models.is_empty() {
             return Err("EMBED_MODELS must define at least one model".into());
         }
 
-        let default_model = env::var("EMBED_DEFAULT_MODEL")
-            .unwrap_or_else(|_| models[0].name.clone());
+        let default_model =
+            env::var("EMBED_DEFAULT_MODEL").unwrap_or_else(|_| models[0].name.clone());
 
         if !models.iter().any(|m| m.name == default_model) {
             return Err(format!(
@@ -85,6 +89,14 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(10u64);
 
+        // AUTO_TRUNCATE defaults to true (TEI-compat). Only the literal
+        // string "false" (case-insensitive) disables it; anything else
+        // keeps the safe default.
+        let auto_truncate = env::var("AUTO_TRUNCATE")
+            .ok()
+            .map(|s| !s.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+
         Ok(Config {
             port,
             models,
@@ -95,6 +107,7 @@ impl Config {
             batch_wait_ms,
             max_queue_size,
             drain_timeout_s,
+            auto_truncate,
         })
     }
 }
@@ -117,11 +130,14 @@ fn parse_one_model(entry: &str) -> Result<ModelDef, String> {
         ));
     }
 
-    let dim = parts[2].parse::<usize>()
+    let dim = parts[2]
+        .parse::<usize>()
         .map_err(|e| format!("invalid dim '{}': {e}", parts[2]))?;
-    let max_len = parts[3].parse::<usize>()
+    let max_len = parts[3]
+        .parse::<usize>()
         .map_err(|e| format!("invalid max_len '{}': {e}", parts[3]))?;
-    let pad_id = parts[4].parse::<u32>()
+    let pad_id = parts[4]
+        .parse::<u32>()
         .map_err(|e| format!("invalid pad_id '{}': {e}", parts[4]))?;
     let has_tti = match parts[5] {
         "true" | "1" => true,
