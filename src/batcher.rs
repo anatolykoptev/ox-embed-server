@@ -97,6 +97,7 @@ async fn run_worker(mut rx: mpsc::Receiver<Item>, embed_fn: EmbedFn, name: Arc<S
             let rem = deadline.checked_duration_since(Instant::now()).unwrap_or(Duration::ZERO);
             match tokio::time::timeout(rem, rx.recv()).await {
                 Ok(Some(item)) if cum + item.texts.len() <= max_batch => {
+                    if item.reply.is_closed() { continue; }
                     cum += item.texts.len();
                     batch.push(item);
                 }
@@ -108,6 +109,8 @@ async fn run_worker(mut rx: mpsc::Receiver<Item>, embed_fn: EmbedFn, name: Arc<S
                 _ => break,
             }
         }
+        batch.retain(|it| !it.reply.is_closed());
+        if batch.is_empty() { continue; }
         dispatch_batch(batch, embed_fn.clone(), name.clone()).await;
     }
 }
@@ -269,6 +272,42 @@ mod tests {
                 assert!(msg.contains("model died"), "unexpected: {msg}");
             }
         }
+        Arc::try_unwrap(b).ok().expect("still has clones").shutdown(Duration::from_millis(200)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_items_are_skipped() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = call_count.clone();
+        let b = Arc::new(DynamicBatcher::with_name(
+            "t_cancel",
+            move |t: Vec<String>| {
+                cc.fetch_add(t.len(), Ordering::SeqCst);
+                Ok(t.iter().map(|_| vec![0.0f32; 4]).collect())
+            },
+            32, 50, 16,
+        ));
+        // Spawn a request, abort its JoinHandle before the batch window closes.
+        let b1 = b.clone();
+        let aborted = tokio::spawn(async move { b1.embed(vec!["cancelled".into()]).await });
+        // Give it a moment to enter the worker's inner loop, then abort.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        aborted.abort();
+        // Wait for the batch window (50ms) to elapse so the worker dispatches.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        // Second, healthy, request.
+        let r = b.embed(vec!["alive".into()]).await.unwrap();
+        assert_eq!(r.len(), 1);
+        // Inference should have run ONLY for the second "alive" text (1 total).
+        // Pre-fix: count == 2.
+        // Post-fix: count == 1.
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "expected only the live item to be embedded, got {} total",
+            call_count.load(Ordering::SeqCst)
+        );
         Arc::try_unwrap(b).ok().expect("still has clones").shutdown(Duration::from_millis(200)).await;
     }
 }
