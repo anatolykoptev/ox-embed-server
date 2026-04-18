@@ -24,8 +24,14 @@ pub struct Config {
     #[allow(dead_code)]
     pub drain_timeout_s: u64,
     /// When true (default, TEI-compat), tokenizer silently truncates
-    /// overlong inputs to model `max_len`. Set `AUTO_TRUNCATE=false`
-    /// to disable and keep the old strict behaviour.
+    /// overlong inputs to model `max_len`.
+    ///
+    /// Only the literal string `"false"` (case-insensitive) disables
+    /// this; values like `"0"`, `"no"`, `"off"`, or `""` LEAVE truncation
+    /// enabled. This matches Hugging Face `text-embeddings-inference`
+    /// convention — `AUTO_TRUNCATE=false` is the one documented escape
+    /// hatch, and we refuse to silently interpret other "falsy"
+    /// strings the same way to avoid surprise disables.
     pub auto_truncate: bool,
 }
 
