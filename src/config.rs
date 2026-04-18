@@ -128,13 +128,23 @@ impl Config {
     }
 }
 
-/// Parse `BATCH_MAX_TOKENS` env value. Unset, empty, or unparseable → 16384
-/// (TEI default). Exposed for testing; env lookup stays in `from_env`.
+/// Parse `BATCH_MAX_TOKENS` env value. Unset, empty, unparseable, or `0` →
+/// 16384 (TEI default). `0` would degenerate the batcher to one item per
+/// dispatch (strict `<` gate never admits a 2nd item), so it's rejected
+/// with a warn rather than silently accepted. Exposed for testing; env
+/// lookup stays in `from_env`.
 fn parse_batch_max_tokens(raw: Option<&str>) -> usize {
     const DEFAULT: usize = 16384;
     match raw {
         None => DEFAULT,
-        Some(s) => s.trim().parse::<usize>().unwrap_or(DEFAULT),
+        Some(s) => match s.trim().parse::<usize>() {
+            Ok(0) => {
+                tracing::warn!("BATCH_MAX_TOKENS=0 is invalid; falling back to default {DEFAULT}");
+                DEFAULT
+            }
+            Ok(n) => n,
+            Err(_) => DEFAULT,
+        },
     }
 }
 
@@ -205,5 +215,13 @@ mod tests {
         assert_eq!(parse_batch_max_tokens(Some("nope")), 16384);
         assert_eq!(parse_batch_max_tokens(Some("-1")), 16384);
         assert_eq!(parse_batch_max_tokens(Some("")), 16384);
+    }
+
+    #[test]
+    fn batch_max_tokens_rejects_zero() {
+        // `0` parses as a valid usize but would starve the batcher (strict `<`
+        // budget gate means no 2nd item ever joins a batch); fall back to default.
+        assert_eq!(parse_batch_max_tokens(Some("0")), 16384);
+        assert_eq!(parse_batch_max_tokens(Some("  0  ")), 16384);
     }
 }
