@@ -68,8 +68,7 @@ impl Item {
 pub struct DynamicBatcher {
     name: Arc<String>,
     sender: mpsc::Sender<Item>,
-    // Kept so `shutdown` can await worker drain; unused outside tests today.
-    #[allow(dead_code)]
+    // Held so `shutdown` can await the worker's `JoinHandle` on SIGTERM drain.
     worker: JoinHandle<()>,
 }
 
@@ -171,8 +170,9 @@ impl DynamicBatcher {
         }
     }
 
-    // Graceful drain used by tests; production shutdown goes via drop-tokens path.
-    #[allow(dead_code)]
+    /// Graceful drain: drop the channel so the worker sees all items through,
+    /// then wait up to `timeout` for its `JoinHandle` to finish. Called on
+    /// SIGTERM from `main::drain_batchers` after axum's HTTP drain returns.
     pub async fn shutdown(self, timeout: Duration) {
         let DynamicBatcher { sender, worker, .. } = self;
         drop(sender);
