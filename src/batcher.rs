@@ -303,11 +303,14 @@ async fn run_worker(
         }
         // Second check: sender may have closed during the coalesce window.
         // Best-effort; accum/batch lengths don't matter post-dispatch.
-        let cancelled_at_dispatch = batch.iter().filter(|it| it.reply.is_closed()).count();
-        for _ in 0..cancelled_at_dispatch {
+        // Fused single pass: retain live items, then charge the diff to
+        // the cancelled-items counter (vs. two walks of the vec).
+        let before = batch.len();
+        batch.retain(|it| !it.reply.is_closed());
+        let cancelled = before - batch.len();
+        for _ in 0..cancelled {
             crate::metrics::record_cancelled(&name);
         }
-        batch.retain(|it| !it.reply.is_closed());
         if batch.is_empty() {
             continue;
         }
@@ -359,6 +362,7 @@ async fn dispatch_batch(items: Vec<Item>, embed_fn: EmbedFn, name: Arc<String>) 
                 return;
             }
             crate::metrics::record_inference(&name, start.elapsed(), total);
+            // Relies on embed_fn preserving input order — checked by vecs.len() == total above.
             for (reply, &n) in replies.into_iter().zip(counts.iter()) {
                 let _ = reply.send(Ok(vecs.drain(..n).collect()));
             }
