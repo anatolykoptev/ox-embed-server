@@ -6,9 +6,42 @@ use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::value::Tensor;
 use tokenizers::Tokenizer;
+use tokenizers::utils::truncation::{TruncationDirection, TruncationParams, TruncationStrategy};
 
 use crate::config::ModelDef;
 use crate::pool;
+
+/// Configure tokenizer truncation.
+///
+/// When `auto_truncate` is true, the tokenizer will silently truncate any
+/// input longer than `max_len` tokens (TEI-compat default — matches Hugging
+/// Face's `text-embeddings-inference` behaviour).
+///
+/// When `auto_truncate` is false, truncation is cleared; overlong inputs
+/// encode to more than `max_len` tokens and downstream code decides how to
+/// handle them (currently `pool::build_tensors` still clips to `max_len`,
+/// but this may change — keeping the strict switch lets callers detect
+/// overlong inputs if we ever wire that up).
+pub fn configure_truncation(
+    tokenizer: &mut Tokenizer,
+    auto_truncate: bool,
+    max_len: usize,
+) -> Result<(), String> {
+    let params = if auto_truncate {
+        Some(TruncationParams {
+            direction: TruncationDirection::Right,
+            max_length: max_len,
+            strategy: TruncationStrategy::LongestFirst,
+            stride: 0,
+        })
+    } else {
+        None
+    };
+    tokenizer
+        .with_truncation(params)
+        .map(|_| ())
+        .map_err(|e| format!("with_truncation: {e}"))
+}
 
 /// Parse the `ORT_OPT_LEVEL` env var (0..=3) into an ort
 /// `GraphOptimizationLevel`. Defaults to `Level3` (all optimizations) when
@@ -39,7 +72,15 @@ pub struct EmbedModel {
 impl EmbedModel {
     /// Load model from a directory containing model_quantized.onnx
     /// and tokenizer.json.
-    pub fn load(def: &ModelDef, intra_threads: usize) -> Result<Self, String> {
+    ///
+    /// `auto_truncate`: if true (TEI-compat default), the tokenizer silently
+    /// truncates inputs longer than `def.max_len`. If false, truncation is
+    /// left disabled on the tokenizer.
+    pub fn load(
+        def: &ModelDef,
+        intra_threads: usize,
+        auto_truncate: bool,
+    ) -> Result<Self, String> {
         let dir = Path::new(&def.dir);
 
         let onnx_path = dir.join("model_quantized.onnx");
@@ -72,9 +113,10 @@ impl EmbedModel {
         tracing::info!("ONNX session created");
 
         tracing::info!(path = %tok_path.display(), "loading tokenizer");
-        let tokenizer = Tokenizer::from_file(&tok_path)
+        let mut tokenizer = Tokenizer::from_file(&tok_path)
             .map_err(|e| format!("load tokenizer: {e}"))?;
-        tracing::info!("tokenizer loaded");
+        configure_truncation(&mut tokenizer, auto_truncate, def.max_len)?;
+        tracing::info!(auto_truncate, "tokenizer loaded");
 
         tracing::info!(
             model = %def.name,
@@ -82,6 +124,7 @@ impl EmbedModel {
             max_len = def.max_len,
             pad_id = def.pad_id,
             has_tti = def.has_token_type_ids,
+            auto_truncate,
             "loaded model"
         );
 
@@ -160,6 +203,86 @@ impl EmbedModel {
         .map_err(|e| format!("mask_f shape: {e}"))?;
 
         pool::mean_pool_normalize(&raw, &mask_arr_f, batch, max_seq, self.dim)
+    }
+}
+
+#[cfg(test)]
+mod truncation_tests {
+    use super::*;
+    use tokenizers::Tokenizer;
+
+    /// Load the real e5 tokenizer.json if present; skip test otherwise so
+    /// the suite still passes on dev boxes without the model bundle.
+    fn load_tokenizer_or_skip() -> Option<Tokenizer> {
+        let p = "/home/krolik/deploy/krolik-server/models/multilingual-e5-large/tokenizer.json";
+        if !std::path::Path::new(p).exists() {
+            eprintln!("skipping: tokenizer.json not at {p}");
+            return None;
+        }
+        Some(Tokenizer::from_file(p).expect("load tokenizer"))
+    }
+
+    #[test]
+    fn configure_truncation_enables_when_auto_true() {
+        let Some(mut tok) = load_tokenizer_or_skip() else { return; };
+        // Precondition: the on-disk tokenizer.json has truncation: null.
+        assert!(
+            tok.get_truncation().is_none(),
+            "precondition: shipped tokenizer.json should have no truncation"
+        );
+
+        configure_truncation(&mut tok, true, 512).expect("configure_truncation");
+
+        let params = tok
+            .get_truncation()
+            .expect("truncation should be enabled when auto_truncate=true");
+        assert_eq!(params.max_length, 512);
+    }
+
+    #[test]
+    fn configure_truncation_disabled_when_auto_false() {
+        let Some(mut tok) = load_tokenizer_or_skip() else { return; };
+        // Pre-seed truncation so we can assert it gets cleared.
+        configure_truncation(&mut tok, true, 512).expect("seed");
+        assert!(tok.get_truncation().is_some());
+
+        configure_truncation(&mut tok, false, 512).expect("configure_truncation");
+
+        assert!(
+            tok.get_truncation().is_none(),
+            "truncation should be disabled when auto_truncate=false"
+        );
+    }
+
+    #[test]
+    fn overlong_input_encodes_within_max_len_when_auto_truncate_on() {
+        let Some(mut tok) = load_tokenizer_or_skip() else { return; };
+        configure_truncation(&mut tok, true, 512).expect("configure_truncation");
+
+        // Make an input that tokenises to well over 512 tokens.
+        let long = "word ".repeat(5000);
+        let enc = tok.encode(long, true).expect("encode");
+        assert!(
+            enc.get_ids().len() <= 512,
+            "expected <= 512 ids, got {}",
+            enc.get_ids().len()
+        );
+    }
+
+    #[test]
+    fn overlong_input_exceeds_max_len_when_auto_truncate_off() {
+        let Some(mut tok) = load_tokenizer_or_skip() else { return; };
+        // Explicitly disabled: we keep the current (pre-A3) strict-ish behaviour
+        // where the encoder emits full-length output and downstream code decides.
+        configure_truncation(&mut tok, false, 512).expect("configure_truncation");
+
+        let long = "word ".repeat(5000);
+        let enc = tok.encode(long, true).expect("encode");
+        assert!(
+            enc.get_ids().len() > 512,
+            "expected overlong ids when truncation off, got {}",
+            enc.get_ids().len()
+        );
     }
 }
 

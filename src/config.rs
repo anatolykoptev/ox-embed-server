@@ -23,6 +23,10 @@ pub struct Config {
     /// Graceful drain timeout for future shutdown support.
     #[allow(dead_code)]
     pub drain_timeout_s: u64,
+    /// When true (default, TEI-compat), tokenizer silently truncates
+    /// overlong inputs to model `max_len`. Set `AUTO_TRUNCATE=false`
+    /// to disable and keep the old strict behaviour.
+    pub auto_truncate: bool,
 }
 
 impl Config {
@@ -85,6 +89,14 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(10u64);
 
+        // AUTO_TRUNCATE defaults to true (TEI-compat). Only the literal
+        // string "false" (case-insensitive) disables it; anything else
+        // keeps the safe default.
+        let auto_truncate = env::var("AUTO_TRUNCATE")
+            .ok()
+            .map(|s| !s.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+
         Ok(Config {
             port,
             models,
@@ -95,6 +107,7 @@ impl Config {
             batch_wait_ms,
             max_queue_size,
             drain_timeout_s,
+            auto_truncate,
         })
     }
 }

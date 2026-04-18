@@ -63,7 +63,7 @@ async fn main() {
     let mut raw_models: HashMap<String, Arc<EmbedModel>> = HashMap::new();
     for def in &cfg.models {
         tracing::info!(model = %def.name, dir = %def.dir, "loading model");
-        let m = EmbedModel::load(def, cfg.intra_threads).unwrap_or_else(|e| {
+        let m = EmbedModel::load(def, cfg.intra_threads, cfg.auto_truncate).unwrap_or_else(|e| {
             eprintln!("failed to load model '{}': {e}", def.name);
             std::process::exit(1);
         });
