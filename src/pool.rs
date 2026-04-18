@@ -1,9 +1,13 @@
 use ndarray::ArrayViewD;
-use tokenizers::Encoding;
 
-/// Build padded i64 tensors for input_ids, attention_mask, token_type_ids.
-pub fn build_tensors(
-    encodings: &[Encoding],
+/// Build padded i64 tensors for input_ids, attention_mask, token_type_ids
+/// from pre-tokenized `Vec<u32>` ids (one per sequence).
+///
+/// `attention_mask[i, j] = 1` iff `j < token_ids[i].len()` (synthesised
+/// mask: 1 over real positions, 0 over pad positions). `token_type_ids`
+/// are always zeros — single-input embedding has no segment-B.
+pub fn build_tensors_from_ids(
+    token_ids: &[Vec<u32>],
     batch: usize,
     max_seq: usize,
     pad_id: u32,
@@ -13,14 +17,12 @@ pub fn build_tensors(
     let mut mask = vec![0i64; total];
     let tti = vec![0i64; total]; // always zeros
 
-    for (i, enc) in encodings.iter().enumerate() {
-        let token_ids = enc.get_ids();
-        let attn_mask = enc.get_attention_mask();
-        let len = token_ids.len().min(max_seq);
+    for (i, seq) in token_ids.iter().enumerate() {
+        let len = seq.len().min(max_seq);
         let offset = i * max_seq;
         for j in 0..len {
-            ids[offset + j] = token_ids[j] as i64;
-            mask[offset + j] = attn_mask[j] as i64;
+            ids[offset + j] = seq[j] as i64;
+            mask[offset + j] = 1i64;
         }
     }
 

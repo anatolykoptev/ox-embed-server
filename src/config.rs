@@ -17,7 +17,14 @@ pub struct Config {
     pub default_model: String,
     pub intra_threads: usize,
     pub batching_enabled: bool,
+    /// Soft cap on items (texts) per batch — retained for fairness, so
+    /// one giant multi-text request can't monopolise a single dispatch.
+    /// The primary budget in Phase B is `batch_max_tokens`.
     pub batch_max: usize,
+    /// Primary batch budget: maximum total tokens per dispatched batch.
+    /// Counted with padded-model accounting — see `DynamicBatcher::with_tokens`.
+    /// Default 16384 (TEI).
+    pub batch_max_tokens: usize,
     pub batch_wait_ms: u64,
     pub max_queue_size: usize,
     /// Graceful drain timeout for future shutdown support.
@@ -80,6 +87,8 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(32usize);
 
+        let batch_max_tokens = parse_batch_max_tokens(env::var("BATCH_MAX_TOKENS").ok().as_deref());
+
         let batch_wait_ms = env::var("BATCH_WAIT_MS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -110,11 +119,22 @@ impl Config {
             intra_threads,
             batching_enabled,
             batch_max,
+            batch_max_tokens,
             batch_wait_ms,
             max_queue_size,
             drain_timeout_s,
             auto_truncate,
         })
+    }
+}
+
+/// Parse `BATCH_MAX_TOKENS` env value. Unset, empty, or unparseable → 16384
+/// (TEI default). Exposed for testing; env lookup stays in `from_env`.
+fn parse_batch_max_tokens(raw: Option<&str>) -> usize {
+    const DEFAULT: usize = 16384;
+    match raw {
+        None => DEFAULT,
+        Some(s) => s.trim().parse::<usize>().unwrap_or(DEFAULT),
     }
 }
 
@@ -159,4 +179,31 @@ fn parse_one_model(entry: &str) -> Result<ModelDef, String> {
         pad_id,
         has_token_type_ids: has_tti,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_max_tokens_default_is_16384_when_unset() {
+        assert_eq!(parse_batch_max_tokens(None), 16384);
+    }
+
+    #[test]
+    fn batch_max_tokens_parses_valid_positive_integer() {
+        assert_eq!(parse_batch_max_tokens(Some("8192")), 8192);
+        assert_eq!(parse_batch_max_tokens(Some("32768")), 32768);
+        // Surrounding whitespace is tolerated — env vars sometimes pick it
+        // up from shell quoting mistakes.
+        assert_eq!(parse_batch_max_tokens(Some("  4096  ")), 4096);
+    }
+
+    #[test]
+    fn batch_max_tokens_falls_back_on_garbage() {
+        // Non-numeric → default (TEI behaviour: don't crash on typos).
+        assert_eq!(parse_batch_max_tokens(Some("nope")), 16384);
+        assert_eq!(parse_batch_max_tokens(Some("-1")), 16384);
+        assert_eq!(parse_batch_max_tokens(Some("")), 16384);
+    }
 }

@@ -83,10 +83,16 @@ async fn main() {
     for (name, model_arc) in raw_models {
         let batcher = if cfg.batching_enabled {
             let m = model_arc.clone();
-            let b = batcher::DynamicBatcher::with_name(
+            // ONNX BERT-style encoders always pad to max(seq_len), so
+            // padded_model=true is the right accounting for our stack.
+            // Kept as a batcher parameter so tests can exercise the
+            // non-padded branch directly.
+            let b = batcher::DynamicBatcher::with_tokens(
                 &name,
-                move |texts| m.embed(&texts),
+                move |token_ids| m.embed_tokens(&token_ids),
+                cfg.batch_max_tokens,
                 cfg.batch_max,
+                /*padded_model*/ true,
                 cfg.batch_wait_ms,
                 cfg.max_queue_size,
             );

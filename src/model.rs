@@ -142,27 +142,52 @@ impl EmbedModel {
         })
     }
 
-    /// Embed a batch of texts, returning one vector per text.
-    pub fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+    /// Tokenize a batch of texts into their `input_ids`. Truncation is
+    /// applied according to the tokenizer's configuration (see
+    /// `configure_truncation`), then defensively capped at `self.max_len`
+    /// per sequence. Runs the tokenizer only — no ONNX forward pass —
+    /// so callers can cheaply compute token counts before dispatching
+    /// a batch (enables token-budget accounting in the batcher).
+    pub fn tokenize(&self, texts: &[String]) -> Result<Vec<Vec<u32>>, String> {
         if texts.is_empty() {
             return Ok(vec![]);
         }
-
         let encodings = self
             .tokenizer
             .encode_batch(texts.to_vec(), true)
             .map_err(|e| format!("tokenize: {e}"))?;
-
-        // Find actual max length in batch, cap at model max.
-        let max_seq = encodings
+        // Per-seq truncation: the tokenizer is already configured to truncate
+        // when auto_truncate=true, but we defensively cap here too so callers
+        // can rely on the bound regardless of tokenizer state.
+        Ok(encodings
             .iter()
-            .map(|e| e.get_ids().len())
+            .map(|e| {
+                let ids = e.get_ids();
+                let len = ids.len().min(self.max_len);
+                ids[..len].to_vec()
+            })
+            .collect())
+    }
+
+    /// Embed a batch of pre-tokenized `input_ids`, returning one vector
+    /// per sequence. Skips the tokenizer entirely — callers are
+    /// responsible for having already run `tokenize()`.
+    pub fn embed_tokens(&self, token_ids: &[Vec<u32>]) -> Result<Vec<Vec<f32>>, String> {
+        if token_ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Pad to the longest sequence in the batch, capped at model max.
+        let max_seq = token_ids
+            .iter()
+            .map(|v| v.len())
             .max()
             .unwrap_or(0)
             .min(self.max_len);
 
-        let batch = encodings.len();
-        let (ids, mask_i64, tti) = pool::build_tensors(&encodings, batch, max_seq, self.pad_id);
+        let batch = token_ids.len();
+        let (ids, mask_i64, tti) =
+            pool::build_tensors_from_ids(token_ids, batch, max_seq, self.pad_id);
 
         let ids_arr =
             Array2::from_shape_vec([batch, max_seq], ids).map_err(|e| format!("ids shape: {e}"))?;
