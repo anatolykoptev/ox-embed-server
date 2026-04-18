@@ -83,8 +83,12 @@ impl DynamicBatcher {
 type EmbedFn = Arc<dyn Fn(Vec<String>) -> Result<Vec<Vec<f32>>, String> + Send + Sync + 'static>;
 
 async fn run_worker(mut rx: mpsc::Receiver<Item>, embed_fn: EmbedFn, name: Arc<String>, max_batch: usize, wait: Duration) {
+    let mut carry: Option<Item> = None;
     loop {
-        let first = match rx.recv().await { Some(i) => i, None => break };
+        let first = match carry.take() {
+            Some(c) => c,
+            None => match rx.recv().await { Some(i) => i, None => break },
+        };
         let mut batch = vec![first];
         let mut cum = batch[0].texts.len();
         let deadline = Instant::now() + wait;
@@ -97,7 +101,8 @@ async fn run_worker(mut rx: mpsc::Receiver<Item>, embed_fn: EmbedFn, name: Arc<S
                     batch.push(item);
                 }
                 Ok(Some(item)) => {
-                    let _ = item.reply.send(Err("item exceeded max_batch after coalesce".into()));
+                    // Overflow: defer this item to the next batch instead of dropping it.
+                    carry = Some(item);
                     break;
                 }
                 _ => break,
@@ -223,6 +228,34 @@ mod tests {
             let _ = filler.await;
         }
         Arc::try_unwrap(b).ok().expect("still has clones").shutdown(Duration::from_millis(500)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coalesce_overflow_defers_to_next_batch() {
+        // Regression: previously the 2nd request got "item exceeded max_batch after coalesce"
+        // and was dropped. Now it should be deferred into the next batch and still succeed.
+        let log = Arc::new(Mutex::new(vec![]));
+        let b = Arc::new(log_batcher("t_defer", log.clone(), 4, 100, 16));
+        {
+            let (b1, b2) = (b.clone(), b.clone());
+            let (r1, r2) = tokio::join!(
+                b1.embed(vec!["a".into(), "b".into(), "c".into()]),
+                async {
+                    tokio::time::sleep(Duration::from_millis(15)).await;
+                    b2.embed(vec!["d".into(), "e".into()]).await
+                },
+            );
+            let v1 = r1.expect("first request must succeed");
+            let v2 = r2.expect("second request must succeed (previously dropped)");
+            assert_eq!(v1.len(), 3);
+            assert_eq!(v2.len(), 2);
+        }
+        let calls = log.lock().unwrap();
+        assert_eq!(calls.len(), 2, "expected exactly 2 batches, got {}", calls.len());
+        assert_eq!(calls[0], vec!["a", "b", "c"]);
+        assert_eq!(calls[1], vec!["d", "e"]);
+        drop(calls);
+        Arc::try_unwrap(b).ok().expect("still has clones").shutdown(Duration::from_millis(200)).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
