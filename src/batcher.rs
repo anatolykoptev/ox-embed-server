@@ -36,7 +36,9 @@ impl std::error::Error for QueueFullError {}
 
 #[derive(Debug)]
 struct Item {
-    texts: Vec<String>,
+    /// One entry per text in the request. Each entry is the tokenizer's
+    /// input_ids (already truncated to the model's `max_len`).
+    token_ids: Vec<Vec<u32>>,
     reply: oneshot::Sender<Result<Vec<Vec<f32>>, String>>,
 }
 
@@ -48,7 +50,8 @@ pub struct DynamicBatcher {
 }
 
 impl DynamicBatcher {
-    /// Create a batcher and start its worker.  `embed_fn` runs in `spawn_blocking`.
+    /// Create a batcher and start its worker.  `embed_fn` runs in `spawn_blocking`
+    /// and receives pre-tokenized input_ids (one `Vec<u32>` per text).
     pub fn with_name<F>(
         name: &str,
         embed_fn: F,
@@ -57,7 +60,7 @@ impl DynamicBatcher {
         max_queue: usize,
     ) -> Self
     where
-        F: Fn(Vec<String>) -> Result<Vec<Vec<f32>>, String> + Send + Sync + 'static,
+        F: Fn(Vec<Vec<u32>>) -> Result<Vec<Vec<f32>>, String> + Send + Sync + 'static,
     {
         let (tx, rx) = mpsc::channel::<Item>(max_queue);
         let arc_name = Arc::new(name.to_string());
@@ -75,12 +78,16 @@ impl DynamicBatcher {
         }
     }
 
-    pub async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, BatchError> {
+    /// Submit a request carrying pre-tokenized input_ids (one `Vec<u32>` per text).
+    pub async fn embed_tokens(
+        &self,
+        token_ids: Vec<Vec<u32>>,
+    ) -> Result<Vec<Vec<f32>>, BatchError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .sender
             .try_send(Item {
-                texts,
+                token_ids,
                 reply: reply_tx,
             })
             .is_err()
@@ -112,18 +119,20 @@ impl DynamicBatcher {
     #[cfg(test)]
     fn enqueue_for_test(
         &self,
-        texts: Vec<String>,
+        token_ids: Vec<Vec<u32>>,
         reply: oneshot::Sender<Result<Vec<Vec<f32>>, String>>,
     ) -> Result<(), BatchError> {
-        self.sender.try_send(Item { texts, reply }).map_err(|_| {
-            BatchError::QueueFull(QueueFullError {
-                batcher_name: self.name.as_ref().clone(),
+        self.sender
+            .try_send(Item { token_ids, reply })
+            .map_err(|_| {
+                BatchError::QueueFull(QueueFullError {
+                    batcher_name: self.name.as_ref().clone(),
+                })
             })
-        })
     }
 }
 
-type EmbedFn = Arc<dyn Fn(Vec<String>) -> Result<Vec<Vec<f32>>, String> + Send + Sync + 'static>;
+type EmbedFn = Arc<dyn Fn(Vec<Vec<u32>>) -> Result<Vec<Vec<f32>>, String> + Send + Sync + 'static>;
 
 async fn run_worker(
     mut rx: mpsc::Receiver<Item>,
@@ -142,7 +151,7 @@ async fn run_worker(
             },
         };
         let mut batch = vec![first];
-        let mut cum = batch[0].texts.len();
+        let mut cum = batch[0].token_ids.len();
         let deadline = Instant::now() + wait;
         loop {
             if cum >= max_batch {
@@ -152,15 +161,15 @@ async fn run_worker(
                 .checked_duration_since(Instant::now())
                 .unwrap_or(Duration::ZERO);
             match tokio::time::timeout(rem, rx.recv()).await {
-                Ok(Some(item)) if cum + item.texts.len() <= max_batch => {
+                Ok(Some(item)) if cum + item.token_ids.len() <= max_batch => {
                     // Client disconnected before the batch window closed — skip this item
-                    // without charging its tokens to the batch budget. Best-effort: the
+                    // without charging it to the batch budget. Best-effort: the
                     // sender may still close between this check and dispatch, and that's fine.
                     if item.reply.is_closed() {
                         crate::metrics::record_cancelled(&name);
                         continue;
                     }
-                    cum += item.texts.len();
+                    cum += item.token_ids.len();
                     batch.push(item);
                 }
                 Ok(Some(item)) => {
@@ -186,14 +195,18 @@ async fn run_worker(
 }
 
 async fn dispatch_batch(items: Vec<Item>, embed_fn: EmbedFn, name: Arc<String>) {
-    let counts: Vec<usize> = items.iter().map(|i| i.texts.len()).collect();
-    let mut texts: Vec<String> = Vec::new();
+    let counts: Vec<usize> = items.iter().map(|i| i.token_ids.len()).collect();
+    let mut ids: Vec<Vec<u32>> = Vec::new();
     let mut replies = Vec::with_capacity(items.len());
-    for Item { texts: t, reply } in items {
-        texts.extend(t);
+    for Item {
+        token_ids: t,
+        reply,
+    } in items
+    {
+        ids.extend(t);
         replies.push(reply);
     }
-    let total = texts.len();
+    let total = ids.len();
     let start = Instant::now();
 
     let fan_err = |replies: Vec<oneshot::Sender<_>>, msg: String| {
@@ -202,7 +215,7 @@ async fn dispatch_batch(items: Vec<Item>, embed_fn: EmbedFn, name: Arc<String>) 
         }
     };
 
-    match tokio::task::spawn_blocking(move || embed_fn(texts)).await {
+    match tokio::task::spawn_blocking(move || embed_fn(ids)).await {
         Ok(Ok(mut vecs)) => {
             if vecs.len() != total {
                 fan_err(
@@ -240,18 +253,21 @@ mod tests {
         })
     }
 
+    /// Test helper: build a batcher that logs each dispatched batch's
+    /// token-id vectors (one `Vec<Vec<u32>>` per batch call) and returns
+    /// deterministic fixed-size vectors.
     fn log_batcher(
         name: &str,
-        log: Arc<Mutex<Vec<Vec<String>>>>,
+        log: Arc<Mutex<Vec<Vec<Vec<u32>>>>>,
         max_batch: usize,
         wait_ms: u64,
         max_queue: usize,
     ) -> DynamicBatcher {
         DynamicBatcher::with_name(
             name,
-            move |t| {
-                log.lock().unwrap().push(t.clone());
-                Ok(t.iter().map(|_| vec![1.0f32, 2.0, 3.0, 4.0]).collect())
+            move |ids: Vec<Vec<u32>>| {
+                log.lock().unwrap().push(ids.clone());
+                Ok(ids.iter().map(|_| vec![1.0f32, 2.0, 3.0, 4.0]).collect())
             },
             max_batch,
             wait_ms,
@@ -259,16 +275,49 @@ mod tests {
         )
     }
 
+    /// Distinct single-token ids, useful when tests want to assert that a
+    /// specific item round-tripped without collisions.
+    fn tok(ids: &[u32]) -> Vec<Vec<u32>> {
+        ids.iter().map(|&i| vec![i]).collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn batcher_passes_token_ids_verbatim() {
+        // RED for B1: the batcher must forward pre-tokenized input_ids
+        // (Vec<Vec<u32>>) to the embed closure unchanged.
+        let got: Arc<Mutex<Vec<Vec<Vec<u32>>>>> = Arc::new(Mutex::new(vec![]));
+        let g = got.clone();
+        let b = DynamicBatcher::with_name(
+            "t_tok",
+            move |ids: Vec<Vec<u32>>| {
+                g.lock().unwrap().push(ids.clone());
+                Ok(ids.iter().map(|_| vec![0.0f32; 4]).collect())
+            },
+            32,
+            50,
+            16,
+        );
+        let r = b
+            .embed_tokens(vec![vec![1u32, 2, 3], vec![4, 5]])
+            .await
+            .unwrap();
+        assert_eq!(r.len(), 2);
+        let captured = got.lock().unwrap().clone();
+        assert_eq!(captured.len(), 1, "expected exactly one batch call");
+        assert_eq!(captured[0], vec![vec![1u32, 2, 3], vec![4, 5]]);
+        b.shutdown(Duration::from_millis(200)).await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn single_request_no_coalesce() {
         let log = Arc::new(Mutex::new(vec![]));
         let b = log_batcher("t1", log.clone(), 32, 50, 16);
-        let r = b.embed(vec!["a".into(), "b".into()]).await.unwrap();
+        let r = b.embed_tokens(tok(&[1, 2])).await.unwrap();
         assert_eq!(r.len(), 2);
         assert_eq!(r[0].len(), 4);
         let calls = log.lock().unwrap();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0], vec!["a", "b"]);
+        assert_eq!(calls[0], tok(&[1, 2]));
         drop(calls);
         b.shutdown(Duration::from_millis(200)).await;
     }
@@ -280,9 +329,9 @@ mod tests {
         {
             let (b1, b2, b3) = (b.clone(), b.clone(), b.clone());
             let (r1, r2, r3) = tokio::join!(
-                b1.embed(vec!["a".into(), "b".into()]),
-                b2.embed(vec!["c".into(), "d".into(), "e".into()]),
-                b3.embed(vec!["f".into()]),
+                b1.embed_tokens(tok(&[1, 2])),
+                b2.embed_tokens(tok(&[3, 4, 5])),
+                b3.embed_tokens(tok(&[6])),
             );
             assert!(r1.is_ok());
             assert!(r2.is_ok());
@@ -294,9 +343,14 @@ mod tests {
             "expected <=2 batches, got {}",
             calls.len()
         );
-        let all: Vec<String> = calls.iter().flat_map(|v| v.iter().cloned()).collect();
-        for t in ["a", "b", "c", "d", "e", "f"] {
-            assert!(all.contains(&t.to_string()), "missing: {t}");
+        // Gather the single-token values across all dispatched batches and
+        // verify every request's token showed up exactly once.
+        let all: Vec<u32> = calls
+            .iter()
+            .flat_map(|batch| batch.iter().map(|v| v[0]))
+            .collect();
+        for t in [1u32, 2, 3, 4, 5, 6] {
+            assert!(all.contains(&t), "missing token: {t}");
         }
         drop(calls);
         Arc::try_unwrap(b)
@@ -313,9 +367,9 @@ mod tests {
         {
             let (b1, b2, b3) = (b.clone(), b.clone(), b.clone());
             let _results = tokio::join!(
-                b1.embed(vec!["a".into(), "b".into()]),
-                b2.embed(vec!["c".into(), "d".into()]),
-                b3.embed(vec!["e".into(), "f".into()]),
+                b1.embed_tokens(tok(&[1, 2])),
+                b2.embed_tokens(tok(&[3, 4])),
+                b3.embed_tokens(tok(&[5, 6])),
             );
         }
         let calls = log.lock().unwrap();
@@ -340,11 +394,11 @@ mod tests {
         let blocked_cl = blocked.clone();
         let b = Arc::new(DynamicBatcher::with_name(
             "t4",
-            move |texts| {
+            move |ids: Vec<Vec<u32>>| {
                 while blocked_cl.load(Ordering::SeqCst) {
                     std::thread::sleep(Duration::from_millis(5));
                 }
-                Ok(texts.iter().map(|_| vec![0.0f32; 4]).collect())
+                Ok(ids.iter().map(|_| vec![0.0f32; 4]).collect())
             },
             32,
             1,
@@ -352,12 +406,12 @@ mod tests {
         ));
         {
             let b1 = b.clone();
-            let first = tokio::spawn(async move { b1.embed(vec!["first".into()]).await });
+            let first = tokio::spawn(async move { b1.embed_tokens(tok(&[1])).await });
             tokio::time::sleep(Duration::from_millis(30)).await;
             let b2 = b.clone();
-            let filler = tokio::spawn(async move { b2.embed(vec!["fill".into()]).await });
+            let filler = tokio::spawn(async move { b2.embed_tokens(tok(&[2])).await });
             tokio::time::sleep(Duration::from_millis(20)).await;
-            let overflow = b.embed(vec!["overflow".into()]).await;
+            let overflow = b.embed_tokens(tok(&[3])).await;
             assert!(
                 matches!(overflow, Err(BatchError::QueueFull(_))),
                 "got: {overflow:?}"
@@ -381,11 +435,10 @@ mod tests {
         let b = Arc::new(log_batcher("t_defer", log.clone(), 4, 100, 16));
         {
             let (b1, b2) = (b.clone(), b.clone());
-            let (r1, r2) =
-                tokio::join!(b1.embed(vec!["a".into(), "b".into(), "c".into()]), async {
-                    tokio::time::sleep(Duration::from_millis(15)).await;
-                    b2.embed(vec!["d".into(), "e".into()]).await
-                },);
+            let (r1, r2) = tokio::join!(b1.embed_tokens(tok(&[1, 2, 3])), async {
+                tokio::time::sleep(Duration::from_millis(15)).await;
+                b2.embed_tokens(tok(&[4, 5])).await
+            },);
             let v1 = r1.expect("first request must succeed");
             let v2 = r2.expect("second request must succeed (previously dropped)");
             assert_eq!(v1.len(), 3);
@@ -398,8 +451,8 @@ mod tests {
             "expected exactly 2 batches, got {}",
             calls.len()
         );
-        assert_eq!(calls[0], vec!["a", "b", "c"]);
-        assert_eq!(calls[1], vec!["d", "e"]);
+        assert_eq!(calls[0], tok(&[1, 2, 3]));
+        assert_eq!(calls[1], tok(&[4, 5]));
         drop(calls);
         Arc::try_unwrap(b)
             .ok()
@@ -412,14 +465,14 @@ mod tests {
     async fn inference_error_fails_all_coalesced() {
         let b = Arc::new(DynamicBatcher::with_name(
             "t5",
-            |_| Err("model died".to_string()),
+            |_: Vec<Vec<u32>>| Err("model died".to_string()),
             32,
             50,
             16,
         ));
         {
             let (b1, b2) = (b.clone(), b.clone());
-            let (r1, r2) = tokio::join!(b1.embed(vec!["a".into()]), b2.embed(vec!["b".into()]));
+            let (r1, r2) = tokio::join!(b1.embed_tokens(tok(&[1])), b2.embed_tokens(tok(&[2])));
             for r in [r1, r2] {
                 let Err(BatchError::Inference(msg)) = r else {
                     panic!("expected Inference, got: {r:?}")
@@ -441,9 +494,9 @@ mod tests {
         let cc = call_count.clone();
         let b = Arc::new(DynamicBatcher::with_name(
             "t_cancel",
-            move |t: Vec<String>| {
-                cc.fetch_add(t.len(), Ordering::SeqCst);
-                Ok(t.iter().map(|_| vec![0.0f32; 4]).collect())
+            move |ids: Vec<Vec<u32>>| {
+                cc.fetch_add(ids.len(), Ordering::SeqCst);
+                Ok(ids.iter().map(|_| vec![0.0f32; 4]).collect())
             },
             32,
             50,
@@ -460,18 +513,17 @@ mod tests {
             cancelled_tx.is_closed(),
             "precondition: dropping rx should close tx"
         );
-        b.enqueue_for_test(vec!["cancelled".into()], cancelled_tx)
+        b.enqueue_for_test(tok(&[99]), cancelled_tx)
             .expect("enqueue cancelled item");
 
         // Live request. Awaiting its result guarantees the worker has
         // processed the queue past the cancelled item; whether the two
         // coalesce into one batch or dispatch separately, the cancelled
         // item is always dropped by `reply.is_closed()` checks.
-        let r = b.embed(vec!["alive".into()]).await.unwrap();
+        let r = b.embed_tokens(tok(&[1])).await.unwrap();
         assert_eq!(r.len(), 1);
 
-        // Inference should have run ONLY for the live "alive" text (1 total).
-        // Pre-fix: count == 2. Post-fix: count == 1.
+        // Inference should have run ONLY for the live token (1 total).
         assert_eq!(
             call_count.load(Ordering::SeqCst),
             1,
@@ -493,7 +545,7 @@ mod tests {
         let model = "t_cancel_metric";
         let b = Arc::new(DynamicBatcher::with_name(
             model,
-            |t: Vec<String>| Ok(t.iter().map(|_| vec![0.0f32; 4]).collect()),
+            |ids: Vec<Vec<u32>>| Ok(ids.iter().map(|_| vec![0.0f32; 4]).collect()),
             32,
             50,
             16,
@@ -506,10 +558,9 @@ mod tests {
         for _ in 0..2 {
             let (tx, rx) = oneshot::channel();
             drop(rx);
-            b.enqueue_for_test(vec!["cancelled".into()], tx)
-                .expect("enqueue");
+            b.enqueue_for_test(tok(&[99]), tx).expect("enqueue");
         }
-        let r = b.embed(vec!["alive".into()]).await.unwrap();
+        let r = b.embed_tokens(tok(&[1])).await.unwrap();
         assert_eq!(r.len(), 1);
 
         let after = read_cancelled_counter(&handle.render(), model);

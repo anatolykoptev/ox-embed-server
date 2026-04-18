@@ -85,7 +85,7 @@ async fn main() {
             let m = model_arc.clone();
             let b = batcher::DynamicBatcher::with_name(
                 &name,
-                move |texts| m.embed(&texts),
+                move |token_ids| m.embed_tokens(&token_ids),
                 cfg.batch_max,
                 cfg.batch_wait_ms,
                 cfg.max_queue_size,
