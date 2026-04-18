@@ -141,6 +141,14 @@ impl DynamicBatcher {
         &self,
         token_ids: Vec<Vec<u32>>,
     ) -> Result<Vec<Vec<f32>>, BatchError> {
+        // Short-circuit empty input: don't enqueue, don't invoke embed_fn.
+        // The HTTP layer rejects this upstream, but embed_tokens is a public
+        // API and a zero-text Item would poison accum accounting (0-texts
+        // Items never fit under the strict `<` budget gate) while still
+        // consuming a queue slot.
+        if token_ids.is_empty() {
+            return Ok(vec![]);
+        }
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .sender
@@ -457,6 +465,32 @@ mod tests {
         let captured = got.lock().unwrap().clone();
         assert_eq!(captured.len(), 1, "expected exactly one batch call");
         assert_eq!(captured[0], vec![vec![1u32, 2, 3], vec![4, 5]]);
+        b.shutdown(Duration::from_millis(200)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn embed_tokens_empty_input_returns_empty_output() {
+        // embed_tokens(vec![]) must short-circuit: no enqueue, no embed_fn call.
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let c = called.clone();
+        let b = DynamicBatcher::with_tokens(
+            "t_empty",
+            move |_| {
+                c.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(vec![])
+            },
+            1000,
+            10,
+            true,
+            50,
+            16,
+        );
+        let r = b.embed_tokens(vec![]).await.unwrap();
+        assert!(r.is_empty());
+        assert!(
+            !called.load(std::sync::atomic::Ordering::SeqCst),
+            "empty input must not invoke embed_fn"
+        );
         b.shutdown(Duration::from_millis(200)).await;
     }
 
