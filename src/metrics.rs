@@ -142,26 +142,47 @@ pub fn record_carry(model: &str) {
     .increment(1);
 }
 
-/// Increment embedding-cache hit counter (one per request position; same
-/// text at N positions counts as N hits, matching the "positions-in-request"
-/// semantic used for miss accounting).
-pub fn record_cache_hit(model: &str) {
+/// Increment embedding-cache hit counter by `n` in a single call.
+///
+/// Positions-in-request semantics: the same text at N positions counts
+/// as N hits (matches miss accounting so hit ratio is per-text-in-request,
+/// not per-unique-text). Use the `_n` form from hot paths that know the
+/// batched count; it compiles to one `.increment(n)` call instead of N
+/// singleton increments.
+pub fn record_cache_hit_n(model: &str, n: u64) {
     metrics::counter!(
         "embed_cache_hit_total",
         "model" => model.to_string()
     )
-    .increment(1);
+    .increment(n);
 }
 
-/// Increment embedding-cache miss counter (one per request position;
-/// duplicates-within-request count as multiple misses so hit ratio is
-/// measured per-text-in-request, not per-unique-text).
-pub fn record_cache_miss(model: &str) {
+/// Increment embedding-cache miss counter by `n` in a single call.
+/// See `record_cache_hit_n` for the positions-in-request semantic.
+pub fn record_cache_miss_n(model: &str, n: u64) {
     metrics::counter!(
         "embed_cache_miss_total",
         "model" => model.to_string()
     )
-    .increment(1);
+    .increment(n);
+}
+
+/// Increment embedding-cache hit counter by 1. Back-compat wrapper that
+/// delegates to `record_cache_hit_n`; prefer the `_n` form from hot
+/// paths that already know the count. (`allow(dead_code)` because the
+/// production call site in api.rs now uses the `_n` form; the singular
+/// wrapper is retained for test call sites and future callers that only
+/// need a single increment.)
+#[allow(dead_code)]
+pub fn record_cache_hit(model: &str) {
+    record_cache_hit_n(model, 1);
+}
+
+/// Increment embedding-cache miss counter by 1. Back-compat wrapper that
+/// delegates to `record_cache_miss_n`.
+#[allow(dead_code)]
+pub fn record_cache_miss(model: &str) {
+    record_cache_miss_n(model, 1);
 }
 
 /// Set the current embedding-cache entry count.

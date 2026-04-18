@@ -1121,4 +1121,30 @@ mod tests {
             "gauge line must be present after stamp: {text}"
         );
     }
+
+    #[test]
+    fn record_cache_hit_n_bulk_increments() {
+        let h = test_prometheus_handle();
+        let name = "tmodel_bulkn_hit"; // unique label; avoid collision with other tests
+        crate::metrics::record_cache_hit_n(name, 5);
+        let text = h.render();
+        let expected = format!("embed_cache_hit_total{{model=\"{name}\"}} 5");
+        assert!(
+            text.contains(&expected),
+            "expected `{expected}` in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn record_cache_miss_n_bulk_increments() {
+        let h = test_prometheus_handle();
+        let name = "tmodel_bulkn_miss";
+        crate::metrics::record_cache_miss_n(name, 3);
+        let text = h.render();
+        let expected = format!("embed_cache_miss_total{{model=\"{name}\"}} 3");
+        assert!(
+            text.contains(&expected),
+            "expected `{expected}` in:\n{text}"
+        );
+    }
 }
