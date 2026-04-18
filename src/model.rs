@@ -27,6 +27,17 @@ pub fn configure_truncation(
     auto_truncate: bool,
     max_len: usize,
 ) -> Result<(), String> {
+    // Truncation knobs we care about:
+    //
+    // `direction: Right` — drop trailing tokens, preserve the leading `[CLS]`
+    //   / BOS and query content. Matters for sentence-pair inputs (Phase E
+    //   reranker) where `[CLS] query [SEP] document [SEP]` must keep the
+    //   query intact and truncate the document tail.
+    // `strategy: LongestFirst` — when the input is a pair, truncate the
+    //   longer side first so a short query isn't clipped just because the
+    //   document is long. For single-input embedding it's effectively a
+    //   no-op (there's only one side), but setting it consistently keeps
+    //   Phase E behaviour aligned with Phase A.
     let params = if auto_truncate {
         Some(TruncationParams {
             direction: TruncationDirection::Right,
