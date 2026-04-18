@@ -120,7 +120,7 @@ pub async fn embeddings(
                     Json(ErrorResponse {
                         error: ErrorDetail {
                             message: msg,
-                            error_type: "invalid_request_error",
+                            error_type: "server_error",
                         },
                     }),
                 )
@@ -163,7 +163,7 @@ pub async fn embeddings(
                     Json(ErrorResponse {
                         error: ErrorDetail {
                             message: e,
-                            error_type: "invalid_request_error",
+                            error_type: "server_error",
                         },
                     }),
                 )
@@ -176,7 +176,7 @@ pub async fn embeddings(
                     Json(ErrorResponse {
                         error: ErrorDetail {
                             message: e,
-                            error_type: "invalid_request_error",
+                            error_type: "server_error",
                         },
                     }),
                 )
