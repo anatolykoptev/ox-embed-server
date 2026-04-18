@@ -42,16 +42,16 @@ impl Config {
             .parse::<u16>()
             .map_err(|e| format!("invalid EMBED_PORT: {e}"))?;
 
-        let models_str = env::var("EMBED_MODELS")
-            .map_err(|_| "EMBED_MODELS env var is required")?;
+        let models_str =
+            env::var("EMBED_MODELS").map_err(|_| "EMBED_MODELS env var is required")?;
 
         let models = parse_models(&models_str)?;
         if models.is_empty() {
             return Err("EMBED_MODELS must define at least one model".into());
         }
 
-        let default_model = env::var("EMBED_DEFAULT_MODEL")
-            .unwrap_or_else(|_| models[0].name.clone());
+        let default_model =
+            env::var("EMBED_DEFAULT_MODEL").unwrap_or_else(|_| models[0].name.clone());
 
         if !models.iter().any(|m| m.name == default_model) {
             return Err(format!(
@@ -130,11 +130,14 @@ fn parse_one_model(entry: &str) -> Result<ModelDef, String> {
         ));
     }
 
-    let dim = parts[2].parse::<usize>()
+    let dim = parts[2]
+        .parse::<usize>()
         .map_err(|e| format!("invalid dim '{}': {e}", parts[2]))?;
-    let max_len = parts[3].parse::<usize>()
+    let max_len = parts[3]
+        .parse::<usize>()
         .map_err(|e| format!("invalid max_len '{}': {e}", parts[3]))?;
-    let pad_id = parts[4].parse::<u32>()
+    let pad_id = parts[4]
+        .parse::<u32>()
         .map_err(|e| format!("invalid pad_id '{}': {e}", parts[4]))?;
     let has_tti = match parts[5] {
         "true" | "1" => true,

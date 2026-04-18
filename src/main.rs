@@ -31,7 +31,10 @@ async fn shutdown_signal(token: CancellationToken, drain_timeout: Duration) {
     // Give in-flight HTTP requests drain_timeout to complete naturally.
     // After this future returns, axum stops accepting new connections; when
     // the last handler finishes, Arc<AppState> drops → batcher workers exit.
-    tracing::info!(secs = drain_timeout.as_secs(), "draining in-flight requests");
+    tracing::info!(
+        secs = drain_timeout.as_secs(),
+        "draining in-flight requests"
+    );
     tokio::time::sleep(drain_timeout).await;
     tracing::info!("drain complete");
 }
@@ -91,7 +94,13 @@ async fn main() {
         } else {
             None
         };
-        model_entries.insert(name, ModelEntry { model: model_arc, batcher });
+        model_entries.insert(
+            name,
+            ModelEntry {
+                model: model_arc,
+                batcher,
+            },
+        );
     }
 
     tracing::info!(
@@ -119,7 +128,10 @@ async fn main() {
                 let h = metrics_handle.clone();
                 async move {
                     (
-                        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+                        [(
+                            axum::http::header::CONTENT_TYPE,
+                            "text/plain; version=0.0.4",
+                        )],
                         h.render(),
                     )
                 }

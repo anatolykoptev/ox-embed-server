@@ -8,17 +8,16 @@ use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 /// Sets sensible histogram buckets for latency (_duration_seconds) and batch
 /// size metrics. Stamps `embed_build_info{version}` to 1.
 pub fn init(version: &str) -> PrometheusHandle {
-    let duration_matcher = metrics_exporter_prometheus::Matcher::Suffix(
-        "_duration_seconds".to_string(),
-    );
-    let batch_matcher = metrics_exporter_prometheus::Matcher::Suffix(
-        "batch_size".to_string(),
-    );
+    let duration_matcher =
+        metrics_exporter_prometheus::Matcher::Suffix("_duration_seconds".to_string());
+    let batch_matcher = metrics_exporter_prometheus::Matcher::Suffix("batch_size".to_string());
 
     let handle = PrometheusBuilder::new()
         .set_buckets_for_metric(
             duration_matcher,
-            &[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0],
+            &[
+                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+            ],
         )
         .expect("set duration buckets")
         .set_buckets_for_metric(

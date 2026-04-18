@@ -1,14 +1,13 @@
 //! HTTP handler for POST /v1/embeddings.
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 
 use crate::types::{
-    AppState, EmbedData, EmbedRequest, EmbedResponse, ErrorDetail, ErrorResponse, Usage,
-    error_json,
+    AppState, EmbedData, EmbedRequest, EmbedResponse, ErrorDetail, ErrorResponse, Usage, error_json,
 };
 
 /// POST /v1/embeddings — OpenAI-compatible embedding endpoint.
@@ -35,9 +34,7 @@ pub async fn embeddings(
     let mut status = "error";
     let mut texts_count: usize = 0;
 
-    let model_name = req
-        .model
-        .unwrap_or_else(|| state.default_model.clone());
+    let model_name = req.model.unwrap_or_else(|| state.default_model.clone());
 
     let entry = match state.models.get(&model_name) {
         Some(e) => e,

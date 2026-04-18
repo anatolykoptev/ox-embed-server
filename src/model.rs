@@ -76,11 +76,7 @@ impl EmbedModel {
     /// `auto_truncate`: if true (TEI-compat default), the tokenizer silently
     /// truncates inputs longer than `def.max_len`. If false, truncation is
     /// left disabled on the tokenizer.
-    pub fn load(
-        def: &ModelDef,
-        intra_threads: usize,
-        auto_truncate: bool,
-    ) -> Result<Self, String> {
+    pub fn load(def: &ModelDef, intra_threads: usize, auto_truncate: bool) -> Result<Self, String> {
         let dir = Path::new(&def.dir);
 
         let onnx_path = dir.join("model_quantized.onnx");
@@ -90,10 +86,7 @@ impl EmbedModel {
 
         let tok_path = dir.join("tokenizer.json");
         if !tok_path.exists() {
-            return Err(format!(
-                "tokenizer.json not found: {}",
-                tok_path.display()
-            ));
+            return Err(format!("tokenizer.json not found: {}", tok_path.display()));
         }
 
         let opt_level = parse_opt_level();
@@ -113,8 +106,8 @@ impl EmbedModel {
         tracing::info!("ONNX session created");
 
         tracing::info!(path = %tok_path.display(), "loading tokenizer");
-        let mut tokenizer = Tokenizer::from_file(&tok_path)
-            .map_err(|e| format!("load tokenizer: {e}"))?;
+        let mut tokenizer =
+            Tokenizer::from_file(&tok_path).map_err(|e| format!("load tokenizer: {e}"))?;
         configure_truncation(&mut tokenizer, auto_truncate, def.max_len)?;
         tracing::info!(auto_truncate, "tokenizer loaded");
 
@@ -158,26 +151,22 @@ impl EmbedModel {
             .min(self.max_len);
 
         let batch = encodings.len();
-        let (ids, mask_i64, tti) =
-            pool::build_tensors(&encodings, batch, max_seq, self.pad_id);
+        let (ids, mask_i64, tti) = pool::build_tensors(&encodings, batch, max_seq, self.pad_id);
 
-        let ids_arr = Array2::from_shape_vec([batch, max_seq], ids)
-            .map_err(|e| format!("ids shape: {e}"))?;
+        let ids_arr =
+            Array2::from_shape_vec([batch, max_seq], ids).map_err(|e| format!("ids shape: {e}"))?;
         let mask_arr = Array2::from_shape_vec([batch, max_seq], mask_i64.clone())
             .map_err(|e| format!("mask shape: {e}"))?;
 
-        let ids_tensor = Tensor::from_array(ids_arr)
-            .map_err(|e| format!("ids tensor: {e}"))?;
-        let mask_tensor = Tensor::from_array(mask_arr)
-            .map_err(|e| format!("mask tensor: {e}"))?;
+        let ids_tensor = Tensor::from_array(ids_arr).map_err(|e| format!("ids tensor: {e}"))?;
+        let mask_tensor = Tensor::from_array(mask_arr).map_err(|e| format!("mask tensor: {e}"))?;
 
         let mut session = self.session.lock().map_err(|e| format!("lock: {e}"))?;
 
         let outputs = if self.has_token_type_ids {
             let tti_arr = Array2::from_shape_vec([batch, max_seq], tti)
                 .map_err(|e| format!("tti shape: {e}"))?;
-            let tti_tensor = Tensor::from_array(tti_arr)
-                .map_err(|e| format!("tti tensor: {e}"))?;
+            let tti_tensor = Tensor::from_array(tti_arr).map_err(|e| format!("tti tensor: {e}"))?;
             session.run(ort::inputs! {
                 "input_ids" => ids_tensor,
                 "attention_mask" => mask_tensor,
@@ -196,11 +185,8 @@ impl EmbedModel {
             .try_extract_array::<f32>()
             .map_err(|e| format!("extract: {e}"))?;
 
-        let mask_arr_f = Array2::from_shape_vec(
-            [batch, max_seq],
-            pool::mask_i64_to_f32(&mask_i64),
-        )
-        .map_err(|e| format!("mask_f shape: {e}"))?;
+        let mask_arr_f = Array2::from_shape_vec([batch, max_seq], pool::mask_i64_to_f32(&mask_i64))
+            .map_err(|e| format!("mask_f shape: {e}"))?;
 
         pool::mean_pool_normalize(&raw, &mask_arr_f, batch, max_seq, self.dim)
     }
@@ -224,7 +210,9 @@ mod truncation_tests {
 
     #[test]
     fn configure_truncation_enables_when_auto_true() {
-        let Some(mut tok) = load_tokenizer_or_skip() else { return; };
+        let Some(mut tok) = load_tokenizer_or_skip() else {
+            return;
+        };
         // Precondition: the on-disk tokenizer.json has truncation: null.
         assert!(
             tok.get_truncation().is_none(),
@@ -241,7 +229,9 @@ mod truncation_tests {
 
     #[test]
     fn configure_truncation_disabled_when_auto_false() {
-        let Some(mut tok) = load_tokenizer_or_skip() else { return; };
+        let Some(mut tok) = load_tokenizer_or_skip() else {
+            return;
+        };
         // Pre-seed truncation so we can assert it gets cleared.
         configure_truncation(&mut tok, true, 512).expect("seed");
         assert!(tok.get_truncation().is_some());
@@ -256,7 +246,9 @@ mod truncation_tests {
 
     #[test]
     fn overlong_input_encodes_within_max_len_when_auto_truncate_on() {
-        let Some(mut tok) = load_tokenizer_or_skip() else { return; };
+        let Some(mut tok) = load_tokenizer_or_skip() else {
+            return;
+        };
         configure_truncation(&mut tok, true, 512).expect("configure_truncation");
 
         // Make an input that tokenises to well over 512 tokens.
@@ -271,7 +263,9 @@ mod truncation_tests {
 
     #[test]
     fn overlong_input_exceeds_max_len_when_auto_truncate_off() {
-        let Some(mut tok) = load_tokenizer_or_skip() else { return; };
+        let Some(mut tok) = load_tokenizer_or_skip() else {
+            return;
+        };
         // Explicitly disabled: we keep the current (pre-A3) strict-ish behaviour
         // where the encoder emits full-length output and downstream code decides.
         configure_truncation(&mut tok, false, 512).expect("configure_truncation");
