@@ -34,6 +34,26 @@ use crate::types::{AppState, ErrorDetail, ErrorResponse, error_json};
 // a second endpoint.
 // ---------------------------------------------------------------------
 
+/// Document input. Cohere accepts EITHER a plain string OR an object
+/// `{"text": "..."}`. Many SDKs (Jina/Voyage/Mixedbread/Cohere SDK) send
+/// the object form — supporting both is required for drop-in compat.
+/// `serde(untagged)` picks the variant by shape.
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub enum RerankDocument {
+    Text(String),
+    Object { text: String },
+}
+
+impl RerankDocument {
+    fn into_text(self) -> String {
+        match self {
+            Self::Text(s) => s,
+            Self::Object { text } => text,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 pub struct RerankRequest {
     /// Optional: if the server has exactly one reranker configured,
@@ -42,11 +62,16 @@ pub struct RerankRequest {
     /// "first" from the HashMap's unspecified iteration order.
     pub model: Option<String>,
     pub query: String,
-    pub documents: Vec<String>,
+    pub documents: Vec<RerankDocument>,
     /// Optional: if absent, all scored results are returned in sorted
     /// order. If `0`, an empty `results` array is returned. If greater
     /// than `documents.len()`, we silently cap at `documents.len()`.
     pub top_n: Option<usize>,
+    /// Cohere-compat: when true, each result includes a `document` field
+    /// with the original text. Default false to keep responses small —
+    /// most clients already have the source text and only need scores.
+    #[serde(default)]
+    pub return_documents: bool,
 }
 
 #[derive(Serialize, Debug, PartialEq)]
@@ -56,12 +81,25 @@ pub struct RerankResult {
     /// back to the text they sent.
     pub index: usize,
     /// Raw cross-encoder logit. Not softmax-normalised — matches
-    /// Cohere/Jina/BGE-reranker convention (higher = more relevant).
+    /// Cohere/Jina reranker convention (higher = more relevant).
     pub relevance_score: f32,
+    /// Set only when the request had `return_documents=true`. Cohere shape:
+    /// `{"text": "..."}` object, NOT a bare string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document: Option<RerankDocumentEcho>,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+pub struct RerankDocumentEcho {
+    pub text: String,
 }
 
 #[derive(Serialize)]
 pub struct RerankResponse {
+    /// Cohere-compat: opaque request id (UUID). Clients sometimes log it
+    /// for tracing; we generate fresh per request so failures can be
+    /// correlated across distributed traces.
+    pub id: String,
     pub model: String,
     pub results: Vec<RerankResult>,
 }
@@ -70,13 +108,20 @@ pub struct RerankResponse {
 /// score descending, apply optional `top_n` cap. Extracted as a
 /// `pub(crate)` free function so it's unit-testable without an
 /// `AppState` harness (see the E3 tests below).
-pub(crate) fn build_sorted_results(scores: &[f32], top_n: Option<usize>) -> Vec<RerankResult> {
+pub(crate) fn build_sorted_results(
+    scores: &[f32],
+    top_n: Option<usize>,
+    documents: Option<&[String]>,
+) -> Vec<RerankResult> {
     let mut scored: Vec<RerankResult> = scores
         .iter()
         .enumerate()
         .map(|(index, &relevance_score)| RerankResult {
             index,
             relevance_score,
+            document: documents.map(|d| RerankDocumentEcho {
+                text: d[index].clone(),
+            }),
         })
         .collect();
     // `total_cmp` gives a total order over f32 (handles NaN / -0.0),
@@ -162,8 +207,11 @@ pub async fn rerank(
         .expect("resolve_reranker_name validated key presence");
 
     let query = req.query;
-    let documents = req.documents;
+    // Normalise mixed string/object form into a flat Vec<String>. Cohere
+    // accepts either; clients rarely care which they send.
+    let documents: Vec<String> = req.documents.into_iter().map(|d| d.into_text()).collect();
     let doc_count = documents.len();
+    let return_documents = req.return_documents;
 
     // Tokenize pairs in spawn_blocking — same reasoning as `api::embeddings`:
     // tokenization is CPU-bound and blocking it on the async runtime
@@ -264,9 +312,21 @@ pub async fn rerank(
         return server_error("internal error: score count mismatch".to_string());
     }
 
-    let results = build_sorted_results(&scores, req.top_n);
+    let echo_docs: Option<&[String]> = if return_documents {
+        Some(&documents)
+    } else {
+        None
+    };
+    let results = build_sorted_results(&scores, req.top_n, echo_docs);
 
     Json(RerankResponse {
+        // Cohere generates an opaque request id for tracing; we use a
+        // simple time-based hex (no extra crate dep). Clients use it for
+        // log correlation only — semantics are "opaque, unique-ish".
+        id: format!("rrk_{:x}", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)),
         model: model_name,
         results,
     })
@@ -325,19 +385,76 @@ mod tests {
     // those fields doesn't get a 400 from serde.
     // -----------------------------------------------------------------
 
+    fn doc_text(d: &RerankDocument) -> &str {
+        match d {
+            RerankDocument::Text(s) => s.as_str(),
+            RerankDocument::Object { text } => text.as_str(),
+        }
+    }
+
     #[test]
     fn rerank_request_deserializes_with_optional_fields() {
         let j1 = r#"{"query":"q","documents":["a"]}"#;
         let r: RerankRequest = serde_json::from_str(j1).unwrap();
         assert!(r.model.is_none() && r.top_n.is_none());
         assert_eq!(r.query, "q");
-        assert_eq!(r.documents, vec!["a".to_string()]);
+        assert_eq!(r.documents.len(), 1);
+        assert_eq!(doc_text(&r.documents[0]), "a");
+        assert!(!r.return_documents);
 
         let j2 = r#"{"model":"m","query":"q","documents":["a","b"],"top_n":1}"#;
         let r: RerankRequest = serde_json::from_str(j2).unwrap();
         assert_eq!(r.model.as_deref(), Some("m"));
         assert_eq!(r.top_n, Some(1));
         assert_eq!(r.documents.len(), 2);
+    }
+
+    /// Cohere SDK + Jina/Voyage shape: documents as `[{"text": "..."}]`.
+    /// Covers the "object form" half of the Cohere `documents` contract.
+    #[test]
+    fn rerank_request_deserializes_object_documents() {
+        let j = r#"{"query":"q","documents":[{"text":"a"},{"text":"b"}]}"#;
+        let r: RerankRequest = serde_json::from_str(j).unwrap();
+        assert_eq!(r.documents.len(), 2);
+        assert_eq!(doc_text(&r.documents[0]), "a");
+        assert_eq!(doc_text(&r.documents[1]), "b");
+    }
+
+    /// Mixed string + object — defensive test for clients that mix forms.
+    /// `serde(untagged)` handles each entry independently.
+    #[test]
+    fn rerank_request_deserializes_mixed_documents() {
+        let j = r#"{"query":"q","documents":["plain",{"text":"obj"}]}"#;
+        let r: RerankRequest = serde_json::from_str(j).unwrap();
+        assert_eq!(r.documents.len(), 2);
+        assert_eq!(doc_text(&r.documents[0]), "plain");
+        assert_eq!(doc_text(&r.documents[1]), "obj");
+    }
+
+    /// `return_documents=true` populates the `document` echo field on each
+    /// result. Default false — `document` stays None and is omitted from
+    /// JSON via `skip_serializing_if`.
+    #[test]
+    fn build_sorted_results_echoes_documents_when_requested() {
+        let scores = vec![0.5_f32, 1.0];
+        let docs = vec!["first".to_string(), "second".to_string()];
+        let results = build_sorted_results(&scores, None, Some(&docs));
+        assert_eq!(results.len(), 2);
+        // Top result is index 1 ("second", score 1.0).
+        assert_eq!(results[0].index, 1);
+        assert_eq!(
+            results[0].document.as_ref().map(|d| d.text.as_str()),
+            Some("second"),
+        );
+        assert_eq!(results[1].index, 0);
+        assert_eq!(
+            results[1].document.as_ref().map(|d| d.text.as_str()),
+            Some("first"),
+        );
+
+        // None case: no echo, all `document` fields stay None.
+        let results = build_sorted_results(&scores, None, None);
+        assert!(results.iter().all(|r| r.document.is_none()));
     }
 
     // -----------------------------------------------------------------
@@ -350,7 +467,7 @@ mod tests {
     #[test]
     fn sort_and_truncate_picks_top_n_desc() {
         let scores = vec![1.0f32, 5.0, 3.0, 2.0];
-        let results = build_sorted_results(&scores, Some(2));
+        let results = build_sorted_results(&scores, Some(2), None);
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].index, 1); // score 5.0
         assert_eq!(results[0].relevance_score, 5.0);
@@ -364,7 +481,7 @@ mod tests {
         // the output, sorted by score descending. Proves that
         // `top_n=None` doesn't silently clip the tail.
         let scores = vec![0.1f32, 0.9, 0.5];
-        let results = build_sorted_results(&scores, None);
+        let results = build_sorted_results(&scores, None, None);
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].index, 1); // 0.9
         assert_eq!(results[1].index, 2); // 0.5
@@ -378,7 +495,7 @@ mod tests {
         // clients may legitimately want to probe a model's
         // availability without materialising scores).
         let scores = vec![1.0f32, 2.0, 3.0];
-        assert!(build_sorted_results(&scores, Some(0)).is_empty());
+        assert!(build_sorted_results(&scores, Some(0), None).is_empty());
     }
 
     #[test]
@@ -387,7 +504,7 @@ mod tests {
         // naturally benign — test pins that behaviour so future
         // refactors can't tighten it into a 400 without noticing.
         let scores = vec![1.0f32, 2.0];
-        let results = build_sorted_results(&scores, Some(10));
+        let results = build_sorted_results(&scores, Some(10), None);
         assert_eq!(results.len(), 2);
     }
 }

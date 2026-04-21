@@ -1,133 +1,106 @@
-# embed-server — Unified Rust ONNX Embedding Sidecar
+# embed-server — Unified Rust ONNX Embedding + Rerank + SPLADE Sidecar
 
-**Rust** | Docker | OpenAI-compatible `/v1/embeddings` | Prometheus `/metrics`
+**Rust / axum** · Docker · Prometheus `/metrics` · branch `main`
 
-Single sidecar serving both `multilingual-e5-large` (1024 dim) and
-`jina-code-v2` (768 dim). Replaced the Python `embed-jina` Apr 2026.
+Single process serving three model classes concurrently:
 
-## Structure
+| Class    | Default model(s)                                        | Endpoint             | API shape |
+|----------|---------------------------------------------------------|----------------------|-----------|
+| Dense    | `multilingual-e5-large` (1024d), `jina-code-v2` (768d)  | `POST /v1/embeddings`| OpenAI    |
+| Reranker | `gte-multi-rerank`                                      | `POST /v1/rerank`    | Cohere    |
+| Sparse   | SPLADE                                                  | `POST /embed_sparse` | TEI       |
 
-| File | Lines | Role |
-|---|---:|---|
-| `src/main.rs` | ~130 | Axum server, routes, signal handling, batcher construction |
-| `src/api.rs` | ~150 | `/v1/embeddings` handler, request/response wiring |
-| `src/types.rs` | ~50 | `AppState`, `ModelEntry`, error/response types |
-| `src/model.rs` | ~140 | ONNX session + tokenizer + inference |
-| `src/pool.rs` | ~90 | Token pooling (mean-pool + L2 normalize) |
-| `src/batcher.rs` | ~240 | `DynamicBatcher` (tokio mpsc + oneshot, wait-window coalesce) |
-| `src/metrics.rs` | ~80 | Prometheus exposition helpers |
-| `src/config.rs` | ~120 | Env parsing (`EMBED_MODELS`, batching knobs) |
-| `bench.py` | — | Load harness (rtk proxy for untruncated output) |
+## Source layout (`src/`, ~5.6k LOC)
 
-## Models
-
-Two models loaded concurrently in one process. Request selects via
-`model` field; `EMBED_DEFAULT_MODEL` (default: first `EMBED_MODELS`
-entry) is used when absent.
-
-| Name | Dim | max_len | Notes |
-|---|---:|---:|---|
-| `multilingual-e5-large` | 1024 | 256 | Default. Multilingual general-purpose. |
-| `jina-code-v2` | 768 | 512 | Code / long-context. ~2-3x faster on ARM. |
-
-Perf deltas (ARM Neoverse-N1): 16 short texts single batch — jina
-~118 ms/req vs e5 ~357 ms/req. conc=16 single-query — jina ~75 rps
-vs e5 ~28 rps.
+| File                 | LOC  | Role |
+|----------------------|-----:|------|
+| `main.rs`            |  385 | axum router, startup, graceful SIGTERM |
+| `config.rs`          |  694 | env parsing: `EMBED_MODELS`, `RERANKER_MODELS`, batching knobs |
+| `types.rs`           |  145 | `AppState`, `ModelEntry`, error types |
+| `api.rs`             |  307 | `/v1/embeddings` handler |
+| `api_rerank.rs`      |  510 | `/v1/rerank` handler (Cohere-shape) |
+| `api_splade.rs`      |  271 | `/embed_sparse` handler (TEI-shape) |
+| `model.rs`           |  382 | Dense ONNX session + tokenizer + mean-pool |
+| `model_reranker.rs`  |  600 | Cross-encoder ONNX scoring, session pool |
+| `model_splade.rs`    |  499 | SPLADE sparse model |
+| `batcher.rs`         | 1150 | `DynamicBatcher` + token-budget batcher, carry-over |
+| `cache.rs`           |  216 | moka response cache (embeddings only; rerank bypasses) |
+| `cache_flow.rs`      |  186 | probe→insert hot path |
+| `pool.rs`            |   94 | mean-pool + L2 normalize |
+| `metrics.rs`         |  196 | Prometheus exposition helpers |
+| `bench.py`           |    — | load harness (run under `rtk` for untruncated output) |
 
 ## API
 
-- `POST /v1/embeddings` — OpenAI-compat. Picks model by `model` field;
-  returns 503 + `Retry-After: 1` when queue full, 503 + `Retry-After: 5`
-  when shutting down.
-- `POST /v1/rerank` — Cohere-compatible, backed by BGE-reranker-v2-m3.
+- `POST /v1/embeddings` — OpenAI-compat. Model picked via `model` field
+  (fallback: `EMBED_DEFAULT_MODEL`). 503 + `Retry-After: 1` when queue full,
+  503 + `Retry-After: 5` during shutdown. Response cache in front.
+- `POST /v1/rerank` — Cohere-shape: `{query, documents[], top_n, return_documents}`
+  → `{results:[{index, relevance_score}]}`. Documents accepted as plain string
+  or `{"text":...}` (untagged serde). **No cache** — `(query, doc)` pairs are
+  nearly always unique.
+- `POST /embed_sparse` — TEI convention (no `/v1/` prefix by design).
 - `GET /health` — plain `ok`.
-- `GET /metrics` — Prometheus text exposition. Key series:
-  `embed_requests_total{model,status}`, `embed_request_duration_seconds`,
-  `embed_inference_duration_seconds`, `embed_batch_size`,
-  `embed_queue_depth{model}`, `embed_queue_rejected_total{model}`,
-  `embed_build_info{version}`.
+- `GET /metrics` — Prometheus `embed_*` series (counters, `embed_batch_tokens`
+  summary, `embed_build_info` gauge). Duration histograms NOT exposed — add in
+  `metrics.rs` if needed.
 
-## Environment
+## Environment (live prod values)
 
-| Variable | Default | Notes |
-|---|---|---|
-| `EMBED_PORT` | `8082` | |
-| `EMBED_MODELS` | required | `name:dir:dim:max_len:pad_id:has_tti[:model_file]` comma-separated. Current: `multilingual-e5-large:/models:1024:256:1:false,jina-code-v2:/models-jina:768:512:0:false` |
-| `EMBED_DEFAULT_MODEL` | first model | Name |
-| `EMBED_INTRA_THREADS` | `4` | ONNX threads per inference |
-| `BATCHING_ENABLED` | `false` | `true` to enable DynamicBatcher |
-| `BATCH_MAX` | `32` | Max texts per coalesced ONNX call. On ARM w/o AVX stay at 8 — larger triggers cache thrash |
-| `BATCH_WAIT_MS` | `10` | Coalescing window |
-| `MAX_QUEUE_SIZE` | `256` | Queue cap → 503 |
-| `DRAIN_TIMEOUT_S` | `10` | SIGTERM drain window |
-| `ORT_DYLIB_PATH` | `/usr/lib/libonnxruntime.so` | required with `load-dynamic` feature |
-| `EMBED_VERSION` | `dev` | Stamped into `embed_build_info` |
-| `RERANKER_MODELS` | unset | `name:dir:max_len:padded` comma-separated. Example: `bge-reranker-v2-m3:/models-reranker:512:true` |
+| Variable                     | Prod value | Notes |
+|------------------------------|------------|------|
+| `EMBED_PORT`                 | `8082`     | |
+| `EMBED_MODELS`               | `multilingual-e5-large:/models:1024:256:1:false,jina-code-v2:/models-jina:768:512:0:false` | Format: `name:dir:dim:max_len:pad_id:has_tti[:model_file]` |
+| `EMBED_DEFAULT_MODEL`        | `multilingual-e5-large` | |
+| `EMBED_INTRA_THREADS`        | `4` | ONNX threads per inference |
+| `RERANKER_MODELS`            | `gte-multi-rerank:/models-gte-rerank:256:true` | Format: `name:dir:max_len:padded` |
+| `RERANKER_INTRA_THREADS`     | `2` | |
+| `RERANKER_SESSION_POOL_SIZE` | `2` | |
+| `BATCHING_ENABLED`           | `true` | |
+| `BATCH_MAX`                  | `32` | Coalesced batch cap |
+| `BATCH_MAX_TOKENS`           | `16384` | Token-budget cap (TEI-style, real limiter) |
+| `BATCH_WAIT_MS`              | `30` | Coalescing window |
+| `MAX_QUEUE_SIZE`             | `256` | Queue cap → 503 |
+| `CACHE_MAX_ENTRIES`          | `10000` | moka embedding cache |
+| `DRAIN_TIMEOUT_S`            | `10` | SIGTERM drain window |
+| `ORT_DYLIB_PATH`             | `/usr/lib/libonnxruntime.so` | required by `ort` with `load-dynamic` |
+| `ORT_OPT_LEVEL`              | `3` | |
+| `EMBED_VERSION`              | `dev` | stamped into `embed_build_info` |
 
 ## Deploy
 
 ```bash
 cd ~/deploy/krolik-server
-docker compose build embed-server        # code-only change: ~40s (BuildKit cache mounts)
+docker compose build embed-server        # code-only: ~40s (BuildKit cache mounts)
 docker compose up -d --no-deps --force-recreate embed-server
 ```
 
-Use `--no-cache` only when deps (Cargo.toml/Cargo.lock) change — regular
-code changes don't need it thanks to the dummy-main dep layer in the
-Dockerfile. Code-only rebuild: ~40s. Warm no-change rebuild: ~2s. Cold
-rebuild (after Cargo.toml): ~3 min.
-
-## Batcher carry-over (commit `3598b48`, Apr 2026)
-
-`run_worker` holds an internal `carry: Option<Item>`. When a second item
-pulled from the channel would push the coalesced batch past `BATCH_MAX`,
-it is deferred to the next batch instead of being rejected. Previous
-behaviour replied with `item exceeded max_batch after coalesce` and
-dropped the item; that error should no longer occur on `master`. If seen
-in logs, the running image predates `3598b48` — rebuild and redeploy.
-Regression test: `coalesce_overflow_defers_to_next_batch`.
-
-## Releases (release-please)
-
-`.github/workflows/release-please.yml` runs release-please on pushes to
-`master`. Config: `release-please-config.json`
-(`release-type: rust`, `include-v-in-tag: true`) and
-`.release-please-manifest.json` (seed `0.1.0`). Conventional commit
-prefixes: `fix:`/`perf:` → patch, `feat:` → minor, `feat!:` or
-`BREAKING CHANGE:` → major, others → no bump. The bot opens and
-updates a single release PR; merging it creates the `vX.Y.Z` tag,
-GitHub release, and version bump in `Cargo.toml` + manifest. First
-PR (#1) targets `v0.2.0`. Do not tag manually.
+- `--no-cache` only when `Cargo.toml` / `Cargo.lock` change; regular code hits
+  the dummy-main dep layer (`Dockerfile` Layer 1). Cold deps: ~3 min. Warm: ~2s.
+- Auto-deploy: push to `main` → dozor webhook (`~/.dozor/deploy-repos.yaml`,
+  repo `anatolykoptev/ox-embed-server`).
+- **Releases:** release-please on push to `main`. Conventional commits →
+  auto-PR + tag. Do not tag manually.
 
 ## Gotchas
 
-- `ort` with `load-dynamic` — `libonnxruntime.so` loaded at startup, not linked.
-- On ARM Neoverse-N1 without AVX/SVE, `BATCH_MAX > 8` is slower than smaller
-  batches due to attention cache thrash. Keep at 8 unless benched otherwise.
+- `ort` + `load-dynamic` → `libonnxruntime.so` loaded from `ORT_DYLIB_PATH` at
+  startup, not linked at build.
 - `model_optimized.onnx` (graph-fused via `onnxruntime.transformers.optimizer`)
-  is SLOWER than `model_quantized.onnx` on this hardware for our BERT-family
-  models. Do not switch MODEL_FILE without benchmarking.
-- BUG-001 (ort crate 30 s slowdown for BERT w/ token_type_ids) does NOT fire
-  for our jina-code-v2 file — inputs are only `[input_ids, attention_mask]`.
-  See `docs/BUGS.md`.
-- First-time compile: `ort-sys` downloads the ORT binary at build time; adds
-  ~30 s on cold cache. Re-uses after first build.
+  is **slower** than `model_quantized.onnx` on ARM Neoverse-N1 for our
+  BERT-family models. Do not switch `MODEL_FILE` without benchmarking.
+- `ort-sys` downloads the ORT binary on first compile (~30s cold, reused after).
+- Batcher has `carry: Option<Item>` — items that would overflow `BATCH_MAX`
+  defer to the next batch (not dropped). If log shows `item exceeded
+  max_batch after coalesce`, running image predates commit `3598b48` — rebuild.
+  Visible as `embed_carry_events_total` in `/metrics`.
+- `BATCH_MAX` historical rule was `≤8` on ARM (cache thrash). Prod now runs
+  `32` with `BATCH_MAX_TOKENS=16384` as the real cap — re-bench with `bench.py`
+  if you change either.
 
-## Benchmarks (Oracle ARM Neoverse-N1, 4 vCPU, 2 GB RAM)
+## References
 
-| Concurrency | e5-large p50 | jina-code-v2 p50 |
-|---|---|---|
-| 1 | — | 1.7 s |
-| 4 | — | 2.4 s (coalesced) |
-
-See `docs/benchmarks/` for baseline + post-migration details.
-
-## History
-
-- Apr 2026: Phase 2 — unified Rust sidecar absorbed jina-code-v2 previously
-  served by Python `embed-jina`. BUG-001 workaround proven unnecessary for
-  the current model file. Added DynamicBatcher, Prometheus metrics, bounded
-  queue + 503 backpressure, graceful SIGTERM. Python `embed-jina` retired.
-- Apr 2026: batcher carry-over fix (`3598b48`) — coalesce-overflow items
-  deferred instead of dropped. Added release-please workflow (`d217c60`);
-  first release PR targets `v0.2.0`.
+- **Benchmarks:** `docs/benchmarks/` (ARM Neoverse-N1 baselines).
+- **Bugs / historical workarounds:** `docs/BUGS.md` (BUG-001 resolved Apr 2026).
+- **Roadmap / phase plans:** `docs/ROADMAP.md`, `docs/plans/`.
+- **Runbook:** `docs/runbook.md`.

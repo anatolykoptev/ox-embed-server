@@ -33,6 +33,23 @@ pub struct RerankerModelDef {
     pub padded_model: bool,
 }
 
+/// Definition of a single SPLADE sparse encoder to load.
+///
+/// Even leaner than `RerankerModelDef`:
+///   - no `padded_model` — v1 doesn't route SPLADE through the dynamic
+///     batcher (one `spawn_blocking` per text), so the padding flag has
+///     no consumer yet. Add when batcher integration lands.
+///   - no `dim` — SPLADE's output dim is the BERT vocab size, discovered
+///     by `SpladeModel::load` from the ONNX graph (no hard-coded 30522).
+///   - no `pad_id` — single-text inputs need no padding inside the
+///     sequence, and the tokenizer-driven truncation runs at load time.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SpladeModelDef {
+    pub name: String,
+    pub dir: String,
+    pub max_len: usize,
+}
+
 /// Server configuration parsed from environment variables.
 pub struct Config {
     pub port: u16,
@@ -43,6 +60,42 @@ pub struct Config {
     pub rerankers: Vec<RerankerModelDef>,
     pub default_model: String,
     pub intra_threads: usize,
+    /// Number of ONNX `Session` instances loaded per reranker model.
+    /// Each session can run inference independently, so requests scoring
+    /// pairs against the same reranker can run in parallel up to
+    /// `reranker_pool_size` at a time. `1` (the default) preserves the
+    /// pre-pool behaviour exactly: a single Mutex-guarded session.
+    ///
+    /// IMPORTANT: when raising this above 1, the operator should also
+    /// lower `EMBED_INTRA_THREADS` so `pool_size * intra_threads` stays
+    /// at or below the available CPU cores. The model side does NOT
+    /// auto-divide the per-session intra threads — caller controls the
+    /// math so the config is honest about what's being requested.
+    pub reranker_pool_size: usize,
+    /// Per-session intra-op threads for reranker ONNX sessions. Defaults
+    /// to `intra_threads` (so unset = same as today's shared budget). Set
+    /// independently from `EMBED_INTRA_THREADS` so the embedder is not
+    /// affected when raising `reranker_pool_size`. Recommended: keep
+    /// `pool_size * reranker_intra_threads ≤ EMBED_INTRA_THREADS` so the
+    /// reranker doesn't steal threads from the embedder when both run
+    /// concurrently.
+    pub reranker_intra_threads: usize,
+    /// Zero-or-more SPLADE sparse encoders. Empty when `SPLADE_MODELS`
+    /// is unset (the default) — server boots without `/v1/sparse_embeddings`
+    /// active. Same fail-loud parse contract as `RERANKER_MODELS`.
+    pub splades: Vec<SpladeModelDef>,
+    /// Number of ONNX `Session` instances loaded per SPLADE model.
+    /// Same semantics as `reranker_pool_size`: `1` (default) preserves
+    /// single-session behaviour; values >1 enable concurrent inference
+    /// at N× per-session memory. SPLADE-v3-distilbert sessions are
+    /// ~360 MB fp32 each, so pool sizes >2 are usually overkill on the
+    /// current production box.
+    pub splade_pool_size: usize,
+    /// Per-session intra-op threads for SPLADE ONNX sessions. Defaults
+    /// to `intra_threads` when unset, mirroring `reranker_intra_threads`.
+    /// Caller should keep `splade_pool_size * splade_intra_threads`
+    /// under the cores reserved for SPLADE.
+    pub splade_intra_threads: usize,
     pub batching_enabled: bool,
     /// Soft cap on items (texts) per batch — retained for fairness, so
     /// one giant multi-text request can't monopolise a single dispatch.
@@ -112,6 +165,19 @@ impl Config {
             .parse::<usize>()
             .map_err(|e| format!("invalid EMBED_INTRA_THREADS: {e}"))?;
 
+        let reranker_pool_size =
+            parse_reranker_pool_size(env::var("RERANKER_SESSION_POOL_SIZE").ok().as_deref());
+
+        // `RERANKER_INTRA_THREADS` defaults to `intra_threads` so unset
+        // means "share the embedder budget" (today's behaviour). Set
+        // explicitly when raising pool_size to keep total reranker
+        // threads under control without changing embedder threads.
+        let reranker_intra_threads = env::var("RERANKER_INTRA_THREADS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(intra_threads);
+
         let batching_enabled = env::var("BATCHING_ENABLED")
             .ok()
             .map(|s| s.eq_ignore_ascii_case("true") || s == "1")
@@ -161,12 +227,36 @@ impl Config {
             .transpose()?
             .unwrap_or_default();
 
+        // `SPLADE_MODELS` follows the same contract as `RERANKER_MODELS`:
+        // unset/empty → no SPLADE endpoints; malformed → fail boot.
+        let splades = env::var("SPLADE_MODELS")
+            .ok()
+            .map(|s| parse_splades(&s))
+            .transpose()?
+            .unwrap_or_default();
+
+        let splade_pool_size =
+            parse_splade_pool_size(env::var("SPLADE_SESSION_POOL_SIZE").ok().as_deref());
+
+        // SPLADE_INTRA_THREADS defaults to `intra_threads` (share embedder
+        // budget when unset), same fallback as RERANKER_INTRA_THREADS.
+        let splade_intra_threads = env::var("SPLADE_INTRA_THREADS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(intra_threads);
+
         Ok(Config {
             port,
             models,
             rerankers,
             default_model,
             intra_threads,
+            reranker_pool_size,
+            reranker_intra_threads,
+            splades,
+            splade_pool_size,
+            splade_intra_threads,
             batching_enabled,
             batch_max,
             batch_max_tokens,
@@ -203,6 +293,29 @@ fn parse_batch_max_tokens(raw: Option<&str>) -> usize {
         Some(s) => match s.trim().parse::<usize>() {
             Ok(0) => {
                 tracing::warn!("BATCH_MAX_TOKENS=0 is invalid; falling back to default {DEFAULT}");
+                DEFAULT
+            }
+            Ok(n) => n,
+            Err(_) => DEFAULT,
+        },
+    }
+}
+
+/// Parse `RERANKER_SESSION_POOL_SIZE` env value. Unset, empty, or
+/// unparseable → 1 (single-session, mirrors the pre-pool behaviour
+/// exactly). `0` is rejected with a warn rather than silently accepted —
+/// it would `% 0` panic at request time, and follows the same
+/// "0 is invalid, fall back" stance as `BATCH_MAX_TOKENS=0`. Exposed for
+/// testing; env lookup stays in `from_env`.
+fn parse_reranker_pool_size(raw: Option<&str>) -> usize {
+    const DEFAULT: usize = 1;
+    match raw {
+        None => DEFAULT,
+        Some(s) => match s.trim().parse::<usize>() {
+            Ok(0) => {
+                tracing::warn!(
+                    "RERANKER_SESSION_POOL_SIZE=0 is invalid; falling back to default {DEFAULT}"
+                );
                 DEFAULT
             }
             Ok(n) => n,
@@ -295,6 +408,58 @@ fn parse_one_reranker(entry: &str) -> Result<RerankerModelDef, String> {
     })
 }
 
+/// Parse `SPLADE_MODELS` into zero-or-more `SpladeModelDef`.
+///
+/// Format: `name:dir:max_len`, comma-separated. 3 fields (no `padded`
+/// switch — v1 SPLADE bypasses the dynamic batcher entirely). Empty
+/// string returns `Ok(vec![])` — the unset path. Malformed entries
+/// fail boot, same as `parse_rerankers` / `parse_models`.
+pub fn parse_splades(s: &str) -> Result<Vec<SpladeModelDef>, String> {
+    s.split(',')
+        .filter(|e| !e.trim().is_empty())
+        .map(parse_one_splade)
+        .collect()
+}
+
+fn parse_one_splade(entry: &str) -> Result<SpladeModelDef, String> {
+    let parts: Vec<&str> = entry.trim().split(':').collect();
+    if parts.len() != 3 {
+        return Err(format!(
+            "splade entry must have 3 colon-separated fields (name:dir:max_len), got {}: '{entry}'",
+            parts.len()
+        ));
+    }
+    let max_len = parts[2]
+        .parse::<usize>()
+        .map_err(|e| format!("invalid splade max_len '{}': {e}", parts[2]))?;
+    Ok(SpladeModelDef {
+        name: parts[0].to_string(),
+        dir: parts[1].to_string(),
+        max_len,
+    })
+}
+
+/// Parse `SPLADE_SESSION_POOL_SIZE`. Same shape as
+/// `parse_reranker_pool_size`: default 1, `0` → fall back with a warn,
+/// garbage → fall back. Kept as a separate function so the warn
+/// message names the right env var (operators grep for the literal).
+fn parse_splade_pool_size(raw: Option<&str>) -> usize {
+    const DEFAULT: usize = 1;
+    match raw {
+        None => DEFAULT,
+        Some(s) => match s.trim().parse::<usize>() {
+            Ok(0) => {
+                tracing::warn!(
+                    "SPLADE_SESSION_POOL_SIZE=0 is invalid; falling back to default {DEFAULT}"
+                );
+                DEFAULT
+            }
+            Ok(n) => n,
+            Err(_) => DEFAULT,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,13 +538,13 @@ mod tests {
 
     #[test]
     fn parse_rerankers_single_entry_round_trips() {
-        let got = parse_rerankers("bge-reranker-v2-m3:/models-reranker:512:true").unwrap();
+        let got = parse_rerankers("gte-multi-rerank:/models-gte-rerank:256:true").unwrap();
         assert_eq!(
             got,
             vec![RerankerModelDef {
-                name: "bge-reranker-v2-m3".into(),
-                dir: "/models-reranker".into(),
-                max_len: 512,
+                name: "gte-multi-rerank".into(),
+                dir: "/models-gte-rerank".into(),
+                max_len: 256,
                 padded_model: true,
             }]
         );
@@ -412,5 +577,118 @@ mod tests {
         // Invalid padded boolean.
         let err = parse_rerankers("bad:/a:512:maybe").unwrap_err();
         assert!(err.contains("padded"), "unexpected err: {err}");
+    }
+
+    // -----------------------------------------------------------------
+    // RERANKER_SESSION_POOL_SIZE parser. Default is 1 (single-session,
+    // exactly the pre-pool behaviour). Mirrors the cache/batch parser
+    // shape: helper takes Option<&str>, env lookup stays in `from_env`.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn reranker_pool_size_default_is_1_when_unset() {
+        // Unset env — preserves the legacy single-Mutex<Session> path.
+        assert_eq!(parse_reranker_pool_size(None), 1);
+    }
+
+    #[test]
+    fn reranker_pool_size_parses_valid_positive_integer() {
+        assert_eq!(parse_reranker_pool_size(Some("1")), 1);
+        assert_eq!(parse_reranker_pool_size(Some("2")), 2);
+        assert_eq!(parse_reranker_pool_size(Some("4")), 4);
+        // Surrounding whitespace tolerated (env quoting mishaps).
+        assert_eq!(parse_reranker_pool_size(Some("  3  ")), 3);
+    }
+
+    #[test]
+    fn reranker_pool_size_rejects_zero() {
+        // 0 would `% 0` panic in the round-robin selector; fall back
+        // rather than silently accept (matches BATCH_MAX_TOKENS=0 stance).
+        assert_eq!(parse_reranker_pool_size(Some("0")), 1);
+        assert_eq!(parse_reranker_pool_size(Some("  0  ")), 1);
+    }
+
+    #[test]
+    fn reranker_pool_size_falls_back_on_garbage() {
+        assert_eq!(parse_reranker_pool_size(Some("nope")), 1);
+        assert_eq!(parse_reranker_pool_size(Some("")), 1);
+        assert_eq!(parse_reranker_pool_size(Some("-1")), 1);
+    }
+
+    // -----------------------------------------------------------------
+    // SPLADE_MODELS parser. Mirrors the RERANKER_MODELS test set but
+    // with 3 fields (name:dir:max_len — no `padded` switch).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_splades_empty_string_is_empty_list() {
+        assert_eq!(parse_splades("").unwrap(), vec![]);
+        assert_eq!(parse_splades("   ").unwrap(), vec![]);
+        assert_eq!(parse_splades(",,").unwrap(), vec![]);
+    }
+
+    #[test]
+    fn parse_splades_single_entry_round_trips() {
+        let got = parse_splades("splade-v3-distilbert:/models-splade:512").unwrap();
+        assert_eq!(
+            got,
+            vec![SpladeModelDef {
+                name: "splade-v3-distilbert".into(),
+                dir: "/models-splade".into(),
+                max_len: 512,
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_splades_multiple_entries_parse_in_order() {
+        let got = parse_splades("a:/x:128,b:/y:256").unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].name, "a");
+        assert_eq!(got[0].max_len, 128);
+        assert_eq!(got[1].name, "b");
+        assert_eq!(got[1].max_len, 256);
+    }
+
+    #[test]
+    fn parse_splades_garbage_errors() {
+        // Wrong field count — too few.
+        assert!(parse_splades("toofew:/a").is_err());
+        // Wrong field count — too many. (4-field reranker entry won't
+        // parse as a splade entry, demonstrating the strict 3-field
+        // contract guards against env-var copy-paste mistakes.)
+        assert!(parse_splades("name:/dir:512:true").is_err());
+        // Unparseable max_len.
+        let err = parse_splades("bad:/a:notanumber").unwrap_err();
+        assert!(err.contains("max_len"), "unexpected err: {err}");
+    }
+
+    // -----------------------------------------------------------------
+    // SPLADE_SESSION_POOL_SIZE parser — same shape as the reranker one.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn splade_pool_size_default_is_1_when_unset() {
+        assert_eq!(parse_splade_pool_size(None), 1);
+    }
+
+    #[test]
+    fn splade_pool_size_parses_valid_positive_integer() {
+        assert_eq!(parse_splade_pool_size(Some("1")), 1);
+        assert_eq!(parse_splade_pool_size(Some("2")), 2);
+        assert_eq!(parse_splade_pool_size(Some("  3  ")), 3);
+    }
+
+    #[test]
+    fn splade_pool_size_rejects_zero() {
+        assert_eq!(parse_splade_pool_size(Some("0")), 1);
+        assert_eq!(parse_splade_pool_size(Some("  0  ")), 1);
+    }
+
+    #[test]
+    fn splade_pool_size_falls_back_on_garbage() {
+        assert_eq!(parse_splade_pool_size(Some("nope")), 1);
+        assert_eq!(parse_splade_pool_size(Some("")), 1);
+        assert_eq!(parse_splade_pool_size(Some("-1")), 1);
     }
 }

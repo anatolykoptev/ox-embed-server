@@ -2,10 +2,25 @@
 
 ## BUG-001: ort crate 1000x slowdown on ARM for BERT models with token_type_ids
 
-**Status:** UNRESOLVED (workaround deployed)
+**Status:** RESOLVED (2026-04, jina-code-v2 served natively by Rust embed-server)
 **Severity:** Critical
-**Date:** 2026-03-06
+**Date:** 2026-03-06 (opened) / 2026-04 (closed)
 **Component:** pykeio/ort v2.0.0-rc.12, ONNX Runtime 1.24.x, ARM Neoverse-N1
+
+### Resolution
+
+The current `jina-code-v2` ONNX file ships with only `[input_ids, attention_mask]`
+inputs (no `token_type_ids`), which avoids the 3-named-input code path in `ort`
+that triggered the 1000x slowdown. With that file, `embed-server` runs jina
+natively in Rust — the Python `embed-jina` sidecar was retired in April 2026
+and archived at `github.com:anatolykoptev/ox-embed-jina` (tag `retired-2026-04-17`).
+
+Verified in prod: jina-code-v2 p50 ~1.7 s single-query, ~2.4 s at conc=4
+(Oracle ARM Neoverse-N1, 4 vCPU). No 30 s outliers observed.
+
+If a future ONNX export re-adds `token_type_ids`, the slowdown may return —
+keep the 2-input file until `ort` ships a verified fix upstream. Monitoring
+pykeio/ort releases remains prudent.
 
 ### Problem
 

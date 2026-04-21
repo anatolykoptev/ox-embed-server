@@ -12,6 +12,7 @@ use crate::batcher::DynamicBatcher;
 use crate::cache::EmbeddingCache;
 use crate::model::EmbedModel;
 use crate::model_reranker::RerankerModel;
+use crate::model_splade::SpladeModel;
 
 // --- State ---
 
@@ -36,6 +37,19 @@ pub struct RerankerEntry {
     pub batcher: Option<Arc<DynamicBatcher>>,
 }
 
+/// Entry for a single SPLADE sparse encoder. v1 is batcher-free —
+/// `/v1/sparse_embeddings` dispatches one `spawn_blocking` per text
+/// rather than queuing into `DynamicBatcher`. The field is reserved
+/// here so a follow-up batcher wiring can land without changing
+/// `AppState`'s shape.
+pub struct SpladeEntry {
+    pub model: Arc<SpladeModel>,
+    /// Reserved for batcher integration in a follow-up. Always `None`
+    /// in v1 — present so the field exists when batching is wired up.
+    #[allow(dead_code)]
+    pub batcher: Option<Arc<DynamicBatcher>>,
+}
+
 /// Shared application state.
 pub struct AppState {
     pub models: HashMap<String, ModelEntry>,
@@ -44,6 +58,10 @@ pub struct AppState {
     /// `/v1/rerank` with any model name will 404/400 (E3).
     #[allow(dead_code)] // consumed by /v1/rerank handler (E3)
     pub rerankers: HashMap<String, RerankerEntry>,
+    /// Zero-or-more SPLADE sparse encoders keyed by model name. Empty
+    /// map is valid (default — `SPLADE_MODELS` unset); the server still
+    /// boots and `/v1/sparse_embeddings` returns 400 for any request.
+    pub splades: HashMap<String, SpladeEntry>,
     pub default_model: String,
     /// Cancelled on SIGTERM/SIGINT; handlers check this to reject new requests.
     pub shutdown: CancellationToken,

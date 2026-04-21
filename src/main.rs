@@ -1,5 +1,6 @@
 mod api;
 mod api_rerank;
+mod api_splade;
 mod batcher;
 mod cache;
 mod cache_flow;
@@ -7,6 +8,7 @@ mod config;
 mod metrics;
 mod model;
 mod model_reranker;
+mod model_splade;
 mod pool;
 mod types;
 
@@ -23,7 +25,8 @@ use crate::cache::EmbeddingCache;
 use crate::config::Config;
 use crate::model::EmbedModel;
 use crate::model_reranker::RerankerModel;
-use crate::types::{AppState, ModelEntry, RerankerEntry};
+use crate::model_splade::SpladeModel;
+use crate::types::{AppState, ModelEntry, RerankerEntry, SpladeEntry};
 
 /// Waits for SIGTERM or SIGINT, then cancels the token and sleeps for drain_timeout
 /// to allow in-flight HTTP requests to complete before axum closes the listener.
@@ -216,12 +219,21 @@ async fn main() {
             &def.dir,
             def.max_len,
             def.padded_model,
-            cfg.intra_threads,
+            cfg.reranker_intra_threads,
+            cfg.reranker_pool_size,
         )
         .unwrap_or_else(|e| {
             eprintln!("failed to load reranker '{}': {e}", def.name);
             std::process::exit(1);
         });
+        // Pre-warm every session in the pool so the FIRST production
+        // request doesn't pay graph compile + arena alloc cost (~3s
+        // observed on cold gte-multi-rerank vs ~1.5s steady state).
+        // Best-effort: warmup failure is logged but does not abort boot
+        // — the server still serves correctly without it.
+        if let Err(e) = m.warmup() {
+            tracing::error!(reranker = %def.name, error = %e, "reranker warmup failed (non-fatal)");
+        }
         let model_arc = Arc::new(m);
 
         // Adapter bridging `RerankerModel::score_pairs -> Vec<f32>` into
@@ -259,10 +271,42 @@ async fn main() {
         );
     }
 
+    // SPLADE loading loop. Mirrors the reranker block exactly except
+    // there's no batcher integration in v1 — `SpladeEntry::batcher` is
+    // always `None` for now. Fail loudly on load errors (same fail-at-
+    // boot stance as the embedding/reranker loops).
+    let mut splade_entries: HashMap<String, SpladeEntry> = HashMap::new();
+    for def in &cfg.splades {
+        tracing::info!(splade = %def.name, dir = %def.dir, "loading splade");
+        let m = SpladeModel::load(
+            &def.name,
+            &def.dir,
+            def.max_len,
+            cfg.splade_intra_threads,
+            cfg.splade_pool_size,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("failed to load splade '{}': {e}", def.name);
+            std::process::exit(1);
+        });
+        splade_entries.insert(
+            def.name.clone(),
+            SpladeEntry {
+                model: Arc::new(m),
+                // v1: no dynamic batcher. Follow-up will populate this
+                // once we observe SPLADE traffic shape and decide
+                // whether per-batch padding amortisation is worth the
+                // adapter complexity.
+                batcher: None,
+            },
+        );
+    }
+
     tracing::info!(
         batching_enabled = cfg.batching_enabled,
         models = model_entries.len(),
         rerankers = reranker_entries.len(),
+        splades = splade_entries.len(),
         "app state ready"
     );
 
@@ -285,6 +329,7 @@ async fn main() {
     let state = Arc::new(AppState {
         models: model_entries,
         rerankers: reranker_entries,
+        splades: splade_entries,
         default_model: cfg.default_model,
         shutdown: shutdown_token.clone(),
         drain_timeout,
@@ -315,6 +360,13 @@ async fn main() {
         )
         .route("/v1/embeddings", axum::routing::post(api::embeddings))
         .route("/v1/rerank", axum::routing::post(api_rerank::rerank))
+        // SPLADE / sparse embeddings — HuggingFace TEI convention path.
+        // No `/v1/` prefix because TEI itself doesn't use one for sparse;
+        // this maximises drop-in compat with TEI-aware tooling.
+        .route(
+            "/embed_sparse",
+            axum::routing::post(api_splade::sparse_embeddings),
+        )
         .with_state(router_state);
 
     let addr = format!("0.0.0.0:{}", cfg.port);

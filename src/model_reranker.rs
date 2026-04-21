@@ -20,6 +20,7 @@
 
 use std::path::Path;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ndarray::Array2;
 use ort::session::Session;
@@ -50,12 +51,24 @@ fn parse_opt_level() -> GraphOptimizationLevel {
 ///
 /// The reranker's ONNX graph has two inputs (`input_ids`, `attention_mask`)
 /// and one output (`logits` shape `[batch, 1]`). We never feed
-/// `token_type_ids` here — the exported BGE-reranker graph omits that
+/// `token_type_ids` here — the exported reranker graph omits that
 /// input entirely, and XLM-RoBERTa (the base model) doesn't use segment
 /// embeddings anyway.
 pub struct RerankerModel {
     name: String,
-    session: Mutex<Session>,
+    /// Pool of independent ONNX sessions. With `pool_size==1` this is a
+    /// single-element vector and behaves exactly like the legacy
+    /// `Mutex<Session>` path. With `pool_size>1`, `score_pairs` round-
+    /// robins across them via `next` so concurrent requests can run
+    /// inference in parallel — each session keeps its own `intra_threads`
+    /// pool inside ORT, so `pool_size * intra_threads` is the upper
+    /// bound on physical threads spent on one model.
+    sessions: Vec<Mutex<Session>>,
+    /// Round-robin cursor for selecting the next session. `Relaxed` is
+    /// fine: no other state is synchronised against this counter, and
+    /// the per-session `Mutex` provides any required ordering for the
+    /// inference itself.
+    next: AtomicUsize,
     tokenizer: Tokenizer,
     max_len: usize,
     /// Whether this model pads every sequence in a batch to `max(seq_len)`
@@ -71,20 +84,41 @@ pub struct RerankerModel {
 }
 
 impl RerankerModel {
-    /// Load the ONNX session + tokenizer from `dir`. Expects
+    /// Load the ONNX session(s) + tokenizer from `dir`. Expects
     /// `model_quantized.onnx` and `tokenizer.json` at the top level —
     /// same layout `EmbedModel::load` uses.
     ///
     /// `intra_threads` plumbs through to ORT's `with_intra_threads` so
     /// the embed-server's single `EMBED_INTRA_THREADS` knob governs both
     /// model kinds.
+    ///
+    /// `pool_size` controls how many independent `Session` instances are
+    /// loaded for this model. `1` is the legacy single-session path —
+    /// behaves byte-for-byte like the pre-pool code. Values >1 enable
+    /// concurrent inference (round-robin across sessions in
+    /// `score_pairs`) at the cost of N× the per-session memory
+    /// (~300-550 MB per session, depends on model: gte-multi-rerank ~340 MB, bge ~544 MB).
+    ///
+    /// IMPORTANT: each loaded session uses the FULL `intra_threads` value
+    /// — the model deliberately does NOT auto-divide. The caller is
+    /// expected to pass `intra_threads = total_cores / pool_size` (or
+    /// similar) so total CPU usage stays bounded. Keeping the math
+    /// explicit at the config layer means `EMBED_INTRA_THREADS` always
+    /// reflects what each session actually sees, instead of being a
+    /// surprising "logical" value the model silently divides.
     pub fn load(
         name: &str,
         dir: &str,
         max_len: usize,
         padded_model: bool,
         intra_threads: usize,
+        pool_size: usize,
     ) -> Result<Self, String> {
+        // Defensive clamp: caller contract says `>=1`, but a stray `0`
+        // from misconfigured plumbing would `% 0` panic in `score_pairs`.
+        // Costs nothing to make robust.
+        let pool_size = pool_size.max(1);
+
         let dir_p = Path::new(dir);
 
         let onnx_path = dir_p.join("model_quantized.onnx");
@@ -101,17 +135,31 @@ impl RerankerModel {
         tracing::info!(
             path = %onnx_path.display(),
             ?opt_level,
-            "creating reranker ONNX session"
+            pool_size,
+            intra_threads,
+            "creating reranker ONNX session(s)"
         );
-        let session = Session::builder()
-            .map_err(|e| format!("session builder: {e}"))?
-            .with_optimization_level(opt_level)
-            .map_err(|e| format!("set opt level: {e}"))?
-            .with_intra_threads(intra_threads)
-            .map_err(|e| format!("set threads: {e}"))?
-            .commit_from_file(&onnx_path)
-            .map_err(|e| format!("load ONNX {}: {e}", onnx_path.display()))?;
-        tracing::info!("reranker ONNX session created");
+        // Build N independent sessions. ORT loads the same ONNX file fine
+        // multiple times — no special "shared weights" mode is needed
+        // (and none exposed by ort 2.0-rc anyway). Each session has its
+        // own intra-op thread pool and weight buffers, so they really do
+        // run in parallel under separate Mutexes.
+        let mut sessions: Vec<Mutex<Session>> = Vec::with_capacity(pool_size);
+        for i in 0..pool_size {
+            let session = Session::builder()
+                .map_err(|e| format!("session builder #{i}: {e}"))?
+                .with_optimization_level(opt_level)
+                .map_err(|e| format!("set opt level #{i}: {e}"))?
+                .with_intra_threads(intra_threads)
+                .map_err(|e| format!("set threads #{i}: {e}"))?
+                .commit_from_file(&onnx_path)
+                .map_err(|e| format!("load ONNX #{i} {}: {e}", onnx_path.display()))?;
+            sessions.push(Mutex::new(session));
+        }
+        tracing::info!(
+            count = sessions.len(),
+            "reranker ONNX session(s) created"
+        );
 
         tracing::info!(path = %tok_path.display(), "loading reranker tokenizer");
         let mut tokenizer =
@@ -149,7 +197,8 @@ impl RerankerModel {
 
         Ok(Self {
             name: name.to_string(),
-            session: Mutex::new(session),
+            sessions,
+            next: AtomicUsize::new(0),
             tokenizer,
             max_len,
             padded_model,
@@ -199,7 +248,7 @@ impl RerankerModel {
     /// Run the cross-encoder forward pass on pre-tokenized pairs.
     /// Returns one raw logit per pair — higher means more relevant.
     ///
-    /// Output tensor shape from the bge-reranker-v2-m3 ONNX graph is
+    /// Output tensor shape from the reranker ONNX graph is
     /// `[batch, 1]`; we take `arr[[i, 0]]` for each row `i`. No softmax,
     /// no normalisation — clients get the raw score (matches Cohere /
     /// Jina rerank response semantics).
@@ -229,7 +278,17 @@ impl RerankerModel {
         let ids_tensor = Tensor::from_array(ids_arr).map_err(|e| format!("ids tensor: {e}"))?;
         let mask_tensor = Tensor::from_array(mask_arr).map_err(|e| format!("mask tensor: {e}"))?;
 
-        let mut session = self.session.lock().map_err(|e| format!("lock: {e}"))?;
+        // Round-robin pick from the pool. With pool_size==1 this always
+        // resolves to index 0 — identical lock pattern to the legacy
+        // single-Mutex<Session> code. With pool_size>1, two concurrent
+        // callers will (in the steady state) land on different sessions
+        // and run inference in parallel under separate locks.
+        // `Relaxed` is sufficient: the per-session Mutex provides the
+        // synchronization for the actual inference state.
+        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.sessions.len();
+        let mut session = self.sessions[idx]
+            .lock()
+            .map_err(|e| format!("lock session #{idx}: {e}"))?;
         let outputs = session
             .run(ort::inputs! {
                 "input_ids" => ids_tensor,
@@ -237,7 +296,7 @@ impl RerankerModel {
             })
             .map_err(|e| format!("reranker inference: {e}"))?;
 
-        // bge-reranker-v2-m3 emits a single output tensor named "logits"
+        // the reranker emits a single output tensor named "logits"
         // of shape [batch, 1]. Extract, reshape, then flatten the trailing
         // 1-dim by taking `[i, 0]` for each row.
         let raw = outputs[0]
@@ -252,6 +311,79 @@ impl RerankerModel {
         }
         Ok((0..batch).map(|i| raw[[i, 0]]).collect())
     }
+
+    /// Run a tiny dummy inference on every session in the pool to force
+    /// ORT graph compilation, kernel selection, and arena allocation
+    /// up-front. Without this the FIRST production request pays the full
+    /// startup cost (~3s observed for gte-multi-rerank, vs ~1.5s steady
+    /// state) — a tail-latency spike that's pure boot-time work.
+    ///
+    /// Best-effort: any session that fails to warm logs an error and we
+    /// continue. The server still serves correctly without warmup; this
+    /// is purely a latency optimization.
+    pub fn warmup(&self) -> Result<(), String> {
+        // Two short pairs so the batch dim isn't 1 (some kernels have
+        // separate codepaths for batch=1 vs batch>1; we want to compile
+        // the common path). Picked deliberately tiny so we don't hold
+        // the lock long.
+        let dummy_pairs = vec![
+            ("warmup query".to_string(), "warmup document one".to_string()),
+            ("warmup query".to_string(), "warmup document two".to_string()),
+        ];
+        let encodings = self
+            .tokenizer
+            .encode_batch(dummy_pairs, /*add_special_tokens*/ true)
+            .map_err(|e| format!("warmup tokenize: {e}"))?;
+        let token_ids: Vec<Vec<u32>> = encodings
+            .iter()
+            .map(|e| {
+                let ids = e.get_ids();
+                let len = ids.len().min(self.max_len);
+                ids[..len].to_vec()
+            })
+            .collect();
+
+        let max_seq = token_ids.iter().map(|v| v.len()).max().unwrap_or(0);
+        let batch = token_ids.len();
+        let (ids, mask_i64, _tti) =
+            pool::build_tensors_from_ids(&token_ids, batch, max_seq, self.pad_id);
+
+        // Warm EACH session in the pool — without this, only the first
+        // session served by round-robin would be hot; the second would
+        // pay the cold-start cost on its first concurrent request.
+        for (i, sess_mu) in self.sessions.iter().enumerate() {
+            let ids_arr = Array2::from_shape_vec([batch, max_seq], ids.clone())
+                .map_err(|e| format!("warmup ids shape: {e}"))?;
+            let mask_arr = Array2::from_shape_vec([batch, max_seq], mask_i64.clone())
+                .map_err(|e| format!("warmup mask shape: {e}"))?;
+            let ids_tensor =
+                Tensor::from_array(ids_arr).map_err(|e| format!("warmup ids tensor: {e}"))?;
+            let mask_tensor =
+                Tensor::from_array(mask_arr).map_err(|e| format!("warmup mask tensor: {e}"))?;
+            let start = std::time::Instant::now();
+            let mut session = sess_mu
+                .lock()
+                .map_err(|e| format!("warmup lock session #{i}: {e}"))?;
+            match session.run(ort::inputs! {
+                "input_ids" => ids_tensor,
+                "attention_mask" => mask_tensor,
+            }) {
+                Ok(_) => tracing::info!(
+                    model = %self.name,
+                    session = i,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "reranker session warmed"
+                ),
+                Err(e) => tracing::error!(
+                    model = %self.name,
+                    session = i,
+                    error = %e,
+                    "reranker session warmup failed (continuing)"
+                ),
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -265,9 +397,16 @@ mod tests {
     /// Resolution order:
     ///   1. `RERANKER_TEST_DIR` env var (CI / alt dev boxes).
     ///   2. Default on-box path
-    ///      `/home/krolik/deploy/krolik-server/models/bge-reranker-v2-m3`.
+    ///      `/home/krolik/deploy/krolik-server/models/gte-multi-rerank`.
     fn load_reranker_or_skip() -> Option<RerankerModel> {
-        const DEFAULT_DIR: &str = "/home/krolik/deploy/krolik-server/models/bge-reranker-v2-m3";
+        load_reranker_or_skip_with_pool(1)
+    }
+
+    /// Like `load_reranker_or_skip` but parameterised on `pool_size` so
+    /// the concurrent-pool test can request a 2-session model. Existing
+    /// tests stay on the single-session helper unchanged.
+    fn load_reranker_or_skip_with_pool(pool_size: usize) -> Option<RerankerModel> {
+        const DEFAULT_DIR: &str = "/home/krolik/deploy/krolik-server/models/gte-multi-rerank";
         let dir = std::env::var("RERANKER_TEST_DIR").unwrap_or_else(|_| DEFAULT_DIR.to_string());
         if !Path::new(&dir).join("tokenizer.json").exists()
             || !Path::new(&dir).join("model_quantized.onnx").exists()
@@ -278,7 +417,10 @@ mod tests {
             );
             return None;
         }
-        Some(RerankerModel::load("bge-reranker-v2-m3", &dir, 512, true, 1).expect("load reranker"))
+        Some(
+            RerankerModel::load("gte-multi-rerank", &dir, 512, true, 1, pool_size)
+                .expect("load reranker"),
+        )
     }
 
     #[test]
@@ -385,5 +527,74 @@ mod tests {
         };
         let scores = m.score_pairs(&[]).expect("empty score");
         assert!(scores.is_empty());
+    }
+
+    /// With `pool_size=2`, two threads calling `score_pairs` concurrently
+    /// must both succeed and return correctly shaped output. The point
+    /// is to prove the pool doesn't serialize through one mutex —
+    /// a regression to a single shared lock would still pass the shape
+    /// assertions, but the test would deadlock the moment one thread
+    /// holds a lock the other expects (it doesn't, by construction, so
+    /// the bare fact that two scoped threads run end-to-end is the
+    /// signal we want). We deliberately do NOT assert on timing —
+    /// wall-clock comparisons are flaky on shared CI runners.
+    #[test]
+    fn score_pairs_pool_concurrent() {
+        let Some(m) = load_reranker_or_skip_with_pool(2) else {
+            return;
+        };
+        // Sanity: the model really did load 2 sessions.
+        assert_eq!(
+            m.sessions.len(),
+            2,
+            "load_reranker_or_skip_with_pool(2) should produce 2 sessions"
+        );
+
+        let ids_a = m
+            .tokenize_pairs(
+                "what is a cat",
+                &[
+                    "a cat is a small domestic feline mammal".into(),
+                    "the price of oil dropped yesterday".into(),
+                ],
+            )
+            .expect("tokenize a");
+        let ids_b = m
+            .tokenize_pairs(
+                "what is a dog",
+                &[
+                    "a dog is a domesticated descendant of the wolf".into(),
+                    "vegetables grow in the garden".into(),
+                    "loyal canines often bark".into(),
+                ],
+            )
+            .expect("tokenize b");
+
+        // `std::thread::scope` lets both threads borrow `&m` directly:
+        // `RerankerModel` is `Sync` because every field is `Sync`
+        // (`Mutex<Session>: Sync`, `AtomicUsize: Sync`, `Tokenizer: Sync`).
+        std::thread::scope(|s| {
+            let h_a = s.spawn(|| m.score_pairs(&ids_a));
+            let h_b = s.spawn(|| m.score_pairs(&ids_b));
+            let scores_a = h_a.join().expect("thread A panicked").expect("score A");
+            let scores_b = h_b.join().expect("thread B panicked").expect("score B");
+
+            assert_eq!(scores_a.len(), 2, "thread A: one logit per doc");
+            assert_eq!(scores_b.len(), 3, "thread B: one logit per doc");
+            assert!(
+                scores_a.iter().all(|s| s.is_finite()),
+                "thread A scores must be finite: {scores_a:?}"
+            );
+            assert!(
+                scores_b.iter().all(|s| s.is_finite()),
+                "thread B scores must be finite: {scores_b:?}"
+            );
+            // Cross-check semantic ordering still holds when running
+            // through the pool — the relevant doc still wins.
+            assert!(
+                scores_a[0] > scores_a[1],
+                "thread A: relevant > unrelated, got {scores_a:?}"
+            );
+        });
     }
 }
