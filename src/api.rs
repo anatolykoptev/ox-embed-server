@@ -151,15 +151,21 @@ pub async fn embeddings(
         match b.embed_tokens(token_ids).await {
             Ok(v) => v,
             Err(crate::batcher::BatchError::QueueFull(e)) => {
-                tracing::warn!(error = %e, "queue full");
+                // E2: queue near capacity (≥80%) → fast-fail with 429
+                // Too Many Requests + Retry-After: 1. Clients (memdb-go
+                // commit 90b964f1) retry with exp backoff — closed
+                // loop. Previously returned 503, which conflated "queue
+                // full" (retryable) with shutdown (also retryable but
+                // usually transient differently).
+                tracing::warn!(error = %e, "queue full — returning 429");
                 crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
                 return (
-                    StatusCode::SERVICE_UNAVAILABLE,
+                    StatusCode::TOO_MANY_REQUESTS,
                     [("retry-after", "1")],
                     Json(ErrorResponse {
                         error: ErrorDetail {
                             message: e.to_string(),
-                            error_type: "server_error",
+                            error_type: "rate_limited",
                         },
                     }),
                 )
