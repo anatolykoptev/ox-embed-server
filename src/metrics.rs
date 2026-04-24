@@ -11,6 +11,12 @@ pub fn init(version: &str) -> PrometheusHandle {
     let duration_matcher =
         metrics_exporter_prometheus::Matcher::Suffix("_duration_seconds".to_string());
     let batch_matcher = metrics_exporter_prometheus::Matcher::Suffix("batch_size".to_string());
+    // ms-scale buckets for `embed_batch_wait_ms` — the queue-to-dispatch
+    // wall time. Bounded on the high end by `BATCH_WAIT_MS=30` under
+    // normal load; a p95 > 100 ms means the worker is saturated before
+    // the coalescing window closes.
+    let wait_ms_matcher =
+        metrics_exporter_prometheus::Matcher::Full("embed_batch_wait_ms".to_string());
 
     let handle = PrometheusBuilder::new()
         .set_buckets_for_metric(
@@ -25,6 +31,11 @@ pub fn init(version: &str) -> PrometheusHandle {
             &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0],
         )
         .expect("set batch buckets")
+        .set_buckets_for_metric(
+            wait_ms_matcher,
+            &[1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 5000.0],
+        )
+        .expect("set batch wait buckets")
         .install_recorder()
         .expect("install Prometheus recorder");
 
@@ -66,11 +77,13 @@ pub fn record_inference(model: &str, duration: Duration, batch_size: usize) {
     .record(batch_size as f64);
 }
 
-/// Increment rejected-due-to-backpressure counter (will be used in R6).
-#[allow(dead_code)]
+/// Increment rejected-due-to-backpressure counter. Called from the
+/// `DynamicBatcher` 80%-of-capacity gate and its belt-and-suspenders
+/// `try_send` fallthrough — so every item that produces a 429 on the
+/// wire increments this exactly once.
 pub fn record_queue_rejected(model: &str) {
     metrics::counter!(
-        "embed_queue_rejected_total",
+        "embed_queue_full_rejected_total",
         "model" => model.to_string()
     )
     .increment(1);
@@ -89,14 +102,29 @@ pub fn record_cancelled(model: &str) {
     .increment(1);
 }
 
-/// Set current queue depth (will be used in R5/R6).
-#[allow(dead_code)]
+/// Set current queue depth for a model's batcher. Emitted on every
+/// `embed_tokens` producer call (before the 80% gate) — so scrapes see
+/// the most recent producer-side view. Computed as
+/// `max_queue − sender.capacity()`.
 pub fn set_queue_depth(model: &str, depth: usize) {
     metrics::gauge!(
-        "embed_queue_depth",
+        "embed_queue_depth_current",
         "model" => model.to_string()
     )
     .set(depth as f64);
+}
+
+/// Record the wall-clock time in milliseconds from the moment an Item
+/// was handed to `tx.try_send` to the moment its batch was cut and
+/// passed to `dispatch_batch`. Sampled once per live Item in each
+/// dispatched batch. Rising p95 indicates producers outrunning dispatch
+/// capacity — usually a prelude to 429s from the 80% gate.
+pub fn record_batch_wait_ms(model: &str, wait_ms: f64) {
+    metrics::histogram!(
+        "embed_batch_wait_ms",
+        "model" => model.to_string()
+    )
+    .record(wait_ms);
 }
 
 /// Record padded-compute tokens for one dispatched batch.

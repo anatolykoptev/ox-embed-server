@@ -45,6 +45,12 @@ struct Item {
     /// input_ids (already truncated to the model's `max_len`).
     token_ids: Vec<Vec<u32>>,
     reply: oneshot::Sender<Result<Vec<Vec<f32>>, String>>,
+    /// Wall-clock instant at which the producer handed this Item to
+    /// `tx.try_send`. Used by the worker to record
+    /// `embed_batch_wait_ms` — the time each item spent queued before
+    /// its batch was cut. A climbing p95 here means producers are
+    /// outrunning dispatch capacity.
+    enqueued_at: Instant,
 }
 
 impl Item {
@@ -68,6 +74,11 @@ impl Item {
 pub struct DynamicBatcher {
     name: Arc<String>,
     sender: mpsc::Sender<Item>,
+    /// Total queue capacity (channel buffer size). Used together with
+    /// `sender.capacity()` to compute current depth for the
+    /// `embed_queue_depth_current` gauge and the 80%-of-cap backpressure
+    /// gate in `embed_tokens`.
+    max_queue: usize,
     // Held so `shutdown` can await the worker's `JoinHandle` on SIGTERM drain.
     worker: JoinHandle<()>,
 }
@@ -132,11 +143,24 @@ impl DynamicBatcher {
         DynamicBatcher {
             name: arc_name,
             sender: tx,
+            max_queue,
             worker: handle,
         }
     }
 
     /// Submit a request carrying pre-tokenized input_ids (one `Vec<u32>` per text).
+    ///
+    /// Backpressure: when the current queue depth is ≥ 80% of `max_queue`,
+    /// this returns `BatchError::QueueFull` **before** enqueueing, instead
+    /// of waiting for a slot. Fast-fail keeps p95 latency predictable
+    /// under overload and lets E1 retry-with-exp-backoff (memdb-go side)
+    /// reschedule the request. The handler maps `QueueFull` to HTTP 429
+    /// with `Retry-After: 1`.
+    ///
+    /// The final `try_send` remains as belt-and-suspenders: even with the
+    /// 80% gate, a racing producer could fill the remaining 20% before
+    /// we reach `try_send`; treating a full channel as `QueueFull` keeps
+    /// semantics consistent.
     pub async fn embed_tokens(
         &self,
         token_ids: Vec<Vec<u32>>,
@@ -149,12 +173,31 @@ impl DynamicBatcher {
         if token_ids.is_empty() {
             return Ok(vec![]);
         }
+        // Emit current depth every producer attempt. `sender.capacity()`
+        // returns remaining slots on the bounded mpsc; depth = total −
+        // remaining. Accurate at producer time, which is what Prometheus
+        // scrapes will see (scrape-driven observability).
+        let depth = self.max_queue.saturating_sub(self.sender.capacity());
+        crate::metrics::set_queue_depth(&self.name, depth);
+        // 80%-of-capacity reject threshold. `max_queue * 8 / 10` uses
+        // integer arithmetic — exactly 80% for max_queue divisible by 10
+        // (our prod value is 256, so threshold = 204). Rejecting before
+        // saturation leaves headroom for in-flight legitimate requests
+        // and avoids flapping right at the boundary.
+        let threshold = self.max_queue.saturating_mul(8) / 10;
+        if depth >= threshold {
+            crate::metrics::record_queue_rejected(&self.name);
+            return Err(BatchError::QueueFull(QueueFullError {
+                batcher_name: self.name.as_ref().clone(),
+            }));
+        }
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .sender
             .try_send(Item {
                 token_ids,
                 reply: reply_tx,
+                enqueued_at: Instant::now(),
             })
             .is_err()
         {
@@ -192,7 +235,11 @@ impl DynamicBatcher {
         reply: oneshot::Sender<Result<Vec<Vec<f32>>, String>>,
     ) -> Result<(), BatchError> {
         self.sender
-            .try_send(Item { token_ids, reply })
+            .try_send(Item {
+                token_ids,
+                reply,
+                enqueued_at: Instant::now(),
+            })
             .map_err(|_| {
                 BatchError::QueueFull(QueueFullError {
                     batcher_name: self.name.as_ref().clone(),
@@ -327,6 +374,18 @@ async fn run_worker(
         };
         crate::metrics::record_batch_tokens(&name, padded_tokens);
         crate::metrics::record_padding_waste(&name, padded_tokens, raw_tokens);
+        // Per-item enqueue→batch wall time. Recorded once per live Item
+        // that made it into this dispatched batch. Cancelled items
+        // (filtered above) are deliberately excluded — their "wait" is
+        // meaningless since no inference ran for them.
+        let now = Instant::now();
+        for item in &batch {
+            let wait_ms = now
+                .saturating_duration_since(item.enqueued_at)
+                .as_secs_f64()
+                * 1000.0;
+            crate::metrics::record_batch_wait_ms(&name, wait_ms);
+        }
         dispatch_batch(batch, embed_fn.clone(), name.clone()).await;
     }
 }
@@ -338,6 +397,7 @@ async fn dispatch_batch(items: Vec<Item>, embed_fn: EmbedFn, name: Arc<String>) 
     for Item {
         token_ids: t,
         reply,
+        enqueued_at: _,
     } in items
     {
         ids.extend(t);
@@ -582,6 +642,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn queue_full_returns_error() {
+        // E2: with the 80% backpressure gate, a `max_queue=10` batcher
+        // rejects the 9th producer (threshold = 10 * 8 / 10 = 8; depth
+        // ≥ 8 ⇒ reject). Worker blocked on a flag so items accumulate.
         use std::sync::atomic::{AtomicBool, Ordering};
         let blocked = Arc::new(AtomicBool::new(true));
         let blocked_cl = blocked.clone();
@@ -593,25 +656,32 @@ mod tests {
                 }
                 Ok(ids.iter().map(|_| vec![0.0f32; 4]).collect())
             },
-            32,
-            1,
-            1,
+            /*max_items*/ 1,
+            /*wait_ms*/ 5,
+            /*max_queue*/ 10,
         ));
         {
-            let b1 = b.clone();
-            let first = tokio::spawn(async move { b1.embed_tokens(tok(&[1])).await });
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            let b2 = b.clone();
-            let filler = tokio::spawn(async move { b2.embed_tokens(tok(&[2])).await });
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            let overflow = b.embed_tokens(tok(&[3])).await;
+            // Spawn 8 producers; worker is blocked so they stack up
+            // (one dispatched + up to 7 in the channel buffer ≤ 80%).
+            let mut fillers = Vec::new();
+            for i in 0..8u32 {
+                let bc = b.clone();
+                fillers.push(tokio::spawn(async move {
+                    bc.embed_tokens(tok(&[i])).await
+                }));
+            }
+            // Give the scheduler a moment so all 8 sends have landed
+            // and the producer-side depth gauge settles at ≥ 8.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let overflow = b.embed_tokens(tok(&[99])).await;
             assert!(
                 matches!(overflow, Err(BatchError::QueueFull(_))),
                 "got: {overflow:?}"
             );
             blocked.store(false, Ordering::SeqCst);
-            let _ = first.await;
-            let _ = filler.await;
+            for h in fillers {
+                let _ = h.await;
+            }
         }
         Arc::try_unwrap(b)
             .ok()
@@ -945,6 +1015,7 @@ mod tests {
         let seed = Item {
             token_ids: vec![vec![0u32; 500]],
             reply: oneshot::channel().0,
+            enqueued_at: Instant::now(),
         };
         let mut accum = BatchAccum::default();
         accum.push(&seed);
@@ -954,6 +1025,7 @@ mod tests {
         let cand50 = Item {
             token_ids: vec![vec![0u32; 50]],
             reply: oneshot::channel().0,
+            enqueued_at: Instant::now(),
         };
         assert!(
             !accum.fits(&cand50, &cfg),
@@ -972,6 +1044,7 @@ mod tests {
         let seed = Item {
             token_ids: vec![vec![0u32; 500]],
             reply: oneshot::channel().0,
+            enqueued_at: Instant::now(),
         };
         let mut accum = BatchAccum::default();
         accum.push(&seed);
@@ -980,6 +1053,7 @@ mod tests {
         let cand_fit = Item {
             token_ids: vec![vec![0u32; 499]],
             reply: oneshot::channel().0,
+            enqueued_at: Instant::now(),
         };
         assert!(accum.fits(&cand_fit, &cfg));
 
@@ -987,6 +1061,7 @@ mod tests {
         let cand_miss = Item {
             token_ids: vec![vec![0u32; 500]],
             reply: oneshot::channel().0,
+            enqueued_at: Instant::now(),
         };
         assert!(!accum.fits(&cand_miss, &cfg));
     }
@@ -1002,6 +1077,7 @@ mod tests {
         let two = Item {
             token_ids: vec![vec![1u32], vec![2u32]],
             reply: oneshot::channel().0,
+            enqueued_at: Instant::now(),
         };
         let mut accum = BatchAccum::default();
         accum.push(&two);
@@ -1009,6 +1085,7 @@ mod tests {
         let one = Item {
             token_ids: vec![vec![3u32]],
             reply: oneshot::channel().0,
+            enqueued_at: Instant::now(),
         };
         assert!(!accum.fits(&one, &cfg));
     }
@@ -1146,5 +1223,120 @@ mod tests {
             text.contains(&expected),
             "expected `{expected}` in:\n{text}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // E2: queue-depth gauge, 80% backpressure gate, batch-wait histogram
+    // -----------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queue_depth_gauge_is_emitted() {
+        let handle = test_prometheus_handle();
+        let name = "t_depth_gauge";
+        let b = item_cap_batcher(
+            name,
+            |ids: Vec<Vec<u32>>| Ok(ids.iter().map(|_| vec![0.0f32; 4]).collect()),
+            /*max_items*/ 32,
+            /*wait_ms*/ 20,
+            /*max_queue*/ 16,
+        );
+        // Any successful enqueue must emit the gauge at least once.
+        let _ = b.embed_tokens(tok(&[1])).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let text = handle.render();
+        let needle = format!("embed_queue_depth_current{{model=\"{name}\"}}");
+        assert!(
+            text.contains(&needle),
+            "expected `{needle}` in /metrics render:\n{text}"
+        );
+        b.shutdown(Duration::from_millis(200)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backpressure_rejects_at_eighty_percent() {
+        // max_queue=10 ⇒ threshold = 10 * 8 / 10 = 8. With 8 slots
+        // occupied (worker blocked), the 9th send must be rejected
+        // BEFORE reaching `try_send` — which proves the pre-check gate
+        // is active (try_send alone would wait up to max_queue=10).
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let handle = test_prometheus_handle();
+        let name = "t_80pct";
+        let blocked = Arc::new(AtomicBool::new(true));
+        let blocked_cl = blocked.clone();
+        let b = Arc::new(item_cap_batcher(
+            name,
+            move |ids: Vec<Vec<u32>>| {
+                while blocked_cl.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(ids.iter().map(|_| vec![0.0f32; 4]).collect())
+            },
+            /*max_items*/ 1,
+            /*wait_ms*/ 5,
+            /*max_queue*/ 10,
+        ));
+        let before = read_queue_rejected(&handle.render(), name);
+        let mut fillers = Vec::new();
+        for i in 0..8u32 {
+            let bc = b.clone();
+            fillers.push(tokio::spawn(async move {
+                bc.embed_tokens(tok(&[i])).await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let rejected = b.embed_tokens(tok(&[99])).await;
+        assert!(
+            matches!(rejected, Err(BatchError::QueueFull(_))),
+            "expected QueueFull at 80% threshold, got: {rejected:?}"
+        );
+        let after = read_queue_rejected(&handle.render(), name);
+        assert_eq!(
+            after - before,
+            1,
+            "rejected counter must advance by 1: {before} -> {after}"
+        );
+        blocked.store(false, Ordering::SeqCst);
+        for h in fillers {
+            let _ = h.await;
+        }
+        Arc::try_unwrap(b)
+            .ok()
+            .expect("still has clones")
+            .shutdown(Duration::from_millis(500))
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn batch_wait_histogram_is_recorded() {
+        let handle = test_prometheus_handle();
+        let name = "t_wait_hist";
+        let b = item_cap_batcher(
+            name,
+            |ids: Vec<Vec<u32>>| Ok(ids.iter().map(|_| vec![0.0f32; 4]).collect()),
+            /*max_items*/ 32,
+            /*wait_ms*/ 20,
+            /*max_queue*/ 16,
+        );
+        let _ = b.embed_tokens(tok(&[1])).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let text = handle.render();
+        assert!(
+            text.contains(&format!("embed_batch_wait_ms_count{{model=\"{name}\"}}")),
+            "missing batch_wait_ms histogram: {text}"
+        );
+        b.shutdown(Duration::from_millis(200)).await;
+    }
+
+    /// Parse the `embed_queue_full_rejected_total{model="..."} N` line
+    /// out of a Prometheus render. Returns 0 if absent.
+    fn read_queue_rejected(rendered: &str, model: &str) -> u64 {
+        let needle = format!("model=\"{model}\"");
+        rendered
+            .lines()
+            .filter(|l| l.starts_with("embed_queue_full_rejected_total"))
+            .find(|l| l.contains(&needle))
+            .and_then(|l| l.rsplit_once(' '))
+            .and_then(|(_, v)| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
     }
 }

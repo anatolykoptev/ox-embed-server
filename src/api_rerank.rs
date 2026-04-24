@@ -252,14 +252,17 @@ pub async fn rerank(
                 }
             },
             Err(crate::batcher::BatchError::QueueFull(e)) => {
-                tracing::warn!(error = %e, "rerank queue full");
+                // E2: 429 Too Many Requests on backpressure (≥80% full).
+                // Matches `/v1/embeddings` semantics — see api.rs for
+                // the full rationale.
+                tracing::warn!(error = %e, "rerank queue full — returning 429");
                 return (
-                    StatusCode::SERVICE_UNAVAILABLE,
+                    StatusCode::TOO_MANY_REQUESTS,
                     [("retry-after", "1")],
                     Json(ErrorResponse {
                         error: ErrorDetail {
                             message: e.to_string(),
-                            error_type: "server_error",
+                            error_type: "rate_limited",
                         },
                     }),
                 )
