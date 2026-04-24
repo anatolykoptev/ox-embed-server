@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.0](https://github.com/anatolykoptev/ox-embed-server/compare/embed-server-v0.3.0...embed-server-v0.4.0) (2026-04-24)
+
+
+### Features
+
+* **batcher:** queue-depth gauge + 429 backpressure (closes E2) ([ba2a250](https://github.com/anatolykoptev/ox-embed-server/commit/ba2a250cb8e29d850b47e3e759f070169a1224ca))
+* **batcher:** queue-depth gauge + 429 backpressure + batch-wait histogram ([88177c6](https://github.com/anatolykoptev/ox-embed-server/commit/88177c6153f7383e7c82293acdc25515910a301c))
+* **cache:** Phase D response cache (moka-backed, probe before tokenize) ([4342ea7](https://github.com/anatolykoptev/ox-embed-server/commit/4342ea77c71d458adbd07cb790b07f3ded413f07))
+* **embed:** Phase E /v1/rerank endpoint (BGE-reranker-v2-m3) ([601c4c0](https://github.com/anatolykoptev/ox-embed-server/commit/601c4c0170cf476cd2a041f53d239dd6645b2e3e))
+* **embed:** reranker pool+warmup polish, SPLADE /embed_sparse v1 ([1033041](https://github.com/anatolykoptev/ox-embed-server/commit/1033041632b97a5db3b6073b1abd11d5de088f0a))
+
 ## [0.3.0](https://github.com/anatolykoptev/ox-embed-server/compare/embed-server-v0.2.0...embed-server-v0.3.0) (2026-04-18)
 
 
