@@ -30,7 +30,16 @@ use crate::types::{AppState, ErrorDetail, ErrorResponse, error_json};
 // G2-server: optional server-side score normalization.
 // ---------------------------------------------------------------------
 
-/// Server-side score normalization mode (G2-server).
+/// Sigmoid input clamp threshold. f32::exp() overflows around x=88.7
+/// (yielding +∞), and at x=-88.7 the denominator 1+exp(-x) ≈ exp(89)
+/// also overflows. Clamping to ±50 keeps exp() arg in a comfortable
+/// range while still giving sigmoid(±50) ≈ 1 / 0 within f32 precision
+/// (the difference between sigmoid(50) and sigmoid(88) is ~1e-22,
+/// far below f32 ULP at that magnitude).
+const SIGMOID_CLAMP: f32 = 50.0;
+
+/// Optional server-side normalization applied to cross-encoder logits
+/// before sort. Default `None` returns raw logits (Cohere/Jina convention).
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum NormalizeMode {
@@ -51,7 +60,7 @@ pub(crate) fn apply_normalize(scores: &mut [f32], mode: NormalizeMode) {
                 // Clamp inputs to ±50 to avoid (-x).exp() overflowing f32
                 // (~1e22 at x=-50). Values outside ±50 are effectively
                 // saturated (sigmoid(-50) ≈ 0, sigmoid(50) ≈ 1).
-                let clamped = s.clamp(-50.0, 50.0);
+                let clamped = s.clamp(-SIGMOID_CLAMP, SIGMOID_CLAMP);
                 *s = 1.0 / (1.0 + (-clamped).exp());
             }
         }
