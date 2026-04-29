@@ -98,28 +98,16 @@ pub async fn embeddings(
     let miss_positions_total: usize = pending.values().map(Vec::len).sum();
     crate::metrics::record_cache_miss_n(&model_name, miss_positions_total as u64);
 
-    // All-hit short-circuit: every position served from cache, no
-    // inference needed. Still records request-level metrics.
-    //
-    // Token count: we re-tokenize to give callers a consistent total_tokens
-    // regardless of hit/miss state. Tokenization itself is O(µs) — far
-    // cheaper than the ~200ms inference we're avoiding. This avoids the
-    // surprising behaviour where the same request reports different token
-    // counts depending on cache warmth.
+    // Cache-hit path: skip backend entirely, report 0 tokens (consistent
+    // with miss path's "hits report 0, only missed texts charged").
     if pending.is_empty() {
         let vectors: Vec<Vec<f32>> = cached.into_iter().map(|o| o.expect("all hits")).collect();
-        let model_for_tokenize = entry.model.clone();
-        let texts_for_tokenize = texts.clone();
-        let hit_total_tokens: u32 = match tokio::task::spawn_blocking(move || {
-            model_for_tokenize.tokenize(&texts_for_tokenize)
-        })
-        .await
-        {
-            Ok(Ok(ids)) => ids.iter().map(|v| v.len() as u32).sum(),
-            // If tokenization fails on the cache-hit path, return 0 rather than
-            // failing the whole request — the caller already has their vectors.
-            _ => 0,
-        };
+        // Full cache hit — no backend work performed, no tokens charged.
+        // Matches OpenAI billing semantics: tokens are billed for compute we
+        // actually did. The same request on a cold cache will report
+        // total_tokens > 0; on a warm cache the caller already paid for those
+        // tokens in a prior request.
+        let total_tokens: u32 = 0;
         status = "ok";
         crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
         return Json(EmbedResponse {
@@ -127,8 +115,8 @@ pub async fn embeddings(
             data: build_data(vectors, encoding_format),
             model: model_name,
             usage: Usage {
-                prompt_tokens: hit_total_tokens,
-                total_tokens: hit_total_tokens,
+                prompt_tokens: total_tokens,
+                total_tokens,
             },
         })
         .into_response();
@@ -146,9 +134,9 @@ pub async fn embeddings(
     let token_ids = match tokio::task::spawn_blocking(move || model.tokenize(&tokenize_input)).await
     {
         Ok(Ok(ids)) => ids,
-        // error arms below are unchanged
         Ok(Err(e)) => {
-            tracing::error!(error = %e, "tokenize failed");
+            tracing::warn!(error = %e, "tokenize failed in /v1/embeddings");
+            crate::metrics::record_tokenize_fallback();
             crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -162,7 +150,8 @@ pub async fn embeddings(
                 .into_response();
         }
         Err(join_err) => {
-            tracing::error!(error = %join_err, "tokenize task panicked");
+            tracing::warn!(error = %join_err, "tokenize task panicked in /v1/embeddings");
+            crate::metrics::record_tokenize_fallback();
             crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,

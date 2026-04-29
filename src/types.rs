@@ -108,12 +108,10 @@ pub struct EmbedRequest {
     /// Encoding format for the `embedding` field in the response.
     /// Defaults to `float` (JSON array). Use `base64` for bulk ingest
     /// paths to reduce HTTP payload by ~33%.
-    #[serde(default)]
     pub encoding_format: Option<EncodingFormat>,
     /// Document or query input type. Currently a no-op for our symmetric
     /// models but accepted and included in the cache key for future
     /// asymmetric model support. Defaults to `document`.
-    #[serde(default)]
     pub input_type: Option<InputType>,
 }
 
