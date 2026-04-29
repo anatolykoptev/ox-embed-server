@@ -666,9 +666,9 @@ mod tests {
             let mut fillers = Vec::new();
             for i in 0..8u32 {
                 let bc = b.clone();
-                fillers.push(tokio::spawn(async move {
-                    bc.embed_tokens(tok(&[i])).await
-                }));
+                fillers.push(tokio::spawn(
+                    async move { bc.embed_tokens(tok(&[i])).await },
+                ));
             }
             // Give the scheduler a moment so all 8 sends have landed
             // and the producer-side depth gauge settles at ≥ 8.
@@ -1279,9 +1279,9 @@ mod tests {
         let mut fillers = Vec::new();
         for i in 0..8u32 {
             let bc = b.clone();
-            fillers.push(tokio::spawn(async move {
-                bc.embed_tokens(tok(&[i])).await
-            }));
+            fillers.push(tokio::spawn(
+                async move { bc.embed_tokens(tok(&[i])).await },
+            ));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
         let rejected = b.embed_tokens(tok(&[99])).await;

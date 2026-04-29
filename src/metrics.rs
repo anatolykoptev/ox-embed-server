@@ -33,7 +33,9 @@ pub fn init(version: &str) -> PrometheusHandle {
         .expect("set batch buckets")
         .set_buckets_for_metric(
             wait_ms_matcher,
-            &[1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 5000.0],
+            &[
+                1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 5000.0,
+            ],
         )
         .expect("set batch wait buckets")
         .install_recorder()

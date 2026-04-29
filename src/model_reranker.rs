@@ -156,10 +156,7 @@ impl RerankerModel {
                 .map_err(|e| format!("load ONNX #{i} {}: {e}", onnx_path.display()))?;
             sessions.push(Mutex::new(session));
         }
-        tracing::info!(
-            count = sessions.len(),
-            "reranker ONNX session(s) created"
-        );
+        tracing::info!(count = sessions.len(), "reranker ONNX session(s) created");
 
         tracing::info!(path = %tok_path.display(), "loading reranker tokenizer");
         let mut tokenizer =
@@ -327,8 +324,14 @@ impl RerankerModel {
         // the common path). Picked deliberately tiny so we don't hold
         // the lock long.
         let dummy_pairs = vec![
-            ("warmup query".to_string(), "warmup document one".to_string()),
-            ("warmup query".to_string(), "warmup document two".to_string()),
+            (
+                "warmup query".to_string(),
+                "warmup document one".to_string(),
+            ),
+            (
+                "warmup query".to_string(),
+                "warmup document two".to_string(),
+            ),
         ];
         let encodings = self
             .tokenizer

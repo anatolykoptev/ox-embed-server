@@ -298,7 +298,11 @@ impl SpladeModel {
             .try_extract_array::<f32>()
             .map_err(|e| format!("extract logits: {e}"))?;
         let shape = raw.shape();
-        if shape.len() != 3 || shape[0] != batch || shape[1] != seq_len || shape[2] != self.vocab_size {
+        if shape.len() != 3
+            || shape[0] != batch
+            || shape[1] != seq_len
+            || shape[2] != self.vocab_size
+        {
             return Err(format!(
                 "unexpected splade output shape: {:?}, expected [{batch}, {seq_len}, {}]",
                 shape, self.vocab_size
@@ -374,8 +378,7 @@ mod tests {
     }
 
     fn load_splade_or_skip_with_pool(pool_size: usize) -> Option<SpladeModel> {
-        const DEFAULT_DIR: &str =
-            "/home/krolik/deploy/krolik-server/models/splade-v3-distilbert";
+        const DEFAULT_DIR: &str = "/home/krolik/deploy/krolik-server/models/splade-v3-distilbert";
         let dir = std::env::var("SPLADE_TEST_DIR").unwrap_or_else(|_| DEFAULT_DIR.to_string());
         if !Path::new(&dir).join("tokenizer.json").exists()
             || !Path::new(&dir).join("model.onnx").exists()
@@ -398,7 +401,10 @@ mod tests {
             return;
         };
         let ids = m.tokenize("what is a cat").expect("tokenize");
-        assert!(!ids.is_empty(), "tokenize must return at least [CLS] ... [SEP]");
+        assert!(
+            !ids.is_empty(),
+            "tokenize must return at least [CLS] ... [SEP]"
+        );
         assert!(
             ids.len() <= 512,
             "tokenize must stay within max_len, got {}",
