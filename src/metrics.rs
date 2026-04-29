@@ -224,3 +224,10 @@ pub fn record_cache_miss(model: &str) {
 pub fn set_cache_size(size: usize) {
     metrics::gauge!("embed_cache_size").set(size as f64);
 }
+
+/// Increment the tokenize-fallback counter. Called whenever a tokenize
+/// call on the miss path fails (Err result or task panic). Allows ops to
+/// detect tokenizer regressions instead of seeing silent total_tokens=0.
+pub fn record_tokenize_fallback() {
+    metrics::counter!("embed_tokenize_fallback_total").increment(1);
+}

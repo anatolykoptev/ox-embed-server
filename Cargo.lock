@@ -397,6 +397,7 @@ name = "embed-server"
 version = "0.3.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "metrics",
  "metrics-exporter-prometheus",
  "moka",

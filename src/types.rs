@@ -75,10 +75,44 @@ pub struct AppState {
 
 // --- Request types ---
 
+/// Encoding format for embedding output, matching the OpenAI API spec.
+///
+/// - `Float` (default): embeddings as JSON arrays of float32.
+/// - `Base64`: embeddings as a base64-encoded string of raw little-endian
+///   float32 bytes. Reduces HTTP payload by ~33% for bulk ingest paths.
+#[derive(Deserialize, Debug, Clone, Copy, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum EncodingFormat {
+    #[default]
+    Float,
+    Base64,
+}
+
+/// Document vs. query distinction for asymmetric embedding models
+/// (Voyage-style). Our current symmetric models (e5/gte/bge-m3) treat
+/// this as a no-op at inference time but it is **included in the cache
+/// key** so that future asymmetric-model deploys don't cause cache
+/// pollution between document and query vectors.
+#[derive(Deserialize, Debug, Clone, Copy, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum InputType {
+    #[default]
+    Document,
+    Query,
+}
+
 #[derive(Deserialize)]
 pub struct EmbedRequest {
     pub input: InputField,
     pub model: Option<String>,
+    /// Encoding format for the `embedding` field in the response.
+    /// Defaults to `float` (JSON array). Use `base64` for bulk ingest
+    /// paths to reduce HTTP payload by ~33%.
+    pub encoding_format: Option<EncodingFormat>,
+    /// Document or query input type. Currently a no-op for our symmetric
+    /// models but accepted and included in the cache key for future
+    /// asymmetric model support. Defaults to `document`.
+    pub input_type: Option<InputType>,
 }
 
 #[derive(Deserialize)]
@@ -99,6 +133,16 @@ impl InputField {
 
 // --- Response types ---
 
+/// The embedding value in a response: either a JSON float array or a
+/// base64-encoded string (little-endian f32 bytes). Serialized as
+/// untagged so the field stays `"embedding": [...]` vs `"embedding": "..."`.
+#[derive(Serialize, Debug, PartialEq)]
+#[serde(untagged)]
+pub enum EmbeddingValue {
+    Vector(Vec<f32>),
+    Base64(String),
+}
+
 #[derive(Serialize)]
 pub struct EmbedResponse {
     pub object: &'static str,
@@ -110,7 +154,7 @@ pub struct EmbedResponse {
 #[derive(Serialize)]
 pub struct EmbedData {
     pub object: &'static str,
-    pub embedding: Vec<f32>,
+    pub embedding: EmbeddingValue,
     pub index: usize,
 }
 
