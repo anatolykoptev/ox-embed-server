@@ -27,6 +27,38 @@ use serde::{Deserialize, Serialize};
 use crate::types::{AppState, ErrorDetail, ErrorResponse, error_json};
 
 // ---------------------------------------------------------------------
+// G2-server: optional server-side score normalization.
+// ---------------------------------------------------------------------
+
+/// Server-side score normalization mode (G2-server).
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum NormalizeMode {
+    /// Identity — return raw cross-encoder logits (Cohere compat default).
+    #[default]
+    None,
+    /// Apply 1/(1+exp(-x)) per score → [0,1].
+    Sigmoid,
+}
+
+/// Pure score normalization — applied after `score_pairs` and before
+/// `build_sorted_results`. Sigmoid is monotonic so sort order is preserved.
+pub(crate) fn apply_normalize(scores: &mut [f32], mode: NormalizeMode) {
+    match mode {
+        NormalizeMode::None => {}
+        NormalizeMode::Sigmoid => {
+            for s in scores.iter_mut() {
+                // Clamp inputs to ±50 to avoid (-x).exp() overflowing f32
+                // (~1e22 at x=-50). Values outside ±50 are effectively
+                // saturated (sigmoid(-50) ≈ 0, sigmoid(50) ≈ 1).
+                let clamped = s.clamp(-50.0, 50.0);
+                *s = 1.0 / (1.0 + (-clamped).exp());
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // Request / response types. Kept local to this module (not `types.rs`)
 // because they are only consumed by this one handler — colocating
 // request/response with their handler keeps the API surface area near
@@ -72,6 +104,12 @@ pub struct RerankRequest {
     /// most clients already have the source text and only need scores.
     #[serde(default)]
     pub return_documents: bool,
+    /// G2: optional server-side score normalization. None (default) returns
+    /// raw logits — preserves Cohere convention. "sigmoid" applies
+    /// 1/(1+exp(-x)) to each score after `score_pairs` and before sort.
+    /// Other values rejected with 400.
+    #[serde(default)]
+    pub normalize: Option<NormalizeMode>,
 }
 
 #[derive(Serialize, Debug, PartialEq)]
@@ -80,8 +118,9 @@ pub struct RerankResult {
     /// array (0-based). Preserved across sort so clients can map scores
     /// back to the text they sent.
     pub index: usize,
-    /// Raw cross-encoder logit. Not softmax-normalised — matches
-    /// Cohere/Jina reranker convention (higher = more relevant).
+    /// Cross-encoder relevance score. By default raw logit (matches
+    /// Cohere/Jina convention; higher = more relevant, unbounded). If the
+    /// request had `"normalize":"sigmoid"`, this is sigmoid-normalized to [0,1].
     pub relevance_score: f32,
     /// Set only when the request had `return_documents=true`. Cohere shape:
     /// `{"text": "..."}` object, NOT a bare string.
@@ -212,6 +251,7 @@ pub async fn rerank(
     let documents: Vec<String> = req.documents.into_iter().map(|d| d.into_text()).collect();
     let doc_count = documents.len();
     let return_documents = req.return_documents;
+    let normalize = req.normalize;
 
     // Tokenize pairs in spawn_blocking — same reasoning as `api::embeddings`:
     // tokenization is CPU-bound and blocking it on the async runtime
@@ -315,6 +355,11 @@ pub async fn rerank(
         return server_error("internal error: score count mismatch".to_string());
     }
 
+    // G2-server: apply optional score normalization before sort.
+    // Sigmoid is monotonic so sort order is preserved — safe to run here.
+    let mut scores = scores;
+    apply_normalize(&mut scores, normalize.unwrap_or_default());
+
     let echo_docs: Option<&[String]> = if return_documents {
         Some(&documents)
     } else {
@@ -326,10 +371,13 @@ pub async fn rerank(
         // Cohere generates an opaque request id for tracing; we use a
         // simple time-based hex (no extra crate dep). Clients use it for
         // log correlation only — semantics are "opaque, unique-ish".
-        id: format!("rrk_{:x}", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)),
+        id: format!(
+            "rrk_{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ),
         model: model_name,
         results,
     })
@@ -509,5 +557,77 @@ mod tests {
         let scores = vec![1.0f32, 2.0];
         let results = build_sorted_results(&scores, Some(10), None);
         assert_eq!(results.len(), 2);
+    }
+
+    // -----------------------------------------------------------------
+    // G2-server: apply_normalize — unit tests for NormalizeMode variants.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn apply_normalize_none_is_identity() {
+        let mut scores = vec![-15.0, -1.0, 0.0, 1.0, 15.0];
+        apply_normalize(&mut scores, NormalizeMode::None);
+        assert_eq!(scores, vec![-15.0, -1.0, 0.0, 1.0, 15.0]);
+    }
+
+    #[test]
+    fn apply_normalize_sigmoid_known_inputs() {
+        let mut scores = vec![-1.0, 0.0, 1.0];
+        apply_normalize(&mut scores, NormalizeMode::Sigmoid);
+        // sigmoid(-1) ≈ 0.2689, sigmoid(0) = 0.5, sigmoid(1) ≈ 0.7311
+        assert!((scores[0] - 0.268_9).abs() < 1e-3);
+        assert!((scores[1] - 0.5).abs() < 1e-6);
+        assert!((scores[2] - 0.731_1).abs() < 1e-3);
+    }
+
+    #[test]
+    fn apply_normalize_sigmoid_extremes_no_inf() {
+        let mut scores = vec![-100.0, 100.0];
+        apply_normalize(&mut scores, NormalizeMode::Sigmoid);
+        assert!(scores[0].is_finite());
+        assert!(scores[1].is_finite());
+        assert!(scores[0] >= 0.0 && scores[0] <= 1.0);
+        assert!(scores[1] >= 0.0 && scores[1] <= 1.0);
+    }
+
+    #[test]
+    fn apply_normalize_sigmoid_preserves_sort_order() {
+        let original = vec![-3.0, -1.0, 0.5, 2.0, 5.0];
+        let mut sigmoid = original.clone();
+        apply_normalize(&mut sigmoid, NormalizeMode::Sigmoid);
+        // sigmoid is monotonic: original[i] < original[j] → sigmoid[i] < sigmoid[j]
+        for i in 0..original.len() {
+            for j in (i + 1)..original.len() {
+                if original[i] < original[j] {
+                    assert!(sigmoid[i] < sigmoid[j], "sort order broken at i={i}, j={j}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rerank_request_deserialize_normalize_field() {
+        // Without field — defaults to None.
+        let r1: RerankRequest = serde_json::from_str(r#"{"query":"q","documents":["a"]}"#).unwrap();
+        assert_eq!(r1.normalize, None);
+
+        // Explicit "none".
+        let r2: RerankRequest =
+            serde_json::from_str(r#"{"query":"q","documents":["a"],"normalize":"none"}"#).unwrap();
+        assert_eq!(r2.normalize, Some(NormalizeMode::None));
+
+        // Explicit "sigmoid".
+        let r3: RerankRequest =
+            serde_json::from_str(r#"{"query":"q","documents":["a"],"normalize":"sigmoid"}"#)
+                .unwrap();
+        assert_eq!(r3.normalize, Some(NormalizeMode::Sigmoid));
+    }
+
+    #[test]
+    fn rerank_request_invalid_normalize_rejected() {
+        // serde with rename_all="lowercase" rejects unknown values.
+        let r: Result<RerankRequest, _> =
+            serde_json::from_str(r#"{"query":"q","documents":["a"],"normalize":"softmax"}"#);
+        assert!(r.is_err(), "unknown normalize value must error");
     }
 }
