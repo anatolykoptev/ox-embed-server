@@ -106,12 +106,22 @@ impl EmbedModel {
             ?opt_level,
             "creating ONNX session"
         );
+        // Disable memory pattern: ORT pre-allocates per static input shape.
+        // Our DynamicBatcher produces variable batch sizes (1..BATCH_MAX) and
+        // variable seq_len (truncated per token budget). With pattern enabled,
+        // each new (batch, seq_len) shape causes a fresh BFCArena extension
+        // that's never released — a 31-min run grew from 3GB to 8GB and
+        // cancelled queues across all models. Disabled, allocations are
+        // sized per-request; couple-ms latency hit per batch is dwarfed by
+        // the queue stalls we get under memory pressure.
         let session = Session::builder()
             .map_err(|e| format!("session builder: {e}"))?
             .with_optimization_level(opt_level)
             .map_err(|e| format!("set opt level: {e}"))?
             .with_intra_threads(intra_threads)
             .map_err(|e| format!("set threads: {e}"))?
+            .with_memory_pattern(false)
+            .map_err(|e| format!("disable memory pattern: {e}"))?
             .commit_from_file(&onnx_path)
             .map_err(|e| format!("load ONNX {}: {e}", onnx_path.display()))?;
         tracing::info!("ONNX session created");

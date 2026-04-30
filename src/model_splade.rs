@@ -129,12 +129,16 @@ impl SpladeModel {
         );
         let mut sessions: Vec<Mutex<Session>> = Vec::with_capacity(pool_size);
         for i in 0..pool_size {
+            // See model.rs: memory pattern + dynamic batches = unbounded
+            // arena growth. SPLADE pool follows the same pattern.
             let session = Session::builder()
                 .map_err(|e| format!("session builder #{i}: {e}"))?
                 .with_optimization_level(opt_level)
                 .map_err(|e| format!("set opt level #{i}: {e}"))?
                 .with_intra_threads(intra_threads)
                 .map_err(|e| format!("set threads #{i}: {e}"))?
+                .with_memory_pattern(false)
+                .map_err(|e| format!("disable memory pattern #{i}: {e}"))?
                 .commit_from_file(&onnx_path)
                 .map_err(|e| format!("load ONNX #{i} {}: {e}", onnx_path.display()))?;
             sessions.push(Mutex::new(session));
