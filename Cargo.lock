@@ -403,6 +403,7 @@ dependencies = [
  "moka",
  "ndarray",
  "ort",
+ "ort-sys",
  "reqwest",
  "serde",
  "serde_json",

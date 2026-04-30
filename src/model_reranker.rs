@@ -157,6 +157,8 @@ impl RerankerModel {
                 .map_err(|e| format!("set threads #{i}: {e}"))?
                 .with_memory_pattern(false)
                 .map_err(|e| format!("disable memory pattern #{i}: {e}"))?
+                .with_env_allocators()
+                .map_err(|e| format!("enable env allocators #{i}: {e}"))?
                 .commit_from_file(&onnx_path)
                 .map_err(|e| format!("load ONNX #{i} {}: {e}", onnx_path.display()))?;
             sessions.push(Mutex::new(session));

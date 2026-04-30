@@ -1,6 +1,7 @@
 mod api;
 mod api_rerank;
 mod api_splade;
+mod arena;
 mod batcher;
 mod cache;
 mod cache_flow;
@@ -153,6 +154,16 @@ async fn main() {
         eprintln!("ort init failed (environment already configured?)");
     }
     tracing::info!("ort runtime initialized");
+
+    // Register a shared CPU arena allocator with kSameAsRequested extend
+    // strategy — see arena.rs. Critical for memory stability under variable
+    // batch sizes; without it, default kNextPowerOfTwo arena per session
+    // grows unboundedly to 8GB OOM.
+    if let Err(e) = arena::register_shared_cpu_arena() {
+        tracing::warn!(error = %e, "shared arena registration failed; sessions will use per-session BFCArena");
+    } else {
+        tracing::info!("shared CPU arena registered (kSameAsRequested)");
+    }
 
     let cfg = Config::from_env().unwrap_or_else(|e| {
         eprintln!("config error: {e}");

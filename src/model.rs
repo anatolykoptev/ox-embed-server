@@ -122,6 +122,10 @@ impl EmbedModel {
             .map_err(|e| format!("set threads: {e}"))?
             .with_memory_pattern(false)
             .map_err(|e| format!("disable memory pattern: {e}"))?
+            // Use the shared env-level arena registered in arena.rs (kSameAsRequested).
+            // Avoids per-session BFCArena duplication and unbounded power-of-two growth.
+            .with_env_allocators()
+            .map_err(|e| format!("enable env allocators: {e}"))?
             .commit_from_file(&onnx_path)
             .map_err(|e| format!("load ONNX {}: {e}", onnx_path.display()))?;
         tracing::info!("ONNX session created");
