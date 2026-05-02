@@ -87,9 +87,8 @@ pub struct SpladeModel {
 
 impl SpladeModel {
     /// Load the SPLADE model from `dir`. Expects:
-    ///   - `<dir>/model.onnx`           (NOTE: not `model_quantized.onnx`
-    ///                                   like the reranker — splade-v3-distilbert
-    ///                                   ships as a single fp32 graph)
+    ///   - `<dir>/model.onnx` (NOTE: not `model_quantized.onnx` like the
+    ///     reranker — splade-v3-distilbert ships as a single fp32 graph)
     ///   - `<dir>/tokenizer.json`
     ///
     /// `intra_threads` plumbs to ORT's `with_intra_threads` (per-session).

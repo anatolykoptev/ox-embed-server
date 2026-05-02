@@ -433,6 +433,13 @@ async fn dispatch_batch(items: Vec<Item>, embed_fn: EmbedFn, name: Arc<String>) 
 }
 
 #[cfg(test)]
+// `await_holding_lock` and `ok_expect` fire on test scaffolding only:
+// the lock is on a `Vec` log used purely for assertions (not contended
+// with the worker for state), and `Arc::try_unwrap(...).ok().expect(...)`
+// is the canonical pattern when the inner type lacks `Debug`. Both
+// patterns are correct in test code; suppress at module scope to keep
+// the warnings live for production paths.
+#[allow(clippy::await_holding_lock, clippy::ok_expect)]
 mod tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};

@@ -507,14 +507,14 @@ async fn tokenize_with_cache(
     // and populate the cache as we go.
     let mut miss_iter = tokenized_misses.into_iter().zip(miss_indices.iter());
     for slot in &mut result_slots {
-        if slot.1.is_none() {
-            if let Some((ids, &orig_idx)) = miss_iter.next() {
-                let arc = std::sync::Arc::new(ids);
-                state
-                    .token_cache
-                    .insert(model_name, query, &documents[orig_idx], arc.clone());
-                slot.1 = Some(arc);
-            }
+        if slot.1.is_none()
+            && let Some((ids, &orig_idx)) = miss_iter.next()
+        {
+            let arc = std::sync::Arc::new(ids);
+            state
+                .token_cache
+                .insert(model_name, query, &documents[orig_idx], arc.clone());
+            slot.1 = Some(arc);
         }
     }
 
