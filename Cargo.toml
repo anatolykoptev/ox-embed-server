@@ -41,6 +41,18 @@ panic = "abort"
 [profile.dev.package."*"]
 opt-level = 1
 
+# 2026-05-02 — explicit test profile for fast iteration. Inherits debug
+# default (opt=0 own crate, opt=1 deps via .package."*" above) but adds:
+#  - incremental=true   → reusable artifact cache between test runs
+#  - codegen-units=256  → max parallelism on multi-core hosts (4-core ARM box)
+#  - debug=false        → smaller artifacts, faster link
+# Iteration: ~30s test compile vs ~5-15min under --release. Use
+# `cargo test` (no --release) for unit work; only release for actual perf bench.
+[profile.test]
+incremental = true
+codegen-units = 256
+debug = false
+
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 # tempfile — used by `model_reranker::load::discovery_tests` to drive
