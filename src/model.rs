@@ -120,8 +120,15 @@ impl EmbedModel {
             .map_err(|e| format!("set opt level: {e}"))?
             .with_intra_threads(intra_threads)
             .map_err(|e| format!("set threads: {e}"))?
-            .with_memory_pattern(false)
-            .map_err(|e| format!("disable memory pattern: {e}"))?
+            // Phase H.17 (2026-05-01) — flipped false → true. Earlier comment
+            // claimed memory_pattern caused n=10 batch regression; that was
+            // before BATCH_MAX_TOKENS was capped (Phase H.17 compose change).
+            // With shapes now bounded (max 32 items × max_seq=256 for e5-large),
+            // memory_pattern lets ORT pre-plan the tensor layout per shape
+            // and reuse buffers across same-shape calls — eliminating the
+            // arena extend cycle that was producing 1.25 GiB slabs.
+            .with_memory_pattern(true)
+            .map_err(|e| format!("enable memory pattern: {e}"))?
             // Use the shared env-level arena registered in arena.rs (kSameAsRequested + bounded max_mem).
             // Avoids per-session BFCArena duplication and unbounded extension growth.
             .with_env_allocators()

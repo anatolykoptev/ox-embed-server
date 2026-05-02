@@ -182,16 +182,18 @@ fn build_session_pool(
             // only way to stop the spin on a shared multi-tenant CPU.
             .with_intra_op_spinning(allow_spinning)
             .map_err(|e| format!("set intra spinning #{i}: {e}"))?
-            // 2026-05-01 — kept disabled. Tried `with_memory_pattern(padded_model)`
-            // for the padded gte-multi case but bench showed regression on
-            // n=10 batch (3.55s → 6.87s). Hypothesis: even with padded
-            // shapes, the BATCH dim still varies per call (different doc
-            // counts), so ORT's pre-planned arenas don't fully reuse and
-            // re-planning overhead dominates. The shared CPU arena (commit
-            // 65b85c0) handles steady-state allocation efficiently without
-            // memory pattern.
-            .with_memory_pattern(false)
-            .map_err(|e| format!("disable memory pattern #{i}: {e}"))?
+            // Phase H.17 (2026-05-01) — flipped false → true. Earlier
+            // experiment (n=10 batch, 3.55s → 6.87s) was contaminated by
+            // unbounded BATCH_MAX_TOKENS=32768 and a leaky shared arena;
+            // memory_pattern re-planned constantly under huge variable
+            // shapes, dominated by re-plan cost. Now with H.17 cap of
+            // BATCH_MAX_TOKENS=8192 + RERANKER_BATCH_MAX=8 the rerank
+            // batch shape varies only across small bounded set
+            // ({1,2,...,8} items × actual_max_seq), so ORT pre-plans for
+            // each shape and reuses across same-shape calls — exactly
+            // what eliminates the arena extend cycle.
+            .with_memory_pattern(true)
+            .map_err(|e| format!("enable memory pattern #{i}: {e}"))?
             .with_env_allocators()
             .map_err(|e| format!("enable env allocators #{i}: {e}"))?
             .commit_from_file(onnx_path)
