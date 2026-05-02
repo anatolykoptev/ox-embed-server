@@ -72,9 +72,14 @@ pub fn init() -> Option<SdkTracerProvider> {
             // exactly as the pre-Phase-H.18 setup did. This is the path
             // CI takes (no Jaeger present) and is also the safe default
             // if the env var is dropped from compose.
+            // Apply RUST_LOG filter to fmt output, defaulting to the same
+            // baseline the pre-Phase-H.18 main.rs used: info + ort::logging=warn.
+            // Without this, the global subscriber falls back to TRACE and
+            // ort::logging floods stdout with per-allocation messages.
+            let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,ort::logging=warn".parse().unwrap());
             tracing_subscriber::registry()
-                .with(tracing_subscriber::EnvFilter::from_default_env())
-                .with(tracing_subscriber::fmt::layer().json())
+                .with(tracing_subscriber::fmt::layer().json().with_filter(filter))
                 .init();
             tracing::info!("OTEL disabled (OTEL_EXPORTER_OTLP_ENDPOINT unset)");
             return None;
@@ -92,9 +97,14 @@ pub fn init() -> Option<SdkTracerProvider> {
             // Don't fail the server if Jaeger is unreachable at boot —
             // serve traffic with stdout-JSON only and let an alert pick
             // up the missing trace flow downstream.
+            // Apply RUST_LOG filter to fmt output, defaulting to the same
+            // baseline the pre-Phase-H.18 main.rs used: info + ort::logging=warn.
+            // Without this, the global subscriber falls back to TRACE and
+            // ort::logging floods stdout with per-allocation messages.
+            let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,ort::logging=warn".parse().unwrap());
             tracing_subscriber::registry()
-                .with(tracing_subscriber::EnvFilter::from_default_env())
-                .with(tracing_subscriber::fmt::layer().json())
+                .with(tracing_subscriber::fmt::layer().json().with_filter(filter))
                 .init();
             tracing::error!(error = %err, endpoint = %endpoint, "OTLP exporter init failed — running without traces");
             return None;
@@ -115,12 +125,23 @@ pub fn init() -> Option<SdkTracerProvider> {
         .build();
 
     let tracer = provider.tracer(SERVICE_NAME);
-    let otel_layer = OpenTelemetryLayer::new(tracer)
-        .with_filter(tracing_subscriber::EnvFilter::from_default_env());
+    // Each subscriber layer needs its OWN EnvFilter — they are NOT
+    // global filters. Without one, the layer defaults to TRACE and
+    // ort::logging floods stdout with per-allocation messages
+    // (incident 2026-05-02 H.18 deploy: log volume + perf hit).
+    let otel_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info,ort::logging=warn".parse().unwrap());
+    let fmt_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info,ort::logging=warn".parse().unwrap());
+    let otel_layer = OpenTelemetryLayer::new(tracer).with_filter(otel_filter);
 
     tracing_subscriber::registry()
         .with(otel_layer)
-        .with(tracing_subscriber::fmt::layer().json())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_filter(fmt_filter),
+        )
         .init();
 
     // Set the provider globally so `global::tracer(...)` calls (and
