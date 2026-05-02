@@ -259,6 +259,8 @@ mod tests {
             shutdown: CancellationToken::new(),
             drain_timeout: Duration::from_secs(1),
             cache: Arc::new(crate::cache::EmbeddingCache::new(0)),
+            token_cache: Arc::new(crate::token_cache::TokenCache::new(0)),
+            rerank_semaphore: None,
         }
     }
 

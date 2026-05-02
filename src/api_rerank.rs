@@ -24,6 +24,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
+use crate::metrics;
 use crate::types::{AppState, ErrorDetail, ErrorResponse, error_json};
 
 // ---------------------------------------------------------------------
@@ -218,6 +219,33 @@ pub async fn rerank(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RerankRequest>,
 ) -> Response {
+    // Global rerank concurrency cap (load-shed before tokenize). Prior
+    // art: TEI's `Infer::try_acquire_permit`. When MAX_CONCURRENT_RERANK_REQUESTS
+    // is unset, `state.rerank_semaphore` is None and this is a no-op.
+    // The acquired permit is held for the entire request lifetime
+    // (including async wait on batcher) and released when `_permit`
+    // drops at function return.
+    let _permit = match &state.rerank_semaphore {
+        Some(sem) => match sem.clone().try_acquire_owned() {
+            Ok(p) => Some(p),
+            Err(_) => {
+                tracing::warn!("rerank concurrency cap reached — returning 429");
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [("retry-after", "1")],
+                    Json(ErrorResponse {
+                        error: ErrorDetail {
+                            message: "rerank concurrency cap reached".to_string(),
+                            error_type: "rate_limited",
+                        },
+                    }),
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
+
     // Shutdown gate — matches `api::embeddings`. Reject new requests
     // with 503 once SIGTERM has flipped the token, giving clients a
     // Retry-After hint to back off while drain completes.
@@ -262,25 +290,93 @@ pub async fn rerank(
     let return_documents = req.return_documents;
     let normalize = req.normalize;
 
-    // Tokenize pairs in spawn_blocking — same reasoning as `api::embeddings`:
-    // tokenization is CPU-bound and blocking it on the async runtime
-    // starves other futures under concurrent load.
-    let model_for_tokenize = entry.model.clone();
-    let tokenize_query = query.clone();
-    let tokenize_docs = documents.clone();
-    let token_ids = match tokio::task::spawn_blocking(move || {
-        model_for_tokenize.tokenize_pairs(&tokenize_query, &tokenize_docs)
-    })
-    .await
-    {
-        Ok(Ok(ids)) => ids,
-        Ok(Err(e)) => {
-            tracing::error!(error = %e, "rerank tokenize failed");
-            return server_error(e);
-        }
-        Err(join_err) => {
-            tracing::error!(error = %join_err, "rerank tokenize task panicked");
-            return server_error(format!("tokenize task panicked: {join_err}"));
+    // -----------------------------------------------------------------------
+    // H.7 — tokenizer cache: probe (query, doc) pairs before calling the
+    // tokenizer. The cross-encoder jointly encodes `[CLS] q [SEP] d [SEP]`,
+    // so the token IDs depend on BOTH the query and the document — the cache
+    // key is (model_name, query, doc), not just (model_name, doc).
+    //
+    // Partition the document list into hits (already cached) and misses.
+    // For misses we call the tokenizer once for the entire miss batch (one
+    // encode_batch call, not N singleton calls). Results are merged back into
+    // the original document order before the inference step.
+    //
+    // When the token cache is disabled (TOKEN_CACHE_MAX_ENTRIES unset or =0),
+    // `token_cache.get` always returns None and `token_cache.insert` is a
+    // no-op — the code path is byte-identical to the pre-H.7 behaviour.
+    // -----------------------------------------------------------------------
+    let token_ids: Vec<Vec<u32>> = {
+        // (original_index, Option<cached_ids>) — None means miss.
+        let mut result_slots: Vec<(usize, Option<std::sync::Arc<Vec<u32>>>)> = documents
+            .iter()
+            .enumerate()
+            .map(|(i, doc)| {
+                let hit = state.token_cache.get(&model_name, &query, doc);
+                (i, hit)
+            })
+            .collect();
+
+        let hit_count = result_slots.iter().filter(|(_, h)| h.is_some()).count();
+        let miss_count = result_slots.len() - hit_count;
+        metrics::record_token_cache_hit(&model_name, hit_count as u64);
+        metrics::record_token_cache_miss(&model_name, miss_count as u64);
+
+        if miss_count == 0 {
+            // Fast path: every pair was in cache. Unwrap in document order.
+            result_slots
+                .into_iter()
+                .map(|(_, arc)| arc.expect("hit").as_ref().clone())
+                .collect()
+        } else {
+            // Miss path: collect docs that need tokenization, preserving their
+            // original indices so we can splice results back into order.
+            let miss_indices: Vec<usize> = result_slots
+                .iter()
+                .filter(|(_, h)| h.is_none())
+                .map(|(i, _)| *i)
+                .collect();
+            let miss_docs: Vec<String> = miss_indices
+                .iter()
+                .map(|&i| documents[i].clone())
+                .collect();
+
+            let model_for_tokenize = entry.model.clone();
+            let tokenize_query = query.clone();
+            let tokenized_misses = match tokio::task::spawn_blocking(move || {
+                model_for_tokenize.tokenize_pairs(&tokenize_query, &miss_docs)
+            })
+            .await
+            {
+                Ok(Ok(ids)) => ids,
+                Ok(Err(e)) => {
+                    tracing::error!(error = %e, "rerank tokenize failed");
+                    return server_error(e);
+                }
+                Err(join_err) => {
+                    tracing::error!(error = %join_err, "rerank tokenize task panicked");
+                    return server_error(format!("tokenize task panicked: {join_err}"));
+                }
+            };
+
+            // Insert misses into the cache and splice into result_slots.
+            let mut miss_iter = tokenized_misses.into_iter().zip(miss_indices.iter());
+            for slot in &mut result_slots {
+                if slot.1.is_none() {
+                    if let Some((ids, &orig_idx)) = miss_iter.next() {
+                        let arc = std::sync::Arc::new(ids);
+                        state
+                            .token_cache
+                            .insert(&model_name, &query, &documents[orig_idx], arc.clone());
+                        slot.1 = Some(arc);
+                    }
+                }
+            }
+
+            // Collect final token IDs in original document order.
+            result_slots
+                .into_iter()
+                .map(|(_, arc)| arc.expect("all slots filled after tokenize").as_ref().clone())
+                .collect()
         }
     };
 

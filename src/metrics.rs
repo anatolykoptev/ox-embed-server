@@ -231,3 +231,32 @@ pub fn set_cache_size(size: usize) {
 pub fn record_tokenize_fallback() {
     metrics::counter!("embed_tokenize_fallback_total").increment(1);
 }
+
+/// Increment the token-cache hit counter by `n`.
+///
+/// Called from the reranker hot path (H.7) once per batch hit. Using an
+/// `_n` form mirrors the embedding-cache pattern so the caller can record
+/// all hits in a batch with a single atomic increment. Pre-warming with
+/// `n=0` at startup ensures the series appears in `/metrics` before the
+/// first request arrives.
+pub fn record_token_cache_hit(model: &str, n: u64) {
+    metrics::counter!(
+        "embed_token_cache_total",
+        "model" => model.to_string(),
+        "outcome" => "hit"
+    )
+    .increment(n);
+}
+
+/// Increment the token-cache miss counter by `n`.
+///
+/// See `record_token_cache_hit` for the batch-increment semantic and
+/// startup pre-warm contract.
+pub fn record_token_cache_miss(model: &str, n: u64) {
+    metrics::counter!(
+        "embed_token_cache_total",
+        "model" => model.to_string(),
+        "outcome" => "miss"
+    )
+    .increment(n);
+}

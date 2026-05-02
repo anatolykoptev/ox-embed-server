@@ -11,6 +11,7 @@ mod model;
 mod model_reranker;
 mod model_splade;
 mod pool;
+mod token_cache;
 mod types;
 
 use std::collections::HashMap;
@@ -27,6 +28,7 @@ use crate::config::Config;
 use crate::model::EmbedModel;
 use crate::model_reranker::RerankerModel;
 use crate::model_splade::SpladeModel;
+use crate::token_cache::TokenCache;
 use crate::types::{AppState, ModelEntry, RerankerEntry, SpladeEntry};
 
 /// Waits for SIGTERM or SIGINT, then cancels the token and sleeps for drain_timeout
@@ -263,7 +265,10 @@ async fn main() {
                         .map(|scores| scores.into_iter().map(|s| vec![s]).collect())
                 },
                 cfg.batch_max_tokens,
-                cfg.batch_max,
+                // Use reranker-specific cap (defaults to 4× batch_max).
+                // Embed batchers still use cfg.batch_max — see the embed
+                // model loop above.
+                cfg.reranker_batch_max,
                 def.padded_model,
                 cfg.batch_wait_ms,
                 cfg.max_queue_size,
@@ -337,6 +342,39 @@ async fn main() {
         "response cache ready"
     );
 
+    // Per-pair tokenizer cache (H.7). Default TOKEN_CACHE_MAX_ENTRIES=0
+    // (disabled) — existing deployments see no behaviour change. A positive
+    // value amortizes ~50ms tokenizer calls when memdb-go's D7 sub-query
+    // rewrites re-score the same (query, doc) pairs.
+    let token_cache = Arc::new(TokenCache::new(cfg.token_cache_max_entries));
+    // Pre-warm hit+miss counters for every loaded reranker model so
+    // /metrics shows the series from startup (before the first request).
+    // This mirrors the embedding-cache gauge stamp above.
+    for def in &cfg.rerankers {
+        crate::metrics::record_token_cache_hit(&def.name, 0);
+        crate::metrics::record_token_cache_miss(&def.name, 0);
+    }
+    tracing::info!(
+        token_cache_max_entries = cfg.token_cache_max_entries,
+        token_cache_enabled = token_cache.is_enabled(),
+        "token cache ready"
+    );
+
+    // Optional global rerank concurrency cap. Reads
+    // MAX_CONCURRENT_RERANK_REQUESTS — when unset/0, semaphore is None
+    // and the handler accepts unlimited concurrent rerank calls (legacy
+    // behaviour). When set, requests over the cap get HTTP 429 with
+    // Retry-After: 1 BEFORE tokenizer CPU is spent — load-shed at the
+    // edge per TEI's `Infer::try_acquire_permit` pattern.
+    let rerank_semaphore = std::env::var("MAX_CONCURRENT_RERANK_REQUESTS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .map(|n| {
+            tracing::info!(cap = n, "rerank semaphore enabled");
+            Arc::new(tokio::sync::Semaphore::new(n))
+        });
+
     let state = Arc::new(AppState {
         models: model_entries,
         rerankers: reranker_entries,
@@ -345,6 +383,8 @@ async fn main() {
         shutdown: shutdown_token.clone(),
         drain_timeout,
         cache,
+        token_cache,
+        rerank_semaphore,
     });
 
     let metrics_handle = prom_handle.clone();

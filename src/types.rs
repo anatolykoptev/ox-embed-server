@@ -13,6 +13,7 @@ use crate::cache::EmbeddingCache;
 use crate::model::EmbedModel;
 use crate::model_reranker::RerankerModel;
 use crate::model_splade::SpladeModel;
+use crate::token_cache::TokenCache;
 
 // --- State ---
 
@@ -71,6 +72,19 @@ pub struct AppState {
     /// Process-local LRU cache for deterministic embedding lookups.
     /// Disabled (no-op) when constructed with capacity 0.
     pub cache: Arc<EmbeddingCache>,
+    /// Per-pair tokenizer cache for the reranker hot path (H.7).
+    /// Disabled (no-op) when constructed with capacity 0.
+    /// Enabled via `TOKEN_CACHE_MAX_ENTRIES` env var.
+    pub token_cache: Arc<TokenCache>,
+    /// Global concurrency cap for `/v1/rerank` requests. Prior art: TEI's
+    /// `Infer::try_acquire_permit` — failing fast at the HTTP layer with
+    /// 429 (instead of letting requests buffer in the batcher's mpsc up
+    /// to MAX_QUEUE_SIZE) keeps tokenizer CPU from burning on work that
+    /// will be cancelled by upstream timeout. The semaphore tracks
+    /// in-flight requests exactly (not approximated by channel depth).
+    /// `None` = unlimited (legacy behaviour); set via
+    /// `MAX_CONCURRENT_RERANK_REQUESTS`.
+    pub rerank_semaphore: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 // --- Request types ---

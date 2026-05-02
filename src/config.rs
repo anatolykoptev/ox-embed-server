@@ -101,6 +101,14 @@ pub struct Config {
     /// one giant multi-text request can't monopolise a single dispatch.
     /// The primary budget in Phase B is `batch_max_tokens`.
     pub batch_max: usize,
+    /// Reranker-specific item cap. Overrides `batch_max` for reranker
+    /// dispatch only — enables larger coalescing for `/v1/rerank` (each
+    /// call is multi-doc → quickly hits global `batch_max=8` and falls
+    /// back to single-call batches, killing concurrent throughput) while
+    /// keeping the conservative embed-side cap for ARM cache-thrash
+    /// avoidance. Default = 4× `batch_max` to give 4 concurrent rerank
+    /// calls of 5-doc room without changing the embed knob.
+    pub reranker_batch_max: usize,
     /// Primary batch budget: maximum total tokens per dispatched batch.
     /// Counted with padded-model accounting — see `DynamicBatcher::with_tokens`.
     /// Default 16384 (TEI).
@@ -128,6 +136,18 @@ pub struct Config {
     /// footprint (~40 MB for 1024-dim f32 vectors) that comfortably
     /// covers MemDB's recurring search strings.
     pub cache_max_entries: usize,
+    /// Maximum entries in the per-pair tokenizer cache (H.7).
+    ///
+    /// `0` disables the token cache (TokenCache::new(0) returns a no-op
+    /// shell that always misses — identical behaviour to the pre-H.7 code
+    /// path). Default `0` (disabled) when `TOKEN_CACHE_MAX_ENTRIES` is
+    /// unset, so existing deployments are not affected. An explicit
+    /// positive value enables caching.
+    ///
+    /// Memory estimate: each entry holds `Arc<Vec<u32>>` (~2 KB per 512-
+    /// token pair) + 40 B key ≈ ~2 KB. At 20 000 entries that's ~40 MB
+    /// — negligible next to the ONNX session memory (~300–550 MB each).
+    pub token_cache_max_entries: usize,
 }
 
 impl Config {
@@ -188,6 +208,16 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(32usize);
 
+        // Reranker-specific item cap. Defaults to 4× embed batch_max so a
+        // single env (`BATCH_MAX=8`) can keep embed-side cache-thrash
+        // mitigation while the reranker still coalesces 4 concurrent
+        // multi-doc calls. Operators can override with RERANKER_BATCH_MAX
+        // when they want a different ratio.
+        let reranker_batch_max = env::var("RERANKER_BATCH_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(batch_max.saturating_mul(4));
+
         let batch_max_tokens = parse_batch_max_tokens(env::var("BATCH_MAX_TOKENS").ok().as_deref());
 
         let batch_wait_ms = env::var("BATCH_WAIT_MS")
@@ -215,6 +245,9 @@ impl Config {
 
         let cache_max_entries =
             parse_cache_max_entries(env::var("CACHE_MAX_ENTRIES").ok().as_deref());
+
+        let token_cache_max_entries =
+            parse_token_cache_max_entries(env::var("TOKEN_CACHE_MAX_ENTRIES").ok().as_deref());
 
         // `RERANKER_MODELS` is optional: unset or empty → no rerankers,
         // server boots serving only `/v1/embeddings`. `/v1/rerank` with
@@ -259,12 +292,14 @@ impl Config {
             splade_intra_threads,
             batching_enabled,
             batch_max,
+            reranker_batch_max,
             batch_max_tokens,
             batch_wait_ms,
             max_queue_size,
             drain_timeout_s,
             auto_truncate,
             cache_max_entries,
+            token_cache_max_entries,
         })
     }
 }
@@ -275,6 +310,27 @@ impl Config {
 /// Exposed for testing; env lookup stays in `from_env`.
 fn parse_cache_max_entries(raw: Option<&str>) -> usize {
     const DEFAULT: usize = 10_000;
+    match raw {
+        None => DEFAULT,
+        Some(s) => s.trim().parse::<usize>().unwrap_or(DEFAULT),
+    }
+}
+
+/// Parse `TOKEN_CACHE_MAX_ENTRIES` env value.
+///
+/// Unset or empty → `0` (disabled). This differs from `CACHE_MAX_ENTRIES`
+/// which defaults to 10_000 — the token cache is a new opt-in feature and
+/// we want zero surprise behaviour for existing deployments. Operators
+/// who want the speedup set an explicit positive value.
+///
+/// An explicit `0` is honoured as the documented disable signal (same as
+/// `CACHE_MAX_ENTRIES=0` for the embedding cache). Garbage → `0` (disabled,
+/// not a hard error — production operators who don't set this var should
+/// never see a boot failure from an env quoting mistake in an adjacent line).
+///
+/// Exposed for testing; env lookup stays in `from_env`.
+fn parse_token_cache_max_entries(raw: Option<&str>) -> usize {
+    const DEFAULT: usize = 0; // disabled by default
     match raw {
         None => DEFAULT,
         Some(s) => s.trim().parse::<usize>().unwrap_or(DEFAULT),
@@ -690,5 +746,37 @@ mod tests {
         assert_eq!(parse_splade_pool_size(Some("nope")), 1);
         assert_eq!(parse_splade_pool_size(Some("")), 1);
         assert_eq!(parse_splade_pool_size(Some("-1")), 1);
+    }
+
+    // -----------------------------------------------------------------
+    // TOKEN_CACHE_MAX_ENTRIES parser.
+    //
+    // Differs from CACHE_MAX_ENTRIES: default is 0 (disabled) so
+    // existing deployments see no behaviour change without opting in.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn token_cache_max_entries_default_disabled_when_unset() {
+        assert_eq!(parse_token_cache_max_entries(None), 0);
+    }
+
+    #[test]
+    fn token_cache_max_entries_parses_valid_values() {
+        assert_eq!(parse_token_cache_max_entries(Some("20000")), 20_000);
+        assert_eq!(parse_token_cache_max_entries(Some("1")), 1);
+        // Surrounding whitespace tolerated.
+        assert_eq!(parse_token_cache_max_entries(Some("  500  ")), 500);
+    }
+
+    #[test]
+    fn token_cache_max_entries_zero_is_explicit_disable() {
+        assert_eq!(parse_token_cache_max_entries(Some("0")), 0);
+    }
+
+    #[test]
+    fn token_cache_max_entries_falls_back_to_disabled_on_garbage() {
+        assert_eq!(parse_token_cache_max_entries(Some("nope")), 0);
+        assert_eq!(parse_token_cache_max_entries(Some("")), 0);
+        assert_eq!(parse_token_cache_max_entries(Some("-1")), 0);
     }
 }

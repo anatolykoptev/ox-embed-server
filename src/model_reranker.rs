@@ -155,6 +155,14 @@ impl RerankerModel {
                 .map_err(|e| format!("set opt level #{i}: {e}"))?
                 .with_intra_threads(intra_threads)
                 .map_err(|e| format!("set threads #{i}: {e}"))?
+                // 2026-05-01 — kept disabled. Tried `with_memory_pattern(padded_model)`
+                // for the padded gte-multi case but bench showed regression on
+                // n=10 batch (3.55s → 6.87s). Hypothesis: even with padded
+                // shapes, the BATCH dim still varies per call (different doc
+                // counts), so ORT's pre-planned arenas don't fully reuse and
+                // re-planning overhead dominates. The shared CPU arena (commit
+                // 65b85c0) handles steady-state allocation efficiently without
+                // memory pattern.
                 .with_memory_pattern(false)
                 .map_err(|e| format!("disable memory pattern #{i}: {e}"))?
                 .with_env_allocators()
@@ -227,14 +235,14 @@ impl RerankerModel {
         if docs.is_empty() {
             return Ok(vec![]);
         }
-        // Build `Vec<(String, String)>` — the `From<(I1, I2)> for EncodeInput`
-        // blanket impl in tokenizers 0.22 (mod.rs:268) turns each tuple
-        // into `EncodeInput::Dual(query, doc)` automatically, so no
-        // explicit `EncodeInput::Dual(...)` map step is needed.
-        let pairs: Vec<(String, String)> = docs
-            .iter()
-            .map(|d| (query.to_string(), d.clone()))
-            .collect();
+        // 2026-05-01 — switched from `Vec<(String, String)>` to
+        // `Vec<(&str, &str)>`. Old code allocated 2N Strings per call:
+        // `query.to_string()` for each doc + `d.clone()` for each doc.
+        // For batch=32, that was 64 heap allocations on the hot path.
+        // tokenizers 0.22 `encode_batch` accepts any `I: Into<EncodeInput>`,
+        // and the blanket `From<(I1, I2)> for EncodeInput` covers
+        // `(&str, &str)` via `InputSequence::from(&str)`. Zero allocs.
+        let pairs: Vec<(&str, &str)> = docs.iter().map(|d| (query, d.as_str())).collect();
         let encodings = self
             .tokenizer
             .encode_batch(pairs, /*add_special_tokens*/ true)
