@@ -9,6 +9,7 @@ use tokenizers::Tokenizer;
 use tokenizers::utils::truncation::{TruncationDirection, TruncationParams, TruncationStrategy};
 
 use crate::config::ModelDef;
+use crate::onnx_cache::{self, CacheDir, LoadPlan};
 use crate::pool;
 
 /// Configure tokenizer truncation.
@@ -101,9 +102,12 @@ impl EmbedModel {
         }
 
         let opt_level = parse_opt_level();
+        let cache = CacheDir::from_env();
+        let plan = LoadPlan::decide(cache.as_ref(), &onnx_path);
         tracing::info!(
             path = %onnx_path.display(),
             ?opt_level,
+            cache_state = ?std::mem::discriminant(&plan),
             "creating ONNX session"
         );
         // Disable memory pattern: ORT pre-allocates per static input shape.
@@ -114,10 +118,11 @@ impl EmbedModel {
         // cancelled queues across all models. Disabled, allocations are
         // sized per-request; couple-ms latency hit per batch is dwarfed by
         // the queue stalls we get under memory pressure.
-        let session = Session::builder()
-            .map_err(|e| format!("session builder: {e}"))?
-            .with_optimization_level(opt_level)
-            .map_err(|e| format!("set opt level: {e}"))?
+        let builder = Session::builder().map_err(|e| format!("session builder: {e}"))?;
+        let builder = onnx_cache::apply_plan(builder, &plan, opt_level)?;
+        let load_path = plan.load_source(&onnx_path).to_path_buf();
+        let t_commit = std::time::Instant::now();
+        let session = builder
             .with_intra_threads(intra_threads)
             .map_err(|e| format!("set threads: {e}"))?
             // Phase H.17 (2026-05-01) — flipped false → true. Earlier comment
@@ -133,9 +138,9 @@ impl EmbedModel {
             // Avoids per-session BFCArena duplication and unbounded extension growth.
             .with_env_allocators()
             .map_err(|e| format!("enable env allocators: {e}"))?
-            .commit_from_file(&onnx_path)
-            .map_err(|e| format!("load ONNX {}: {e}", onnx_path.display()))?;
-        tracing::info!("ONNX session created");
+            .commit_from_file(&load_path)
+            .map_err(|e| format!("load ONNX {}: {e}", load_path.display()))?;
+        onnx_cache::observe_post_commit(&plan, t_commit.elapsed().as_millis());
 
         tracing::info!(path = %tok_path.display(), "loading tokenizer");
         let mut tokenizer =

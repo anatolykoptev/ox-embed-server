@@ -49,6 +49,7 @@ use ort::value::Tensor;
 use tokenizers::Tokenizer;
 
 use crate::model::configure_truncation;
+use crate::onnx_cache::{self, CacheDir, LoadPlan};
 
 /// Parse `ORT_OPT_LEVEL` the same way `EmbedModel` and `RerankerModel`
 /// do — single shared knob for the whole process.
@@ -119,6 +120,7 @@ impl SpladeModel {
         }
 
         let opt_level = parse_opt_level();
+        let cache = CacheDir::from_env();
         tracing::info!(
             path = %onnx_path.display(),
             ?opt_level,
@@ -128,12 +130,17 @@ impl SpladeModel {
         );
         let mut sessions: Vec<Mutex<Session>> = Vec::with_capacity(pool_size);
         for i in 0..pool_size {
+            // Re-check cache state per iteration: session 0 misses and
+            // writes, sessions 1..N hit on the file written by session 0.
+            let plan = LoadPlan::decide(cache.as_ref(), &onnx_path);
+            let load_path = plan.load_source(&onnx_path).to_path_buf();
+            let t_commit = std::time::Instant::now();
             // See model.rs: memory pattern + dynamic batches = unbounded
             // arena growth. SPLADE pool follows the same pattern.
-            let session = Session::builder()
-                .map_err(|e| format!("session builder #{i}: {e}"))?
-                .with_optimization_level(opt_level)
-                .map_err(|e| format!("set opt level #{i}: {e}"))?
+            let builder = Session::builder().map_err(|e| format!("session builder #{i}: {e}"))?;
+            let builder = onnx_cache::apply_plan(builder, &plan, opt_level)
+                .map_err(|e| format!("apply cache plan #{i}: {e}"))?;
+            let session = builder
                 .with_intra_threads(intra_threads)
                 .map_err(|e| format!("set threads #{i}: {e}"))?
                 // Phase H.17 — see model.rs for rationale. SPLADE's
@@ -143,8 +150,9 @@ impl SpladeModel {
                 .map_err(|e| format!("enable memory pattern #{i}: {e}"))?
                 .with_env_allocators()
                 .map_err(|e| format!("enable env allocators #{i}: {e}"))?
-                .commit_from_file(&onnx_path)
-                .map_err(|e| format!("load ONNX #{i} {}: {e}", onnx_path.display()))?;
+                .commit_from_file(&load_path)
+                .map_err(|e| format!("load ONNX #{i} {}: {e}", load_path.display()))?;
+            onnx_cache::observe_post_commit(&plan, t_commit.elapsed().as_millis());
             sessions.push(Mutex::new(session));
         }
         tracing::info!(count = sessions.len(), "splade ONNX session(s) created");
