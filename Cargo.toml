@@ -22,6 +22,15 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false }
 tokio-util = { version = "0.7", features = ["rt"] }
 
+# Phase H.18 — OTEL distributed tracing. Pipes tracing::span!/info_span!/
+# #[instrument] into Jaeger via OTLP gRPC, correlated with memdb-go traces
+# through the W3C traceparent header. Versions chosen for compatibility:
+# tracing-opentelemetry 0.31 needs opentelemetry 0.30 + opentelemetry_sdk 0.30.
+opentelemetry = "0.30"
+opentelemetry-otlp = { version = "0.30", default-features = false, features = ["grpc-tonic", "trace"] }
+opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"] }
+tracing-opentelemetry = "0.31"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

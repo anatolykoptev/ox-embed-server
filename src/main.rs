@@ -10,6 +10,7 @@ mod metrics;
 mod model;
 mod model_reranker;
 mod model_splade;
+mod otel;
 mod pool;
 mod token_cache;
 mod types;
@@ -143,13 +144,11 @@ async fn drain_batchers(state: Arc<AppState>, timeout: Duration) {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,ort::logging=warn".parse().unwrap()),
-        )
-        .init();
+    // Phase H.18 — OTEL when OTEL_EXPORTER_OTLP_ENDPOINT is set, plain
+    // JSON logs otherwise. The handle is held until the end of main so
+    // the batch exporter gets `shutdown()` on graceful termination.
+    // RUST_LOG / OTEL_LOG_LEVEL still drive filtering inside otel::init.
+    let otel_provider = otel::init();
 
     // Initialize ort runtime explicitly (required for load-dynamic).
     if !ort::init().commit() {
@@ -418,6 +417,12 @@ async fn main() {
             "/embed_sparse",
             axum::routing::post(api_splade::sparse_embeddings),
         )
+        // Phase H.18 — every request gets a root span linked to the
+        // upstream caller's trace via W3C traceparent (memdb-go sets it
+        // on every outbound /v1/* call). /health and /metrics also get
+        // spans, but at default sampling (5 %) they're effectively
+        // free; can exclude via env-driven sampler if it ever matters.
+        .layer(axum::middleware::from_fn(otel::trace_request))
         .with_state(router_state);
 
     let addr = format!("0.0.0.0:{}", cfg.port);
@@ -433,4 +438,11 @@ async fn main() {
     // clones remain. Now cleanly join every batcher worker so no batch is cut
     // mid-forward-pass. Uses the same drain_timeout budget (task #20).
     drain_batchers(state, drain_timeout).await;
+
+    // Phase H.18 — flush the OTEL batch exporter so spans for the last
+    // requests handled before SIGTERM make it to Jaeger instead of
+    // dropping with the process. No-op when OTEL was disabled at boot.
+    if let Some(p) = otel_provider {
+        otel::shutdown(p);
+    }
 }
