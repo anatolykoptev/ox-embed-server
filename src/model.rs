@@ -295,15 +295,15 @@ impl EmbedModel {
         // forward pass dominates wall time anyway.
         let texts: Vec<String> = (0..batch).map(|_| "warmup".to_string()).collect();
         let token_ids = self.tokenize(&texts)?;
-        let max_seq = token_ids
-            .iter()
-            .map(|v| v.len())
-            .max()
-            .unwrap_or(0)
-            .min(self.max_len);
-        if max_seq == 0 {
+        if token_ids.iter().all(|v| v.is_empty()) {
             return Err("warmup tokens produced empty sequence".to_string());
         }
+        // Pad to `self.max_len` so the warmup forward pass exercises the
+        // worst-case prod shape `[batch, max_len]`. Tokenizing "warmup"
+        // alone produces ~3 tokens, leaving ORT cold for typical 50-512-
+        // token e5/jina prod traffic. `build_tensors_from_ids` zero-pads
+        // beyond the real token count with `pad_id` + `attention_mask=0`.
+        let max_seq = self.max_len;
         let (ids, mask_i64, tti) =
             pool::build_tensors_from_ids(&token_ids, batch, max_seq, self.pad_id);
         let ids_arr = Array2::from_shape_vec([batch, max_seq], ids)
