@@ -20,9 +20,8 @@ pub fn init(version: &str) -> PrometheusHandle {
     // Padding-waste ratio matcher: 0.0 (no waste) → 1.0 (all padding). Linear
     // 0.1 buckets give resolution at the operational decision boundary
     // (median > 0.4 → length-bucketing payoff per Phase 3C plan).
-    let waste_matcher = metrics_exporter_prometheus::Matcher::Suffix(
-        "padding_waste_ratio".to_string(),
-    );
+    let waste_matcher =
+        metrics_exporter_prometheus::Matcher::Suffix("padding_waste_ratio".to_string());
 
     let handle = PrometheusBuilder::new()
         .set_buckets_for_metric(

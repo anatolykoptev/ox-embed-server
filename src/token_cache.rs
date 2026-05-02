@@ -195,7 +195,10 @@ mod tests {
         c.insert("gte-multi", "hello", "world", a.clone());
         c.insert("gte-modernbert", "hello", "world", b.clone());
 
-        assert_eq!(*c.get("gte-multi", "hello", "world").unwrap(), vec![10u32, 20]);
+        assert_eq!(
+            *c.get("gte-multi", "hello", "world").unwrap(),
+            vec![10u32, 20]
+        );
         assert_eq!(
             *c.get("gte-modernbert", "hello", "world").unwrap(),
             vec![30u32, 40]

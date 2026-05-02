@@ -155,10 +155,7 @@ impl RerankerModel {
         // Sum of clipped real lengths — used for padding-waste ratio. Each
         // sequence contributes `min(len, max_len)` tokens of actual compute;
         // the rest of the `[batch, max_seq]` tensor is padding.
-        let real_tokens: usize = token_ids
-            .iter()
-            .map(|v| v.len().min(self.max_len))
-            .sum();
+        let real_tokens: usize = token_ids.iter().map(|v| v.len().min(self.max_len)).sum();
         // Reuse `pool::build_tensors_from_ids` — the `tti` output slot is
         // intentionally discarded because the reranker ONNX graph has no
         // `token_type_ids` input (confirmed via `Session::inputs()` at load).

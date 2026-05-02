@@ -335,25 +335,18 @@ pub async fn rerank(
     }
 
     // ---- Phase: tokenize (with H.7 cache + timing) -----------------------
-    let token_ids = match tokenize_with_cache(
-        &state,
-        &model_name,
-        &entry.model,
-        &query,
-        &documents,
-    )
-    .await
-    {
-        Ok(ids) => ids,
-        Err(TokenizeError::Failed(msg)) => {
-            tracing::error!(error = %msg, "rerank tokenize failed");
-            finish!("server_error", server_error(msg));
-        }
-        Err(TokenizeError::Panic(msg)) => {
-            tracing::error!(error = %msg, "rerank tokenize task panicked");
-            finish!("server_error", server_error(msg));
-        }
-    };
+    let token_ids =
+        match tokenize_with_cache(&state, &model_name, &entry.model, &query, &documents).await {
+            Ok(ids) => ids,
+            Err(TokenizeError::Failed(msg)) => {
+                tracing::error!(error = %msg, "rerank tokenize failed");
+                finish!("server_error", server_error(msg));
+            }
+            Err(TokenizeError::Panic(msg)) => {
+                tracing::error!(error = %msg, "rerank tokenize task panicked");
+                finish!("server_error", server_error(msg));
+            }
+        };
 
     // ---- Phase: inference dispatch (batcher or direct) -------------------
     let scores = match dispatch_inference(entry, token_ids, doc_count).await {
@@ -527,7 +520,11 @@ async fn tokenize_with_cache(
 
     Ok(result_slots
         .into_iter()
-        .map(|(_, arc)| arc.expect("all slots filled after tokenize").as_ref().clone())
+        .map(|(_, arc)| {
+            arc.expect("all slots filled after tokenize")
+                .as_ref()
+                .clone()
+        })
         .collect())
 }
 
