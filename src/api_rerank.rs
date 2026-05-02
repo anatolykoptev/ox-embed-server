@@ -17,6 +17,7 @@
 //! stays focused on its actual wins (reused `(model, single_text)`
 //! lookups for embedding workloads).
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::Json;
 use axum::extract::State;
@@ -24,6 +25,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
+use crate::metrics;
 use crate::types::{AppState, ErrorDetail, ErrorResponse, error_json};
 
 // ---------------------------------------------------------------------
@@ -218,10 +220,51 @@ pub async fn rerank(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RerankRequest>,
 ) -> Response {
+    // Phase 1A: end-to-end request timer. Started before any work so
+    // semaphore-rejected (429) and shutdown (503) requests are also
+    // attributed in `embed_rerank_request_duration_seconds`. Pre-model
+    // exits use label `model="unknown"` because we have not yet resolved
+    // which reranker would have served the request.
+    let request_start = Instant::now();
+
+    // Global rerank concurrency cap (load-shed before tokenize). Prior
+    // art: TEI's `Infer::try_acquire_permit`. When MAX_CONCURRENT_RERANK_REQUESTS
+    // is unset, `state.rerank_semaphore` is None and this is a no-op.
+    // The acquired permit is held for the entire request lifetime
+    // (including async wait on batcher) and released when `_permit`
+    // drops at function return.
+    let _permit = match &state.rerank_semaphore {
+        Some(sem) => match sem.clone().try_acquire_owned() {
+            Ok(p) => Some(p),
+            Err(_) => {
+                tracing::warn!("rerank concurrency cap reached — returning 429");
+                metrics::record_rerank_request(
+                    "unknown",
+                    "rate_limited",
+                    request_start.elapsed(),
+                    0,
+                );
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [("retry-after", "1")],
+                    Json(ErrorResponse {
+                        error: ErrorDetail {
+                            message: "rerank concurrency cap reached".to_string(),
+                            error_type: "rate_limited",
+                        },
+                    }),
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
+
     // Shutdown gate — matches `api::embeddings`. Reject new requests
     // with 503 once SIGTERM has flipped the token, giving clients a
     // Retry-After hint to back off while drain completes.
     if state.shutdown.is_cancelled() {
+        metrics::record_rerank_request("unknown", "shutdown", request_start.elapsed(), 0);
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [("retry-after", "5")],
@@ -238,21 +281,32 @@ pub async fn rerank(
     // Validate inputs BEFORE resolving a model — a malformed request
     // shouldn't need reranker configuration to reach a 400.
     if req.query.trim().is_empty() {
+        metrics::record_rerank_request("unknown", "bad_request", request_start.elapsed(), 0);
         return error_json("query must not be empty").into_response();
     }
     if req.documents.is_empty() {
+        metrics::record_rerank_request("unknown", "bad_request", request_start.elapsed(), 0);
         return error_json("documents must not be empty").into_response();
     }
 
     let model_name = match resolve_reranker_name(&state, req.model) {
         Ok(n) => n,
-        Err(msg) => return error_json(msg).into_response(),
+        Err(msg) => {
+            metrics::record_rerank_request("unknown", "bad_request", request_start.elapsed(), 0);
+            return error_json(msg).into_response();
+        }
     };
     // `expect` is safe: `resolve_reranker_name` guarantees presence.
     let entry = state
         .rerankers
         .get(&model_name)
         .expect("resolve_reranker_name validated key presence");
+
+    // Phase 1A: in-flight gauge. RAII increment/decrement across the
+    // entire remaining handler lifetime, including async waits on
+    // tokenize and batcher dispatch. Drop runs on every return path —
+    // success, error, panic.
+    let _in_flight = metrics::RerankInFlightGuard::new(&model_name);
 
     let query = req.query;
     // Normalise mixed string/object form into a flat Vec<String>. Cohere
@@ -262,68 +316,54 @@ pub async fn rerank(
     let return_documents = req.return_documents;
     let normalize = req.normalize;
 
-    // Tokenize pairs in spawn_blocking — same reasoning as `api::embeddings`:
-    // tokenization is CPU-bound and blocking it on the async runtime
-    // starves other futures under concurrent load.
-    let model_for_tokenize = entry.model.clone();
-    let tokenize_query = query.clone();
-    let tokenize_docs = documents.clone();
-    let token_ids = match tokio::task::spawn_blocking(move || {
-        model_for_tokenize.tokenize_pairs(&tokenize_query, &tokenize_docs)
-    })
-    .await
-    {
-        Ok(Ok(ids)) => ids,
-        Ok(Err(e)) => {
-            tracing::error!(error = %e, "rerank tokenize failed");
-            return server_error(e);
-        }
-        Err(join_err) => {
-            tracing::error!(error = %join_err, "rerank tokenize task panicked");
-            return server_error(format!("tokenize task panicked: {join_err}"));
-        }
-    };
+    // Phase 1A helper: deduplicates the terminal record_rerank_request
+    // call across the ~6 post-model-resolution exit points. Required
+    // because each branch chooses its own status_code + body, so a single
+    // `?`-friendly Result<Response, _> shape doesn't fit. The macro is
+    // hygienic and only exists in this fn's scope.
+    #[allow(unused_macros)]
+    macro_rules! finish {
+        ($status:literal, $resp:expr) => {{
+            metrics::record_rerank_request(
+                &model_name,
+                $status,
+                request_start.elapsed(),
+                doc_count,
+            );
+            return $resp;
+        }};
+    }
 
-    // Inference: prefer the configured batcher (E2 wires every reranker
-    // with one when `BATCHING_ENABLED=true`); fall back to a direct
-    // `spawn_blocking(score_pairs)` when batching is off.
-    let scores: Vec<f32> = if let Some(b) = &entry.batcher {
-        // The E2 adapter closure wraps each scalar score as a 1-element
-        // `Vec<f32>` to fit the batcher's `Vec<Vec<f32>>` contract;
-        // here we unwrap that, validating the shape so a batcher bug
-        // surfaces as a 500 instead of a panic.
-        match b.embed_tokens(token_ids).await {
-            Ok(v) => match unwrap_scalar_batch(v, doc_count) {
-                Ok(s) => s,
-                Err(msg) => {
-                    tracing::error!(error = %msg, "rerank batcher output shape invalid");
-                    return server_error(msg);
-                }
-            },
-            Err(crate::batcher::BatchError::QueueFull(e)) => {
-                // E2: 429 Too Many Requests on backpressure (≥80% full).
-                // Matches `/v1/embeddings` semantics — see api.rs for
-                // the full rationale.
-                tracing::warn!(error = %e, "rerank queue full — returning 429");
-                return (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    [("retry-after", "1")],
-                    Json(ErrorResponse {
-                        error: ErrorDetail {
-                            message: e.to_string(),
-                            error_type: "rate_limited",
-                        },
-                    }),
-                )
-                    .into_response();
+    // ---- Phase: tokenize (with H.7 cache + timing) -----------------------
+    let token_ids =
+        match tokenize_with_cache(&state, &model_name, &entry.model, &query, &documents).await {
+            Ok(ids) => ids,
+            Err(TokenizeError::Failed(msg)) => {
+                tracing::error!(error = %msg, "rerank tokenize failed");
+                finish!("server_error", server_error(msg));
             }
-            Err(crate::batcher::BatchError::Inference(msg)) => {
-                tracing::error!(error = %msg, "rerank inference failed");
-                return server_error(msg);
+            Err(TokenizeError::Panic(msg)) => {
+                tracing::error!(error = %msg, "rerank tokenize task panicked");
+                finish!("server_error", server_error(msg));
             }
-            Err(crate::batcher::BatchError::Shutdown) => {
-                tracing::error!("rerank batcher shut down");
-                return (
+        };
+
+    // ---- Phase: inference dispatch (batcher or direct) -------------------
+    let scores = match dispatch_inference(entry, token_ids, doc_count).await {
+        Ok(s) => s,
+        Err(InferenceError::QueueFull(msg)) => {
+            tracing::warn!(error = %msg, "rerank queue full — returning 429");
+            finish!("rate_limited", rate_limited_response(msg));
+        }
+        Err(InferenceError::Inference(msg)) => {
+            tracing::error!(error = %msg, "rerank inference failed");
+            finish!("server_error", server_error(msg));
+        }
+        Err(InferenceError::Shutdown) => {
+            tracing::error!("rerank batcher shut down");
+            finish!(
+                "shutdown",
+                (
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(ErrorResponse {
                         error: ErrorDetail {
@@ -332,40 +372,34 @@ pub async fn rerank(
                         },
                     }),
                 )
-                    .into_response();
-            }
+                    .into_response()
+            );
         }
-    } else {
-        // Legacy path: one `spawn_blocking` for the entire batch (NOT
-        // per-pair — score_pairs already does a single vectorised
-        // forward pass over all pre-tokenised pairs).
-        let model_for_score = entry.model.clone();
-        match tokio::task::spawn_blocking(move || model_for_score.score_pairs(&token_ids)).await {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                tracing::error!(error = %e, "rerank score_pairs failed");
-                return server_error(e);
-            }
-            Err(join_err) => {
-                tracing::error!(error = %join_err, "rerank score task panicked");
-                return server_error(format!("score task panicked: {join_err}"));
-            }
+        Err(InferenceError::ShapeMismatch(msg)) => {
+            tracing::error!(error = %msg, "rerank batcher output shape invalid");
+            finish!("server_error", server_error(msg));
+        }
+        Err(InferenceError::Panic(msg)) => {
+            tracing::error!(error = %msg, "rerank score task panicked");
+            finish!("server_error", server_error(msg));
         }
     };
 
-    // Sanity: the inference layer must return exactly one score per
-    // document. A mismatch is a batcher/model bug; surface it as 500.
+    // ---- Phase: validate shape, normalize, sort, respond -----------------
     if scores.len() != doc_count {
         tracing::error!(
             expected = doc_count,
             got = scores.len(),
             "rerank score count mismatch"
         );
-        return server_error("internal error: score count mismatch".to_string());
+        finish!(
+            "server_error",
+            server_error("internal error: score count mismatch".to_string())
+        );
     }
 
-    // G2-server: apply optional score normalization before sort.
-    // Sigmoid is monotonic so sort order is preserved — safe to run here.
+    // G2-server: apply optional score normalization before sort. Sigmoid
+    // is monotonic so sort order is preserved — safe to run pre-sort.
     let mut scores = scores;
     apply_normalize(&mut scores, normalize.unwrap_or_default());
 
@@ -376,21 +410,196 @@ pub async fn rerank(
     };
     let results = build_sorted_results(&scores, req.top_n, echo_docs);
 
-    Json(RerankResponse {
-        // Cohere generates an opaque request id for tracing; we use a
-        // simple time-based hex (no extra crate dep). Clients use it for
-        // log correlation only — semantics are "opaque, unique-ish".
-        id: format!(
-            "rrk_{:x}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ),
-        model: model_name,
+    let response = Json(RerankResponse {
+        id: opaque_request_id(),
+        model: model_name.clone(),
         results,
     })
-    .into_response()
+    .into_response();
+    finish!("success", response);
+}
+
+// ---------------------------------------------------------------------
+// Phase decomposition: tokenize + inference are extracted as private
+// helpers so the handler reads as a clear sequence of phases (validate →
+// resolve model → tokenize → infer → respond) rather than a 250-line wall
+// of inline branches. Each helper owns its own metric emissions for the
+// observable it controls (tokenizer duration, inference duration, cache
+// hit/miss counts) — the handler only emits terminal-state series
+// (`embed_rerank_request_*`) it owns end-to-end.
+// ---------------------------------------------------------------------
+
+/// Failure modes returned by `tokenize_with_cache`. Keeping them as a
+/// 2-variant enum (vs a flat `String` error) lets the handler attach
+/// distinct log fields and, in future, distinct status labels.
+enum TokenizeError {
+    Failed(String),
+    Panic(String),
+}
+
+/// Tokenize a `(query, documents[])` set with H.7 cache lookup, falling
+/// back to one batched `tokenize_pairs` call for misses. Records cache
+/// hit/miss counters and `embed_rerank_tokenizer_duration_seconds`
+/// (miss-path wall time only — cache-only requests skip the histogram
+/// since their tokenizer time is zero).
+///
+/// Returns token IDs in original document order so the caller can use
+/// `documents[i]` and the corresponding `token_ids[i]` interchangeably.
+async fn tokenize_with_cache(
+    state: &Arc<AppState>,
+    model_name: &str,
+    model: &Arc<crate::model_reranker::RerankerModel>,
+    query: &str,
+    documents: &[String],
+) -> Result<Vec<Vec<u32>>, TokenizeError> {
+    // Probe the cache for every (query, doc) pair. None = miss.
+    let mut result_slots: Vec<(usize, Option<std::sync::Arc<Vec<u32>>>)> = documents
+        .iter()
+        .enumerate()
+        .map(|(i, doc)| {
+            let hit = state.token_cache.get(model_name, query, doc);
+            (i, hit)
+        })
+        .collect();
+
+    let hit_count = result_slots.iter().filter(|(_, h)| h.is_some()).count();
+    let miss_count = result_slots.len() - hit_count;
+    metrics::record_token_cache_hit(model_name, hit_count as u64);
+    metrics::record_token_cache_miss(model_name, miss_count as u64);
+
+    if miss_count == 0 {
+        // Fast path: every pair was in cache. No tokenizer wall time to
+        // record (would be a 0-bucket spike that distorts p50).
+        return Ok(result_slots
+            .into_iter()
+            .map(|(_, arc)| arc.expect("hit").as_ref().clone())
+            .collect());
+    }
+
+    // Miss path: collect docs needing tokenization, preserving original
+    // indices so the splice back is in-order.
+    let miss_indices: Vec<usize> = result_slots
+        .iter()
+        .filter(|(_, h)| h.is_none())
+        .map(|(i, _)| *i)
+        .collect();
+    let miss_docs: Vec<String> = miss_indices.iter().map(|&i| documents[i].clone()).collect();
+
+    let model_for_tokenize = model.clone();
+    let tokenize_query = query.to_string();
+    let tokenize_start = Instant::now();
+    let tokenized_misses = match tokio::task::spawn_blocking(move || {
+        model_for_tokenize.tokenize_pairs(&tokenize_query, &miss_docs)
+    })
+    .await
+    {
+        Ok(Ok(ids)) => ids,
+        Ok(Err(e)) => return Err(TokenizeError::Failed(e)),
+        Err(join_err) => {
+            return Err(TokenizeError::Panic(format!(
+                "tokenize task panicked: {join_err}"
+            )));
+        }
+    };
+    metrics::record_rerank_tokenizer(model_name, tokenize_start.elapsed());
+
+    // Splice tokenized misses back into result_slots in original order
+    // and populate the cache as we go.
+    let mut miss_iter = tokenized_misses.into_iter().zip(miss_indices.iter());
+    for slot in &mut result_slots {
+        if slot.1.is_none()
+            && let Some((ids, &orig_idx)) = miss_iter.next()
+        {
+            let arc = std::sync::Arc::new(ids);
+            state
+                .token_cache
+                .insert(model_name, query, &documents[orig_idx], arc.clone());
+            slot.1 = Some(arc);
+        }
+    }
+
+    Ok(result_slots
+        .into_iter()
+        .map(|(_, arc)| {
+            arc.expect("all slots filled after tokenize")
+                .as_ref()
+                .clone()
+        })
+        .collect())
+}
+
+/// Failure modes returned by `dispatch_inference`. Each variant maps to a
+/// distinct HTTP response shape (429 / 500 / 503) and a distinct
+/// `embed_rerank_requests_total{status}` label, so they cannot collapse
+/// into one error type without losing observability.
+enum InferenceError {
+    QueueFull(String),
+    Inference(String),
+    Shutdown,
+    ShapeMismatch(String),
+    Panic(String),
+}
+
+/// Dispatch a pre-tokenized batch to the configured backend: the
+/// per-model `DynamicBatcher` if `BATCHING_ENABLED=true` (E2 wires one
+/// for every reranker entry at startup), otherwise a single
+/// `spawn_blocking(score_pairs)` legacy path. The legacy path is
+/// preserved for environments that explicitly disable batching for
+/// debugging.
+async fn dispatch_inference(
+    entry: &crate::types::RerankerEntry,
+    token_ids: Vec<Vec<u32>>,
+    doc_count: usize,
+) -> Result<Vec<f32>, InferenceError> {
+    if let Some(b) = &entry.batcher {
+        match b.embed_tokens(token_ids).await {
+            Ok(v) => unwrap_scalar_batch(v, doc_count).map_err(InferenceError::ShapeMismatch),
+            Err(crate::batcher::BatchError::QueueFull(e)) => {
+                Err(InferenceError::QueueFull(e.to_string()))
+            }
+            Err(crate::batcher::BatchError::Inference(msg)) => Err(InferenceError::Inference(msg)),
+            Err(crate::batcher::BatchError::Shutdown) => Err(InferenceError::Shutdown),
+        }
+    } else {
+        let model_for_score = entry.model.clone();
+        match tokio::task::spawn_blocking(move || model_for_score.score_pairs(&token_ids)).await {
+            Ok(Ok(s)) => Ok(s),
+            Ok(Err(e)) => Err(InferenceError::Inference(e)),
+            Err(join_err) => Err(InferenceError::Panic(format!(
+                "score task panicked: {join_err}"
+            ))),
+        }
+    }
+}
+
+/// 429 Too Many Requests with `Retry-After: 1`. Both load-shed layers
+/// (semaphore cap, batcher queue full) share the 1-second backoff hint —
+/// neither failure mode is a meaningful steady state on healthy infra,
+/// and a fixed short retry matches the `/v1/embeddings` contract.
+fn rate_limited_response(message: String) -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [("retry-after", "1")],
+        Json(ErrorResponse {
+            error: ErrorDetail {
+                message,
+                error_type: "rate_limited",
+            },
+        }),
+    )
+        .into_response()
+}
+
+/// Cohere-shape opaque request id. Clients use it for log correlation
+/// only — the contract is "unique-ish, not cryptographic".
+fn opaque_request_id() -> String {
+    format!(
+        "rrk_{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    )
 }
 
 /// Unwrap the batcher's `Vec<Vec<f32>>` (one 1-element inner per pair)

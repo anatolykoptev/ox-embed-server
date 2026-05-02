@@ -17,6 +17,11 @@ pub fn init(version: &str) -> PrometheusHandle {
     // the coalescing window closes.
     let wait_ms_matcher =
         metrics_exporter_prometheus::Matcher::Full("embed_batch_wait_ms".to_string());
+    // Padding-waste ratio matcher: 0.0 (no waste) → 1.0 (all padding). Linear
+    // 0.1 buckets give resolution at the operational decision boundary
+    // (median > 0.4 → length-bucketing payoff per Phase 3C plan).
+    let waste_matcher =
+        metrics_exporter_prometheus::Matcher::Suffix("padding_waste_ratio".to_string());
 
     let handle = PrometheusBuilder::new()
         .set_buckets_for_metric(
@@ -38,6 +43,11 @@ pub fn init(version: &str) -> PrometheusHandle {
             ],
         )
         .expect("set batch wait buckets")
+        .set_buckets_for_metric(
+            waste_matcher,
+            &[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+        )
+        .expect("set padding waste buckets")
         .install_recorder()
         .expect("install Prometheus recorder");
 
@@ -230,4 +240,164 @@ pub fn set_cache_size(size: usize) {
 /// detect tokenizer regressions instead of seeing silent total_tokens=0.
 pub fn record_tokenize_fallback() {
     metrics::counter!("embed_tokenize_fallback_total").increment(1);
+}
+
+/// Increment the token-cache hit counter by `n`.
+///
+/// Called from the reranker hot path (H.7) once per batch hit. Using an
+/// `_n` form mirrors the embedding-cache pattern so the caller can record
+/// all hits in a batch with a single atomic increment. Pre-warming with
+/// `n=0` at startup ensures the series appears in `/metrics` before the
+/// first request arrives.
+pub fn record_token_cache_hit(model: &str, n: u64) {
+    metrics::counter!(
+        "embed_token_cache_total",
+        "model" => model.to_string(),
+        "outcome" => "hit"
+    )
+    .increment(n);
+}
+
+/// Increment the token-cache miss counter by `n`.
+///
+/// See `record_token_cache_hit` for the batch-increment semantic and
+/// startup pre-warm contract.
+pub fn record_token_cache_miss(model: &str, n: u64) {
+    metrics::counter!(
+        "embed_token_cache_total",
+        "model" => model.to_string(),
+        "outcome" => "miss"
+    )
+    .increment(n);
+}
+
+// ---------------------------------------------------------------------
+// Rerank-specific instrumentation (Phase 1A — 2026-05-01).
+//
+// Series prefix `embed_rerank_*` (kept under the global `embed_` namespace
+// so existing scrape configs and Grafana dashboards pick them up without
+// label-relabeling). Until this phase the /v1/rerank path emitted only
+// the batcher-level series (queue depth, batch tokens) and `embed_token_cache_total` —
+// no per-request counters, no inference timing, no tokenizer split.
+// Without these series, Phase 2's head-to-head bench (gte-multi vs
+// gte-modernbert) would only be measurable as black-box wall-clock,
+// with no way to attribute regressions to inference vs tokenize vs queue.
+// ---------------------------------------------------------------------
+
+/// Record a completed /v1/rerank request — counter + end-to-end latency
+/// histogram + pairs-per-request distribution.
+///
+/// Call once per request, on every exit path (success and error). Use the
+/// `_RerankInFlightGuard_` for the in-flight gauge; this function only
+/// records terminal-state series.
+pub fn record_rerank_request(model: &str, status: &str, duration: Duration, doc_count: usize) {
+    metrics::counter!(
+        "embed_rerank_requests_total",
+        "model" => model.to_string(),
+        "status" => status.to_string()
+    )
+    .increment(1);
+    metrics::histogram!(
+        "embed_rerank_request_duration_seconds",
+        "model" => model.to_string()
+    )
+    .record(duration.as_secs_f64());
+    metrics::histogram!(
+        "embed_rerank_pairs_per_request",
+        "model" => model.to_string()
+    )
+    .record(doc_count as f64);
+}
+
+/// Record one cross-encoder inference — wraps the `session.run()` call only,
+/// not the tokenize or pool-acquire phases (those have their own series).
+/// `batch_size` is the number of (query, doc) pairs in the forward pass —
+/// i.e. the tensor's batch dim, which is the actual unit of cross-encoder
+/// compute cost.
+pub fn record_rerank_inference(model: &str, duration: Duration, batch_size: usize) {
+    metrics::histogram!(
+        "embed_rerank_inference_duration_seconds",
+        "model" => model.to_string()
+    )
+    .record(duration.as_secs_f64());
+    metrics::histogram!(
+        "embed_rerank_batch_size",
+        "model" => model.to_string()
+    )
+    .record(batch_size as f64);
+}
+
+/// Record HuggingFace tokenizer wall time for one rerank request's miss
+/// batch. Excludes cache-hit pairs (those bypass the tokenizer entirely).
+/// On cache-only requests this series is not recorded — track miss
+/// fraction via `embed_token_cache_total{outcome}`.
+#[allow(dead_code)]
+pub fn record_rerank_tokenizer(model: &str, duration: Duration) {
+    metrics::histogram!(
+        "embed_rerank_tokenizer_duration_seconds",
+        "model" => model.to_string()
+    )
+    .record(duration.as_secs_f64());
+}
+
+/// Record session-pool mutex acquire wall time. Sub-ms under no contention;
+/// rises to the inference-duration tail under saturation. Drives Phase 3A
+/// `RERANKER_SESSION_POOL_SIZE` decisions.
+pub fn record_rerank_pool_acquire(model: &str, duration: Duration) {
+    metrics::histogram!(
+        "embed_rerank_pool_acquire_duration_seconds",
+        "model" => model.to_string()
+    )
+    .record(duration.as_secs_f64());
+}
+
+/// Record padding-waste ratio for one cross-encoder forward pass. Computed
+/// as `(padded_tokens - real_tokens) / padded_tokens` clamped to `[0, 1]`.
+/// Drives Phase 3C (length-bucketing) decisions: median > 0.4 = payoff.
+pub fn record_rerank_padding_waste(model: &str, padded: usize, raw: usize) {
+    let ratio = if padded == 0 {
+        0.0
+    } else {
+        ((padded.saturating_sub(raw)) as f64 / padded as f64).clamp(0.0, 1.0)
+    };
+    metrics::histogram!(
+        "embed_rerank_padding_waste_ratio",
+        "model" => model.to_string()
+    )
+    .record(ratio);
+}
+
+/// RAII guard that increments `embed_rerank_in_flight{model}` on construction
+/// and decrements it on `Drop`. Holding it across the entire request
+/// lifetime — including async waits on tokenize and batcher — is what makes
+/// the gauge a faithful "currently processing" count rather than a
+/// peak-counter approximation.
+///
+/// Drop semantics are panic-safe: even if the handler unwinds (it shouldn't,
+/// but axum catches panics anyway), the gauge decrement still fires.
+pub struct RerankInFlightGuard {
+    model: String,
+}
+
+impl RerankInFlightGuard {
+    pub fn new(model: &str) -> Self {
+        metrics::gauge!(
+            "embed_rerank_in_flight",
+            "model" => model.to_string()
+        )
+        .increment(1.0);
+        Self {
+            model: model.to_string(),
+        }
+    }
+}
+
+impl Drop for RerankInFlightGuard {
+    fn drop(&mut self) {
+        metrics::gauge!(
+            "embed_rerank_in_flight",
+            "model" => self.model.clone()
+        )
+        .decrement(1.0);
+    }
 }

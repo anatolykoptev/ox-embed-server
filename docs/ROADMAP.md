@@ -50,6 +50,101 @@ Status of the multi-model Rust inference sidecar on the `krolik` server. Updated
 
 Rough effort = **focused implementation hours** (not calendar time — each phase adds CI wait + dozor build ≈ +5 min overhead).
 
+---
+
+## Phase H — Karpathy throughput sprint (2026-05-01 added)
+
+Findings from competitive research (TEI, Infinity, vLLM) + ML expert review during memdb-go LoCoMo eval session. Server is **already best-in-class on ARM ONNX + INT8** per competitive audit; remaining gains come from *application-level* features and *model-level* swaps, NOT batcher microopts.
+
+### H.1 — `RERANKER_BATCH_MAX` env (separate from embed `BATCH_MAX`) ✅ shipped 2026-05-01
+- **Why**: shared `batch_max=8` cap blocked rerank coalescing — 5-doc payloads instantly hit cap, killed concurrent throughput
+- **Where**: `config.rs` field + `main.rs` reranker batcher init (~25 LOC)
+- **Default**: `4 × batch_max` so single env (`BATCH_MAX=8`) preserves embed cache-thrash mitigation while reranker uses 32-64
+
+### H.2 — Tokenize zero-alloc on rerank hot path ✅ shipped 2026-05-01
+- **Was**: `Vec<(String, String)>` with `query.to_string() + d.clone()` per doc (2N allocs/call)
+- **Now**: `Vec<(&str, &str)>` via `From<(I1, I2)> for EncodeInput` blanket impl
+- **Where**: `model_reranker.rs:tokenize_pairs` (~10 LOC)
+- **Impact**: ~15% tokenize-phase speedup, zero-risk
+
+### H.3 — `MAX_CONCURRENT_RERANK_REQUESTS` semaphore (TEI pattern) ✅ shipped 2026-05-01
+- **Why**: load-shed at HTTP layer with 429 BEFORE tokenizer CPU is spent on requests that will time out upstream
+- **Where**: `AppState.rerank_semaphore: Option<Arc<Semaphore>>` + `api_rerank.rs` permit acquire (~40 LOC)
+- **Default**: `4` (matches truly-parallel rerank capacity on 4-core ARM)
+- **Prior art**: HuggingFace TEI `Infer::try_acquire_permit`
+
+### H.4 — `gte-reranker-modernbert-base` model swap ✅ shipped 2026-05-01
+- **Why**: 149M params (3.8× smaller than gte-multi 568M) + 8192 max_seq_len (vs 256, eliminates silent doc truncation) + matches 1.2B Nemotron quality
+- **Where**: `RERANKER_MODELS` env now lists both — gte-multi (legacy) + gte-modernbert
+- **Files**: `models/gte-reranker-modernbert-base/{config,tokenizer,model_quantized}.{json,onnx}` (151MB INT8 from Alibaba's HF repo)
+- **Switch**: set `CROSS_ENCODER_MODEL=gte-modernbert` in memdb-go env
+
+### H.5 — Length-sorted batch packing (Infinity pattern) — TODO
+- **Effort**: ~150 LOC + tests
+- **What**: After coalesce window closes, drain queue non-blockingly, sort by `max_seq_len`, slice into homogeneous sub-batches before dispatch
+- **Where**: `batcher.rs::run_worker` — refactor inner loop
+- **Payoff**: 10-25% throughput on **mixed-length** workloads. For our memos (all clustered ~256 tokens) gain near-zero — defer until measurable padding waste appears
+- **Prior art**: Infinity `CustomFIFOQueue.pop_optimal_batches`
+
+### H.6 — Fused tokenize+forward в одном `spawn_blocking` — TODO
+- **Effort**: ~60 LOC core + 200 LOC test rewrite
+- **What**: Move tokenization OUT of `api_rerank.rs` handler, INTO batcher worker so single `spawn_blocking` does both. Eliminates tokio context-switch + L1 cache eviction between tokenize and forward
+- **Payoff**: 15-30% single-text latency recovery (matches old ROADMAP B-polish estimate)
+- **Risk**: API contract change in `DynamicBatcher::embed_tokens` — needs tests
+
+### H.7 — Tokenizer cache (moka) — TODO
+- **Effort**: ~60 LOC
+- **What**: `LRU<Sha256<text>, Vec<u32>>` cached input_ids. Memdb-go D7 sub-queries against same docs hit immediately
+- **Payoff**: 50ms tokenize → 0ms on cache hit. Estimated 30% rerank latency reduction on repeat-doc loads
+- **Where**: extend `cache.rs` (currently embeddings-only) with token cache
+
+### H.8 — Combined `/v1/retrieve_and_rerank` endpoint — TODO
+- **Effort**: ~200 LOC
+- **What**: Single endpoint accepts query + dense_emb + sparse_emb + candidate_docs → server does RRF fusion + CE rerank. Saves 3 HTTP RTT per memdb-go search
+- **Payoff**: 30-100ms × D7 fanout (~3 sub-queries) = 90-300ms p95 reduction per chat turn
+- **Risk**: API contract addition; backwards-compat trivial (new endpoint)
+
+### H.9 — Late-interaction (ColBERT-style) endpoint — TODO
+- **Effort**: ~400 LOC
+- **What**: Score query × docs using stored token-level embeddings + light interaction matrix. NOT full cross-encoder
+- **Payoff**: 10× faster than CE for −2pp quality. Drop-in for low-stakes rerank steps (D7 sub-queries)
+
+### H.10 — Adaptive threshold response field — TODO
+- **Effort**: ~30 LOC
+- **What**: Add `confidence: f32` to rerank response (entropy of top-N scores). Memdb-go can skip docs below threshold without separate quality_floor heuristic
+- **Payoff**: cleaner client API, removes duplicated logic
+
+### H.11 — Batch rerank API `/v1/rerank/batch` — TODO
+- **Effort**: ~100 LOC
+- **What**: Accept array of `{query, documents}` tuples. Server fans out internally, batches efficiently
+- **Payoff**: D7 sub-queries в одной HTTP call вместо 3 — saves RTT + lets batcher coalesce across queries
+
+### H.12 — LLM-listwise rerank fallback — TODO
+- **Effort**: ~150 LOC
+- **What**: When CE quality_floor hit (top-1 < 0.05), call gemini-flash-lite for listwise rerank as fallback
+- **Payoff**: Recover degraded queries with smarter model — narrow OOD English where gte struggles
+- **Risk**: external LLM dependency, latency variance
+
+### H.13 — gRPC endpoint — TODO (low priority)
+- **Effort**: ~200 LOC
+- **What**: tonic-based gRPC for `/v1/rerank` + `/v1/embeddings`
+- **Payoff**: ~30% wire overhead reduction. Useful only if memdb-go QPS scales 10×
+
+### H.14 — IO binding (ORT pre-allocated tensors) — TODO
+- **Effort**: ~80 LOC
+- **What**: `SessionInputValue` with reused backing buffers vs per-call malloc
+- **Payoff**: 5-15% under sustained load (allocator pressure reduction on 4-core ARM)
+- **Prior art**: TEI ORT backend
+
+### Sequencing recommendation
+
+**Sprint 1** (~4 h, immediate user-visible wins): H.7 tokenizer cache + H.10 adaptive threshold + H.11 batch API
+**Sprint 2** (~8 h, throughput tier): H.5 length-sort + H.6 fused dispatch + H.14 IO binding
+**Sprint 3** (~10 h, architecture): H.8 combined endpoint + H.9 late-interaction + H.12 LLM fallback
+**Sprint 4** (≥15 h, hardware tier): H.13 gRPC + Phase F NER + Phase G SPLADE polish
+
+---
+
 ### Priority 1 — ~5-7 h
 
 #### `B-polish` — close Phase B hygiene

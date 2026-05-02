@@ -41,9 +41,21 @@ Single process serving three model classes concurrently:
   nearly always unique.
 - `POST /embed_sparse` — TEI convention (no `/v1/` prefix by design).
 - `GET /health` — plain `ok`.
-- `GET /metrics` — Prometheus `embed_*` series (counters, `embed_batch_tokens`
-  summary, `embed_build_info` gauge). Duration histograms NOT exposed — add in
-  `metrics.rs` if needed.
+- `GET /metrics` — Prometheus `embed_*` series. Counters
+  (`embed_requests_total`, `embed_rerank_requests_total`,
+  `embed_token_cache_total`, etc.), latency histograms
+  (`embed_request_duration_seconds`, `embed_inference_duration_seconds`,
+  `embed_rerank_request_duration_seconds`,
+  `embed_rerank_inference_duration_seconds`,
+  `embed_rerank_pool_acquire_duration_seconds`,
+  `embed_rerank_tokenizer_duration_seconds`), batch-shape histograms
+  (`embed_batch_size`, `embed_rerank_batch_size`,
+  `embed_rerank_pairs_per_request`, `embed_batch_tokens`,
+  `embed_batch_padding_waste_ratio`,
+  `embed_rerank_padding_waste_ratio`), gauges
+  (`embed_queue_depth_current`, `embed_rerank_in_flight`,
+  `embed_build_info`). All histograms have suffix-matched bucket
+  configs in `metrics::init`.
 
 ## Environment (live prod values)
 
