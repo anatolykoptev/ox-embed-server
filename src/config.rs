@@ -312,10 +312,14 @@ impl Config {
         // texts_per_req=8 embed default, single-text splade) — the
         // unset path MUST get the cold-start fix, hence non-empty
         // defaults rather than `[]` when the env var is absent.
-        let rerank_warmup_batch_sizes =
-            parse_warmup_batch_sizes(env::var("RERANK_WARMUP_BATCH_SIZES").ok().as_deref(), &[1, 5]);
-        let embed_warmup_batch_sizes =
-            parse_warmup_batch_sizes(env::var("EMBED_WARMUP_BATCH_SIZES").ok().as_deref(), &[1, 8]);
+        let rerank_warmup_batch_sizes = parse_warmup_batch_sizes(
+            env::var("RERANK_WARMUP_BATCH_SIZES").ok().as_deref(),
+            &[1, 5],
+        );
+        let embed_warmup_batch_sizes = parse_warmup_batch_sizes(
+            env::var("EMBED_WARMUP_BATCH_SIZES").ok().as_deref(),
+            &[1, 8],
+        );
         let splade_warmup_batch_sizes =
             parse_warmup_batch_sizes(env::var("SPLADE_WARMUP_BATCH_SIZES").ok().as_deref(), &[1]);
 
@@ -955,37 +959,22 @@ mod tests {
     fn warmup_batch_sizes_parses_csv_in_order() {
         // Order matters — operator picks "compile this first" by ordering
         // the list. We do not sort.
-        assert_eq!(
-            parse_warmup_batch_sizes(Some("1,5"), &[1, 5]),
-            vec![1, 5]
-        );
-        assert_eq!(
-            parse_warmup_batch_sizes(Some("5,1"), &[1, 5]),
-            vec![5, 1]
-        );
+        assert_eq!(parse_warmup_batch_sizes(Some("1,5"), &[1, 5]), vec![1, 5]);
+        assert_eq!(parse_warmup_batch_sizes(Some("5,1"), &[1, 5]), vec![5, 1]);
         assert_eq!(
             parse_warmup_batch_sizes(Some("1,2,5,10"), &[1]),
             vec![1, 2, 5, 10]
         );
         // Whitespace tolerance — env quoting in compose files is fragile.
-        assert_eq!(
-            parse_warmup_batch_sizes(Some("  1 , 5 "), &[1]),
-            vec![1, 5]
-        );
+        assert_eq!(parse_warmup_batch_sizes(Some("  1 , 5 "), &[1]), vec![1, 5]);
     }
 
     #[test]
     fn warmup_batch_sizes_dedups_preserving_order() {
         // Duplicates collapse to first occurrence — keeps total warmup
         // time bounded when an operator pastes "1,5,1" by accident.
-        assert_eq!(
-            parse_warmup_batch_sizes(Some("3,5,3"), &[1]),
-            vec![3, 5]
-        );
-        assert_eq!(
-            parse_warmup_batch_sizes(Some("1,1,1"), &[1]),
-            vec![1]
-        );
+        assert_eq!(parse_warmup_batch_sizes(Some("3,5,3"), &[1]), vec![3, 5]);
+        assert_eq!(parse_warmup_batch_sizes(Some("1,1,1"), &[1]), vec![1]);
         assert_eq!(
             parse_warmup_batch_sizes(Some("1,5,1,5,8"), &[1]),
             vec![1, 5, 8]
@@ -997,14 +986,8 @@ mod tests {
         // 0 would `% 0` panic in any per-batch dispatch loop. Negatives
         // can't parse as usize. Both get dropped without falling back —
         // the rest of the list is still useful.
-        assert_eq!(
-            parse_warmup_batch_sizes(Some("0,1,5"), &[1]),
-            vec![1, 5]
-        );
-        assert_eq!(
-            parse_warmup_batch_sizes(Some("1,-3,5"), &[1]),
-            vec![1, 5]
-        );
+        assert_eq!(parse_warmup_batch_sizes(Some("0,1,5"), &[1]), vec![1, 5]);
+        assert_eq!(parse_warmup_batch_sizes(Some("1,-3,5"), &[1]), vec![1, 5]);
         assert_eq!(
             parse_warmup_batch_sizes(Some("0"), &[1, 5]),
             vec![1, 5],
@@ -1016,10 +999,7 @@ mod tests {
     fn warmup_batch_sizes_skips_unparseable_keeps_valid() {
         // Single typo in the middle should not kill warmup for the other
         // shapes — drop the bad token, keep the rest.
-        assert_eq!(
-            parse_warmup_batch_sizes(Some("1,nope,5"), &[1]),
-            vec![1, 5]
-        );
+        assert_eq!(parse_warmup_batch_sizes(Some("1,nope,5"), &[1]), vec![1, 5]);
         assert_eq!(
             parse_warmup_batch_sizes(Some("garbage"), &[1, 5]),
             vec![1, 5],
@@ -1034,10 +1014,7 @@ mod tests {
         // explicit ("the warmup feature has no documented disable knob"
         // — same stance as the reranker pool size's `0` rejection).
         assert_eq!(parse_warmup_batch_sizes(Some(""), &[1, 5]), vec![1, 5]);
-        assert_eq!(
-            parse_warmup_batch_sizes(Some("   "), &[1, 5]),
-            vec![1, 5]
-        );
+        assert_eq!(parse_warmup_batch_sizes(Some("   "), &[1, 5]), vec![1, 5]);
         assert_eq!(parse_warmup_batch_sizes(Some(",,"), &[1, 5]), vec![1, 5]);
     }
 }

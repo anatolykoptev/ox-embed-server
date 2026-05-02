@@ -208,9 +208,7 @@ fn legacy_unsuffixed_static_loads_as_b1() {
     let dynamic = Path::new(&dir).join("model_quantized.onnx");
     let tok = Path::new(&dir).join("tokenizer.json");
     if !dynamic.exists() || !tok.exists() || !static_legacy.exists() {
-        eprintln!(
-            "SKIP legacy_unsuffixed_static_loads_as_b1: required files not present at {dir}"
-        );
+        eprintln!("SKIP legacy_unsuffixed_static_loads_as_b1: required files not present at {dir}");
         return;
     }
     let m = RerankerModel::load("gte-modernbert", &dir, 256, true, 1, 1)

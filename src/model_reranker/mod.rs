@@ -309,7 +309,10 @@ impl RerankerModel {
         let batch = token_ids.len();
         // The pool's static graph dim is `batch` literally — caller is
         // responsible for matching, but assert for paranoia in debug.
-        debug_assert!(batch >= 1, "score_pairs_static must not be called with empty input");
+        debug_assert!(
+            batch >= 1,
+            "score_pairs_static must not be called with empty input"
+        );
         let static_seq = self.max_len;
         let real_tokens: usize = token_ids.iter().map(|v| v.len().min(static_seq)).sum();
 
@@ -423,8 +426,9 @@ impl RerankerModel {
         // Tiny strings keep tokenization cheap; we cap to `max_len`
         // below so the mask shape matches what production traffic
         // produces at this batch dim.
-        let pairs: Vec<(&str, &str)> =
-            (0..batch).map(|_| ("warmup query", "warmup document")).collect();
+        let pairs: Vec<(&str, &str)> = (0..batch)
+            .map(|_| ("warmup query", "warmup document"))
+            .collect();
         let encodings = self
             .tokenizer
             .encode_batch(pairs, /*add_special_tokens*/ true)
