@@ -28,6 +28,7 @@
 //! call paths.
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -78,23 +79,33 @@ pub struct RerankerModel {
     /// so other reranker kinds (e.g. bge-reranker-base — BERT, pad_id=0)
     /// don't need a hand-coded override.
     pub(super) pad_id: u32,
-    /// Phase H.20 — optional fast-path session pool with FIXED static shape
-    /// `[1, max_len]`. Loaded only if `<dir>/model_quantized_static.onnx`
-    /// exists alongside the dynamic file. ORT pre-folds 700+ runtime
-    /// shape-computation nodes into constants, giving 1.74x speedup
-    /// per-call vs the dynamic graph (bench: 1359ms → 781ms on
-    /// gte-reranker-modernbert-base, batch=1, seq=256, ARM Neoverse-N1).
+    /// Phase H.20 + 2026-05-02 multi-shape extension — optional
+    /// fast-path session pools, one per supported batch size, each with
+    /// FIXED static shape `[N, max_len]`. The map key is the batch size
+    /// `N`; the value is a `Vec<Mutex<Session>>` (pool-of-2 by default).
     ///
-    /// Routing: `score_pairs` checks the actual batch size — a single-pair
-    /// call (batch=1, the dominant prod path for memdb-go's per-pair
-    /// rerank loop) goes through the static pool; multi-pair calls
-    /// (batch>1) keep using the dynamic pool because the static graph's
-    /// input shape is literally `[1, ?]` and ORT will reject `[N, ?]`.
-    pub(super) static_sessions: Option<Vec<Mutex<Session>>>,
-    /// Round-robin cursor for the static pool. Separate from `next` so
-    /// the two pools cycle independently and a busy dynamic pool can't
-    /// stall the static fast path.
-    pub(super) static_next: AtomicUsize,
+    /// Loaded only if `<dir>/model_quantized_static_b<N>.onnx` files
+    /// exist alongside the dynamic file. The legacy unsuffixed
+    /// `model_quantized_static.onnx` (PR #27 convention) is treated as
+    /// `b=1` for backwards compatibility — operators upgrading don't
+    /// need to rename files.
+    ///
+    /// ORT pre-folds 700+ runtime shape-computation nodes into
+    /// constants once the batch axis is fixed, giving 1.74x speedup
+    /// per-call vs the dynamic graph at batch=1 (bench: 1359ms → 781ms
+    /// on gte-reranker-modernbert-base, seq=256, ARM Neoverse-N1).
+    ///
+    /// Routing: `score_pairs` checks the actual batch size against this
+    /// map — exact match → static pool; miss → dynamic pool fallback.
+    /// We deliberately do NOT pad-up (e.g. batch=3 → b=5 static)
+    /// because that's a different optimization with a different
+    /// padding-waste trade-off. See
+    /// `docs/plans/2026-05-02-multi-shape-static-export.md`.
+    pub(super) static_session_pools: BTreeMap<usize, Vec<Mutex<Session>>>,
+    /// Per-shape round-robin cursors. Each batch size gets its own
+    /// `AtomicUsize` so a busy `b=5` pool can't stall the `b=1` pool
+    /// (and neither can stall the dynamic `next` cursor).
+    pub(super) static_session_cursors: BTreeMap<usize, AtomicUsize>,
 }
 
 impl RerankerModel {
@@ -109,6 +120,19 @@ impl RerankerModel {
     /// expose pool capacity in `/health` if needed. Cheap (`Vec::len`).
     pub fn session_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    /// Sorted list of batch sizes for which a static-shape session pool
+    /// is loaded. Empty when no `model_quantized_static_b*.onnx` (and
+    /// no legacy unsuffixed `model_quantized_static.onnx`) was found
+    /// at load time.
+    ///
+    /// Public so integration tests in `tests.rs` can assert backwards
+    /// compatibility with PR #27 (`{1}` for the legacy unsuffixed
+    /// file). Intended as a read-only ops accessor — not part of the
+    /// scoring hot path.
+    pub fn static_pool_shapes(&self) -> Vec<usize> {
+        self.static_session_pools.keys().copied().collect()
     }
 
     /// Tokenize `(query, doc)` pairs into concatenated input_ids.
@@ -162,17 +186,31 @@ impl RerankerModel {
             return Ok(vec![]);
         }
 
-        // Phase H.20 fast path: route batch=1 calls to the static-shape
-        // session if loaded. The static graph is `[1, max_len]` fixed —
-        // ORT pre-folded ~700 runtime shape ops into constants giving
-        // 1.74× speedup vs the dynamic graph (1359ms → 781ms standalone
-        // bench, gte-reranker-modernbert-base, ARM Neoverse-N1).
-        // batch>1 falls through to the dynamic path below because the
-        // static graph rejects shapes other than `[1, max_len]`.
-        if token_ids.len() == 1
-            && let Some(static_sessions) = &self.static_sessions
-        {
-            return self.score_pairs_static(token_ids, static_sessions);
+        // Phase H.20 + 2026-05-02 multi-shape fast path: route to the
+        // static-shape session pool whose batch axis exactly matches
+        // the inbound `token_ids.len()`. The static graph is
+        // `[N, max_len]` fixed — ORT pre-folded ~700 runtime shape ops
+        // into constants giving 1.74× speedup vs the dynamic graph at
+        // batch=1 (1359ms → 781ms standalone bench, gte-reranker-
+        // modernbert-base, ARM Neoverse-N1).
+        //
+        // Exact-match only: a batch size with no matching static pool
+        // (e.g. batch=3 with `{1, 5}` deployed) falls through to the
+        // dynamic path below. We do NOT pad-up to a larger static
+        // shape — different optimisation, different padding-waste
+        // calculus, intentionally out of scope. See
+        // `docs/plans/2026-05-02-multi-shape-static-export.md` § Routing.
+        if let Some(static_pool) = self.static_session_pools.get(&token_ids.len()) {
+            // The cursor map is built in lock-step with the pool map at
+            // load time — every key in `static_session_pools` has a
+            // matching cursor in `static_session_cursors`, by construction
+            // (see `RerankerModel::load`). Defensive `expect` documents
+            // that invariant; a missing cursor would be a load-time bug.
+            let cursor = self
+                .static_session_cursors
+                .get(&token_ids.len())
+                .expect("static_session_cursors missing key — load.rs invariant violated");
+            return self.score_pairs_static(token_ids, static_pool, cursor);
         }
 
         let max_seq = token_ids
@@ -242,33 +280,45 @@ impl RerankerModel {
         Ok((0..batch).map(|i| raw[[i, 0]]).collect())
     }
 
-    /// Phase H.20 fast-path inference for batch=1 calls. Uses the
-    /// static-shape session pool (`[1, max_len]` fixed graph) which
+    /// Phase H.20 + 2026-05-02 multi-shape fast-path inference. Uses
+    /// the static-shape session pool whose batch axis matches the
+    /// inbound `token_ids.len()` (`[N, max_len]` fixed graph), which
     /// avoids the ~700 runtime shape-computation nodes of the dynamic
-    /// graph. Always pads to `self.max_len` (no per-call max_seq calc)
-    /// because that's literally the only shape the static graph accepts.
+    /// graph. Always pads to `self.max_len` (no per-call `max_seq`
+    /// calc) because that's literally the only shape the static graph
+    /// accepts.
     ///
-    /// Trade-off: short single-pair calls pad to full max_len even when
-    /// the actual content is shorter (lose padding-waste advantage of
-    /// the dynamic path). The 1.74× per-call speedup more than offsets
-    /// this for typical seq>=64; for seq<32 the dynamic path may be
-    /// faster but the difference is sub-millisecond and not worth
-    /// switching back per call.
+    /// Trade-off: short pairs pad to full `max_len` even when the
+    /// actual content is shorter (lose padding-waste advantage of the
+    /// dynamic path). The static-graph per-call speedup offsets this
+    /// for typical seq>=64. The {b=1, b=5} default policy assumes
+    /// memdb-go's realistic shape, where `MaxCharsPerDoc=0` means real
+    /// docs frequently saturate the 256-token cap anyway.
+    ///
+    /// Caller (`score_pairs`) does the exact-match lookup and supplies
+    /// both `static_pool` and the matching per-shape cursor. Pool +
+    /// cursor are kept on separate maps in the parent struct for
+    /// allocation locality reasons (cursors are tiny `AtomicUsize`,
+    /// pools are heavy `Mutex<Session>` vecs).
     fn score_pairs_static(
         &self,
         token_ids: &[Vec<u32>],
-        static_sessions: &[Mutex<Session>],
+        static_pool: &[Mutex<Session>],
+        cursor: &AtomicUsize,
     ) -> Result<Vec<f32>, String> {
-        debug_assert_eq!(token_ids.len(), 1);
+        let batch = token_ids.len();
+        // The pool's static graph dim is `batch` literally — caller is
+        // responsible for matching, but assert for paranoia in debug.
+        debug_assert!(batch >= 1, "score_pairs_static must not be called with empty input");
         let static_seq = self.max_len;
-        let real_tokens = token_ids[0].len().min(static_seq);
+        let real_tokens: usize = token_ids.iter().map(|v| v.len().min(static_seq)).sum();
 
         let (ids, mask_i64, _tti) =
-            pool::build_tensors_from_ids(token_ids, 1, static_seq, self.pad_id);
+            pool::build_tensors_from_ids(token_ids, batch, static_seq, self.pad_id);
 
-        let ids_arr = Array2::from_shape_vec([1, static_seq], ids)
+        let ids_arr = Array2::from_shape_vec([batch, static_seq], ids)
             .map_err(|e| format!("static ids shape: {e}"))?;
-        let mask_arr = Array2::from_shape_vec([1, static_seq], mask_i64)
+        let mask_arr = Array2::from_shape_vec([batch, static_seq], mask_i64)
             .map_err(|e| format!("static mask shape: {e}"))?;
 
         let ids_tensor =
@@ -276,11 +326,11 @@ impl RerankerModel {
         let mask_tensor =
             Tensor::from_array(mask_arr).map_err(|e| format!("static mask tensor: {e}"))?;
 
-        let idx = self.static_next.fetch_add(1, Ordering::Relaxed) % static_sessions.len();
+        let idx = cursor.fetch_add(1, Ordering::Relaxed) % static_pool.len();
         let acquire_start = Instant::now();
-        let mut session = static_sessions[idx]
+        let mut session = static_pool[idx]
             .lock()
-            .map_err(|e| format!("lock static session #{idx}: {e}"))?;
+            .map_err(|e| format!("lock static session b{batch}#{idx}: {e}"))?;
         crate::metrics::record_rerank_pool_acquire(&self.name, acquire_start.elapsed());
 
         let inference_start = Instant::now();
@@ -289,51 +339,96 @@ impl RerankerModel {
                 "input_ids" => ids_tensor,
                 "attention_mask" => mask_tensor,
             })
-            .map_err(|e| format!("static reranker inference: {e}"))?;
-        crate::metrics::record_rerank_inference(&self.name, inference_start.elapsed(), 1);
-        crate::metrics::record_rerank_padding_waste(&self.name, static_seq, real_tokens);
+            .map_err(|e| format!("static reranker inference (b{batch}): {e}"))?;
+        crate::metrics::record_rerank_inference(&self.name, inference_start.elapsed(), batch);
+        crate::metrics::record_rerank_padding_waste(
+            &self.name,
+            batch.saturating_mul(static_seq),
+            real_tokens,
+        );
 
         let raw = outputs[0]
             .try_extract_array::<f32>()
             .map_err(|e| format!("static extract logits: {e}"))?;
         let shape = raw.shape();
-        if shape.len() != 2 || shape[0] != 1 || shape[1] != 1 {
+        if shape.len() != 2 || shape[0] != batch || shape[1] != 1 {
             return Err(format!(
-                "unexpected static reranker output shape: {:?}, expected [1, 1]",
+                "unexpected static reranker output shape: {:?}, expected [{batch}, 1]",
                 shape
             ));
         }
-        Ok(vec![raw[[0, 0]]])
+        Ok((0..batch).map(|i| raw[[i, 0]]).collect())
     }
 
-    /// Run a tiny dummy inference on every session in the pool to force
-    /// ORT graph compilation, kernel selection, and arena allocation
-    /// up-front. Without this the FIRST production request pays the full
-    /// startup cost (~3s observed for gte-multi-rerank, vs ~1.5s steady
-    /// state) — a tail-latency spike that's pure boot-time work.
+    /// Run a tiny dummy inference on every session in the pool, once per
+    /// requested batch shape, to force ORT graph compilation, kernel
+    /// selection, and arena allocation up-front. Without this the FIRST
+    /// production request at a given batch shape pays the full startup
+    /// cost (~3s observed for gte-multi-rerank cold, vs ~1.5s steady) —
+    /// a tail-latency spike that's pure boot-time work and that ALSO
+    /// re-fires when production traffic shifts to a new batch size
+    /// (e.g. memdb-go's batch=5 fanout vs batch=1 single-pair calls).
     ///
-    /// Best-effort: any session that fails to warm logs an error and we
-    /// continue. The server still serves correctly without warmup; this
-    /// is purely a latency optimization.
-    pub fn warmup(&self) -> Result<(), String> {
-        // Two short pairs so the batch dim isn't 1 (some kernels have
-        // separate codepaths for batch=1 vs batch>1; we want to compile
-        // the common path). Picked deliberately tiny so we don't hold
-        // the lock long.
-        let dummy_pairs = vec![
-            (
-                "warmup query".to_string(),
-                "warmup document one".to_string(),
-            ),
-            (
-                "warmup query".to_string(),
-                "warmup document two".to_string(),
-            ),
-        ];
+    /// `shapes` is a list of batch sizes (operator-controlled via
+    /// `RERANK_WARMUP_BATCH_SIZES`). For each shape `B` we synthesise
+    /// `B` dummy `(query, doc)` pairs so ORT compiles its kernels for
+    /// that exact `[B, max_seq]` graph shape. Order in `shapes` is
+    /// preserved — the first listed shape is compiled first and is the
+    /// "best path" if the static-shape fast-path (Phase H.20) is
+    /// loaded; the rest force the dynamic graph to bind kernels for the
+    /// other shapes prod will see.
+    ///
+    /// Best-effort per shape: a single shape failing (e.g. operator put
+    /// `batch=99` and the static graph rejects it) only logs a warn and
+    /// the next shape proceeds. Total startup cost is bounded by
+    /// `shapes.len() * sessions.len()` — `parse_warmup_batch_sizes`
+    /// dedupes the input so duplicate shapes don't double-count.
+    pub fn warmup(&self, shapes: &[usize]) -> Result<(), String> {
+        if shapes.is_empty() {
+            // Defensive — `parse_warmup_batch_sizes` falls back to
+            // defaults on empty input, so this branch never trips in
+            // production. Still guard against direct callers (tests,
+            // future code paths) so `shapes[0]` indexing in the loop
+            // can't panic.
+            tracing::warn!(
+                model = %self.name,
+                "reranker warmup called with empty shapes — skipping"
+            );
+            return Ok(());
+        }
+        for &batch in shapes {
+            if let Err(e) = self.warmup_at_shape(batch) {
+                // Per-shape failure is non-fatal: log and try the next
+                // shape. The static-shape fast-path will loudly reject
+                // batch>1 with `[N, ?]` — that's expected for any shape
+                // we throw at it that isn't 1, so we just continue.
+                tracing::warn!(
+                    model = %self.name,
+                    batch,
+                    error = %e,
+                    "reranker shape warmup failed (continuing with remaining shapes)"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Run one pre-warm pass at exactly `batch` items across every
+    /// session in the dynamic pool. Helper extracted from `warmup` so
+    /// per-shape error handling stays clean (one fallible scope per
+    /// shape, no manual cleanup of partial state).
+    fn warmup_at_shape(&self, batch: usize) -> Result<(), String> {
+        // `batch` of the same query-doc pair — content doesn't matter,
+        // only the resulting `[batch, max_seq]` tensor shape does.
+        // Tiny strings keep tokenization cheap; we cap to `max_len`
+        // below so the mask shape matches what production traffic
+        // produces at this batch dim.
+        let pairs: Vec<(&str, &str)> =
+            (0..batch).map(|_| ("warmup query", "warmup document")).collect();
         let encodings = self
             .tokenizer
-            .encode_batch(dummy_pairs, /*add_special_tokens*/ true)
-            .map_err(|e| format!("warmup tokenize: {e}"))?;
+            .encode_batch(pairs, /*add_special_tokens*/ true)
+            .map_err(|e| format!("warmup tokenize batch={batch}: {e}"))?;
         let token_ids: Vec<Vec<u32>> = encodings
             .iter()
             .map(|e| {
@@ -342,9 +437,18 @@ impl RerankerModel {
                 ids[..len].to_vec()
             })
             .collect();
-
-        let max_seq = token_ids.iter().map(|v| v.len()).max().unwrap_or(0);
-        let batch = token_ids.len();
+        // Pad to `self.max_len` so warmup compiles ORT kernels and primes
+        // BFCArena for the **worst-case prod shape**. Warming at the
+        // natural ~8-token tokenizer output of the dummy text leaves
+        // production traffic - which routinely hits `[batch, max_len]`
+        // when docs are long - entirely cold; the first real request
+        // then re-pays kernel-binding + arena-extend cost (observed
+        // post-H.21 deploy: first prod batch=5 = 2683ms vs steady 1672ms).
+        // `build_tensors_from_ids` fills positions beyond the real token
+        // count with `pad_id` and sets `attention_mask=0`, which is byte-
+        // for-byte identical to what `score_pairs` produces when prod
+        // tokens fill less than `max_len`.
+        let max_seq = self.max_len;
         let (ids, mask_i64, _tti) =
             pool::build_tensors_from_ids(&token_ids, batch, max_seq, self.pad_id);
 
@@ -353,17 +457,17 @@ impl RerankerModel {
         // pay the cold-start cost on its first concurrent request.
         for (i, sess_mu) in self.sessions.iter().enumerate() {
             let ids_arr = Array2::from_shape_vec([batch, max_seq], ids.clone())
-                .map_err(|e| format!("warmup ids shape: {e}"))?;
+                .map_err(|e| format!("warmup ids shape (batch={batch}): {e}"))?;
             let mask_arr = Array2::from_shape_vec([batch, max_seq], mask_i64.clone())
-                .map_err(|e| format!("warmup mask shape: {e}"))?;
-            let ids_tensor =
-                Tensor::from_array(ids_arr).map_err(|e| format!("warmup ids tensor: {e}"))?;
-            let mask_tensor =
-                Tensor::from_array(mask_arr).map_err(|e| format!("warmup mask tensor: {e}"))?;
+                .map_err(|e| format!("warmup mask shape (batch={batch}): {e}"))?;
+            let ids_tensor = Tensor::from_array(ids_arr)
+                .map_err(|e| format!("warmup ids tensor (batch={batch}): {e}"))?;
+            let mask_tensor = Tensor::from_array(mask_arr)
+                .map_err(|e| format!("warmup mask tensor (batch={batch}): {e}"))?;
             let start = Instant::now();
             let mut session = sess_mu
                 .lock()
-                .map_err(|e| format!("warmup lock session #{i}: {e}"))?;
+                .map_err(|e| format!("warmup lock session #{i} (batch={batch}): {e}"))?;
             match session.run(ort::inputs! {
                 "input_ids" => ids_tensor,
                 "attention_mask" => mask_tensor,
@@ -371,12 +475,14 @@ impl RerankerModel {
                 Ok(_) => tracing::info!(
                     model = %self.name,
                     session = i,
+                    batch,
                     elapsed_ms = start.elapsed().as_millis() as u64,
                     "reranker session warmed"
                 ),
                 Err(e) => tracing::error!(
                     model = %self.name,
                     session = i,
+                    batch,
                     error = %e,
                     "reranker session warmup failed (continuing)"
                 ),

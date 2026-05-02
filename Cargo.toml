@@ -43,3 +43,8 @@ opt-level = 1
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["blocking", "json"] }
+# tempfile — used by `model_reranker::load::discovery_tests` to drive
+# the static-shape filename parser through synthetic dirs without any
+# real ONNX bytes (placeholder empty files only). Keep dev-only so it
+# doesn't bloat the production container.
+tempfile = "3"

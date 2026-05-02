@@ -148,6 +148,34 @@ pub struct Config {
     /// token pair) + 40 B key ≈ ~2 KB. At 20 000 entries that's ~40 MB
     /// — negligible next to the ONNX session memory (~300–550 MB each).
     pub token_cache_max_entries: usize,
+    /// Per-shape warmup batch sizes for cross-encoder rerankers.
+    ///
+    /// Each entry is a batch size at which every reranker session runs
+    /// one dummy inference at boot — pre-paying the ORT kernel-binding /
+    /// memory-pattern / arena-allocation cost so the FIRST production
+    /// request at that shape doesn't see the cold-path spike. Default
+    /// `[1, 5]` covers the two prod-traffic shapes: batch=1 (the static
+    /// fast-path single-pair calls) and batch=5 (memdb-go's D7 sub-query
+    /// fanout default). Operators set `RERANK_WARMUP_BATCH_SIZES` to
+    /// override (e.g. `1,2,5,10` for boxes serving wider batch ranges).
+    pub rerank_warmup_batch_sizes: Vec<usize>,
+    /// Per-shape warmup batch sizes for dense (bi-encoder) embedders.
+    ///
+    /// Default `[1, 8]`: batch=1 covers the trivial `/v1/embeddings`
+    /// caller, batch=8 matches the `texts_per_req=8` default the typical
+    /// memdb-go embedder client uses. Override via
+    /// `EMBED_WARMUP_BATCH_SIZES`.
+    pub embed_warmup_batch_sizes: Vec<usize>,
+    /// Per-shape warmup batch sizes for SPLADE sparse encoders.
+    ///
+    /// SPLADE's `encode_sparse` is intrinsically single-text (batch=1
+    /// hard-coded inside the model — see `model_splade.rs`), so this
+    /// list typically has one entry. Defaults to `[1]`. Operators
+    /// who only ever call SPLADE with batch=1 traffic (the v1 norm)
+    /// should leave this unset. Override via
+    /// `SPLADE_WARMUP_BATCH_SIZES` if a future SPLADE batched API
+    /// lands and shape pre-warming becomes useful.
+    pub splade_warmup_batch_sizes: Vec<usize>,
 }
 
 impl Config {
@@ -279,6 +307,18 @@ impl Config {
             .filter(|n| *n > 0)
             .unwrap_or(intra_threads);
 
+        // Per-kind warmup shape lists. Defaults are tuned to the prod
+        // traffic shape we already know about (memdb's batch=5 fanout,
+        // texts_per_req=8 embed default, single-text splade) — the
+        // unset path MUST get the cold-start fix, hence non-empty
+        // defaults rather than `[]` when the env var is absent.
+        let rerank_warmup_batch_sizes =
+            parse_warmup_batch_sizes(env::var("RERANK_WARMUP_BATCH_SIZES").ok().as_deref(), &[1, 5]);
+        let embed_warmup_batch_sizes =
+            parse_warmup_batch_sizes(env::var("EMBED_WARMUP_BATCH_SIZES").ok().as_deref(), &[1, 8]);
+        let splade_warmup_batch_sizes =
+            parse_warmup_batch_sizes(env::var("SPLADE_WARMUP_BATCH_SIZES").ok().as_deref(), &[1]);
+
         Ok(Config {
             port,
             models,
@@ -300,6 +340,9 @@ impl Config {
             auto_truncate,
             cache_max_entries,
             token_cache_max_entries,
+            rerank_warmup_batch_sizes,
+            embed_warmup_batch_sizes,
+            splade_warmup_batch_sizes,
         })
     }
 }
@@ -493,6 +536,102 @@ fn parse_one_splade(entry: &str) -> Result<SpladeModelDef, String> {
         dir: parts[1].to_string(),
         max_len,
     })
+}
+
+/// Parse a `*_WARMUP_BATCH_SIZES` env value into a deduped, order-
+/// preserving list of positive batch sizes.
+///
+/// Shared by `RERANK_WARMUP_BATCH_SIZES`, `EMBED_WARMUP_BATCH_SIZES`,
+/// and `SPLADE_WARMUP_BATCH_SIZES` — each has different defaults but the
+/// parsing rules are identical, so the per-env-var helpers are thin
+/// wrappers in `from_env` that pass their own defaults in.
+///
+/// Behaviour:
+///   - `None` → return `defaults` verbatim. The unset path MUST get the
+///     pre-warm benefit; otherwise the feature is off-by-default and
+///     prod still hits the cold-path latency spike on first batch=N.
+///   - empty / whitespace-only / all-comma → defaults (env quoting
+///     mishaps shouldn't accidentally disable warmup).
+///   - "1,5" → `[1, 5]`. Order is preserved — operator decides which
+///     shape to compile first; we don't sort.
+///   - "3,5,3" → `[3, 5]`. Duplicates collapse to first-occurrence so
+///     total warmup time stays bounded under operator paste mistakes.
+///   - "0,1,5" → `[1, 5]`. `0` would `% 0` panic in any per-shape
+///     dispatch loop and is meaningless as a batch size; we drop it
+///     silently rather than fail boot.
+///   - "1,nope,5" → `[1, 5]`. Single-token typo doesn't kill the warmup
+///     for valid neighbours; we log a warn but keep going.
+///   - "garbage" or "nope,oops" (no valid entries at all) → defaults,
+///     with a warn — same fall-back stance as `parse_batch_max_tokens`
+///     when zero or unparseable. Better to over-warm than under-warm
+///     production.
+///
+/// Exposed for testing; env lookup stays in `from_env`.
+fn parse_warmup_batch_sizes(raw: Option<&str>, defaults: &[usize]) -> Vec<usize> {
+    let Some(s) = raw else {
+        return defaults.to_vec();
+    };
+
+    // Track which valid sizes we've already emitted so dupes collapse to
+    // the first occurrence (preserves order — sorting would change the
+    // operator's intended compile-first shape).
+    let mut seen = std::collections::HashSet::<usize>::new();
+    // First-occurrence-wins, order-preserving. Capacity hint = comma
+    // count + 1, which over-allocates by at most a few slots — cheap.
+    let mut out: Vec<usize> = Vec::with_capacity(s.matches(',').count() + 1);
+    let mut bad_tokens: Vec<&str> = Vec::new();
+
+    for piece in s.split(',') {
+        let trimmed = piece.trim();
+        if trimmed.is_empty() {
+            // Skip empty splits (handles trailing comma / `,,` / pure
+            // whitespace input). Not "bad" — operators legitimately
+            // produce these via env-quoting.
+            continue;
+        }
+        match trimmed.parse::<usize>() {
+            Ok(0) => {
+                // 0 is invalid as a batch size (would `% 0` panic
+                // downstream and means nothing semantically). Treat as
+                // a bad token so the warn fires if it's the only entry.
+                bad_tokens.push(trimmed);
+            }
+            Ok(n) => {
+                if seen.insert(n) {
+                    out.push(n);
+                }
+            }
+            Err(_) => bad_tokens.push(trimmed),
+        }
+    }
+
+    if out.is_empty() {
+        // Nothing valid — fall back to defaults so prod still warms.
+        // Only emit a warn when the input WAS something (vs the empty/
+        // whitespace path, which is silent because it's a common
+        // env-quoting artefact, not a configuration mistake).
+        let trimmed_full = s.trim();
+        if !trimmed_full.is_empty() && trimmed_full.chars().any(|c| c != ',') {
+            tracing::warn!(
+                raw = %s,
+                bad_tokens = ?bad_tokens,
+                defaults = ?defaults,
+                "*_WARMUP_BATCH_SIZES had no valid positive integers; falling back to defaults"
+            );
+        }
+        return defaults.to_vec();
+    }
+
+    if !bad_tokens.is_empty() {
+        tracing::warn!(
+            raw = %s,
+            bad_tokens = ?bad_tokens,
+            kept = ?out,
+            "*_WARMUP_BATCH_SIZES had unparseable or zero entries; warming with the rest"
+        );
+    }
+
+    out
 }
 
 /// Parse `SPLADE_SESSION_POOL_SIZE`. Same shape as
@@ -778,5 +917,127 @@ mod tests {
         assert_eq!(parse_token_cache_max_entries(Some("nope")), 0);
         assert_eq!(parse_token_cache_max_entries(Some("")), 0);
         assert_eq!(parse_token_cache_max_entries(Some("-1")), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // {RERANK,EMBED,SPLADE}_WARMUP_BATCH_SIZES parser.
+    //
+    // Single shared parser used by all three env vars (per-kind defaults
+    // passed in by the caller — `parse_warmup_batch_sizes` is unaware of
+    // which env var produced `raw`, so it cannot bake the defaults in).
+    // Contract:
+    //   - None or empty → return defaults verbatim
+    //   - "1,5" → [1, 5] (preserve order)
+    //   - "5,1" → [5, 1] (preserve order — operator decides which shape
+    //     to compile first; we don't second-guess)
+    //   - "3,5,3" → [3, 5] (dedup, first-occurrence wins, no resort)
+    //   - "0,1,5" → [1, 5] (drop 0 — would `% 0` panic in the dispatch
+    //     loop and is meaningless as a batch size)
+    //   - "garbage" or "1,nope,5" → [1, 5] (skip unparseable, keep
+    //     valid neighbours so a single typo doesn't kill the warmup)
+    //   - "nope,oops" (all garbage) → defaults (nothing valid → fall back
+    //     so prod still gets the pre-warm benefit on env-var typos)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn warmup_batch_sizes_default_when_unset() {
+        // None → defaults verbatim. This is the load-bearing path: when
+        // no env override is set, we must still pre-warm the shapes that
+        // production traffic uses (1 + memdb's batch=5, or embed's
+        // texts_per_req=8). Otherwise the feature is off-by-default and
+        // the cold-path latency spike persists.
+        assert_eq!(parse_warmup_batch_sizes(None, &[1, 5]), vec![1, 5]);
+        assert_eq!(parse_warmup_batch_sizes(None, &[1]), vec![1]);
+        assert_eq!(parse_warmup_batch_sizes(None, &[1, 8]), vec![1, 8]);
+    }
+
+    #[test]
+    fn warmup_batch_sizes_parses_csv_in_order() {
+        // Order matters — operator picks "compile this first" by ordering
+        // the list. We do not sort.
+        assert_eq!(
+            parse_warmup_batch_sizes(Some("1,5"), &[1, 5]),
+            vec![1, 5]
+        );
+        assert_eq!(
+            parse_warmup_batch_sizes(Some("5,1"), &[1, 5]),
+            vec![5, 1]
+        );
+        assert_eq!(
+            parse_warmup_batch_sizes(Some("1,2,5,10"), &[1]),
+            vec![1, 2, 5, 10]
+        );
+        // Whitespace tolerance — env quoting in compose files is fragile.
+        assert_eq!(
+            parse_warmup_batch_sizes(Some("  1 , 5 "), &[1]),
+            vec![1, 5]
+        );
+    }
+
+    #[test]
+    fn warmup_batch_sizes_dedups_preserving_order() {
+        // Duplicates collapse to first occurrence — keeps total warmup
+        // time bounded when an operator pastes "1,5,1" by accident.
+        assert_eq!(
+            parse_warmup_batch_sizes(Some("3,5,3"), &[1]),
+            vec![3, 5]
+        );
+        assert_eq!(
+            parse_warmup_batch_sizes(Some("1,1,1"), &[1]),
+            vec![1]
+        );
+        assert_eq!(
+            parse_warmup_batch_sizes(Some("1,5,1,5,8"), &[1]),
+            vec![1, 5, 8]
+        );
+    }
+
+    #[test]
+    fn warmup_batch_sizes_drops_zero_and_negatives() {
+        // 0 would `% 0` panic in any per-batch dispatch loop. Negatives
+        // can't parse as usize. Both get dropped without falling back —
+        // the rest of the list is still useful.
+        assert_eq!(
+            parse_warmup_batch_sizes(Some("0,1,5"), &[1]),
+            vec![1, 5]
+        );
+        assert_eq!(
+            parse_warmup_batch_sizes(Some("1,-3,5"), &[1]),
+            vec![1, 5]
+        );
+        assert_eq!(
+            parse_warmup_batch_sizes(Some("0"), &[1, 5]),
+            vec![1, 5],
+            "all-zero CSV must fall back to defaults, not return empty"
+        );
+    }
+
+    #[test]
+    fn warmup_batch_sizes_skips_unparseable_keeps_valid() {
+        // Single typo in the middle should not kill warmup for the other
+        // shapes — drop the bad token, keep the rest.
+        assert_eq!(
+            parse_warmup_batch_sizes(Some("1,nope,5"), &[1]),
+            vec![1, 5]
+        );
+        assert_eq!(
+            parse_warmup_batch_sizes(Some("garbage"), &[1, 5]),
+            vec![1, 5],
+            "all-garbage must fall back to defaults so prod still warms"
+        );
+    }
+
+    #[test]
+    fn warmup_batch_sizes_empty_string_falls_back() {
+        // Set-to-empty (not unset — those are different) still gets the
+        // defaults. An operator who unsets warmup has to write something
+        // explicit ("the warmup feature has no documented disable knob"
+        // — same stance as the reranker pool size's `0` rejection).
+        assert_eq!(parse_warmup_batch_sizes(Some(""), &[1, 5]), vec![1, 5]);
+        assert_eq!(
+            parse_warmup_batch_sizes(Some("   "), &[1, 5]),
+            vec![1, 5]
+        );
+        assert_eq!(parse_warmup_batch_sizes(Some(",,"), &[1, 5]), vec![1, 5]);
     }
 }
