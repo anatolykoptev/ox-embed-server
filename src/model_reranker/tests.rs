@@ -191,6 +191,37 @@ fn warmup_runs_for_all_requested_shapes() {
     );
 }
 
+/// Backwards-compat integration test for PR #27 → multi-shape
+/// transition: a model dir containing the legacy unsuffixed
+/// `model_quantized_static.onnx` (no `_b<N>` suffix) must load that
+/// file as the `b=1` static pool. Production gte-reranker-modernbert-
+/// base ships exactly this layout (see PR #27 commit `c5ac856`).
+///
+/// Skips when the ModernBERT static file is not on disk — same SKIP
+/// pattern as the rest of this file.
+#[test]
+fn legacy_unsuffixed_static_loads_as_b1() {
+    const DEFAULT_DIR: &str =
+        "/home/krolik/deploy/krolik-server/models/gte-reranker-modernbert-base";
+    let dir = std::env::var("MODERNBERT_TEST_DIR").unwrap_or_else(|_| DEFAULT_DIR.to_string());
+    let static_legacy = Path::new(&dir).join("model_quantized_static.onnx");
+    let dynamic = Path::new(&dir).join("model_quantized.onnx");
+    let tok = Path::new(&dir).join("tokenizer.json");
+    if !dynamic.exists() || !tok.exists() || !static_legacy.exists() {
+        eprintln!(
+            "SKIP legacy_unsuffixed_static_loads_as_b1: required files not present at {dir}"
+        );
+        return;
+    }
+    let m = RerankerModel::load("gte-modernbert", &dir, 256, true, 1, 1)
+        .expect("load gte-modernbert with legacy static file");
+    let shapes: Vec<usize> = m.static_pool_shapes();
+    assert!(
+        shapes.contains(&1),
+        "legacy unsuffixed static file must register as b=1, got shapes={shapes:?}"
+    );
+}
+
 /// With `pool_size=2`, two threads calling `score_pairs` concurrently
 /// must both succeed and return correctly shaped output. The point is
 /// to prove the pool doesn't serialize through one mutex — a regression

@@ -9,7 +9,12 @@
 //!   - graph-input introspection (Phase 1B — startup self-documenting
 //!     guard against unexpected ONNX graph shapes)
 //!   - pad_id discovery
-use std::path::Path;
+//!   - static-shape ONNX discovery (Phase H.20 + multi-shape extension,
+//!     2026-05-02): scans `<dir>/model_quantized_static_b<N>.onnx` files
+//!     and the legacy unsuffixed `model_quantized_static.onnx` (treated
+//!     as `b=1` for backwards compatibility with PR #27).
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 
@@ -133,21 +138,35 @@ impl RerankerModel {
 
         let pad_id = discover_pad_id(&tokenizer);
 
-        // Phase H.20 — opportunistically load a static-shape sibling
-        // session pool from `<dir>/model_quantized_static.onnx` if it
-        // exists. Convention-based, no env config — operators drop the
-        // file in place and `score_pairs` automatically routes batch=1
-        // calls to it. Pool size hard-coded to 2 (mirrors the dynamic
-        // default and matches the typical 4-core / 4-inflight config).
-        let static_sessions =
-            load_static_session_pool(name, dir_p, opt_level, intra_threads, allow_spinning);
+        // Phase H.20 + 2026-05-02 multi-shape extension —
+        // opportunistically load static-shape sibling session pools from
+        // `<dir>/model_quantized_static_b<N>.onnx` files. Each batch-size
+        // axis (`N`) gets its own session pool keyed in a `BTreeMap`, so
+        // routing in `score_pairs` is a single `.get(&len)` lookup.
+        // Backwards-compat: a legacy unsuffixed `model_quantized_static.onnx`
+        // (the PR #27 convention) is treated as `b=1`.
+        // Convention-based, no env config — operators drop the file in
+        // place and the matching shape activates automatically. Per-shape
+        // pool size hard-coded to 2 (mirrors the dynamic default and
+        // matches the typical 4-core / 4-inflight config).
+        let static_session_pools = load_static_session_pools(
+            name,
+            dir_p,
+            opt_level,
+            intra_threads,
+            allow_spinning,
+        );
+        let static_session_cursors = static_session_pools
+            .keys()
+            .map(|k| (*k, AtomicUsize::new(0)))
+            .collect();
 
         tracing::info!(
             model = %name,
             max_len,
             pad_id,
             padded_model,
-            static_sessions = static_sessions.as_ref().map(|s| s.len()).unwrap_or(0),
+            static_pool_shapes = ?static_session_pools.keys().copied().collect::<Vec<_>>(),
             "loaded reranker model"
         );
 
@@ -159,62 +178,198 @@ impl RerankerModel {
             max_len,
             padded_model,
             pad_id,
-            static_sessions,
-            static_next: AtomicUsize::new(0),
+            static_session_pools,
+            static_session_cursors,
         })
     }
 }
 
-/// Phase H.20 — load `model_quantized_static.onnx` from `dir` as a
-/// fast-path session pool when present. Returns `None` (with debug log)
-/// when the file is absent — that's the normal case for rerankers that
-/// don't have a static export, and not an error.
+/// Per-shape session pool size. PR #27 hard-coded the legacy single-shape
+/// pool to 2. Matches the typical 4-core / 4-inflight config and keeps
+/// the multi-shape memory budget bounded (see
+/// `docs/plans/2026-05-02-multi-shape-static-export.md` § Memory budget).
+/// Hoisted to a module const so the discovery + load split share a
+/// single source of truth.
+const STATIC_POOL_SIZE_PER_SHAPE: usize = 2;
+
+/// Discovery — scan `dir` for static-shape ONNX files and produce a
+/// `(batch_size, path)` map. Pure: no I/O beyond `read_dir`, no session
+/// build, deterministic ordering (`BTreeMap` sorts by key).
 ///
-/// Logs a `warn` when the file IS present but session creation fails
-/// (e.g. corrupted ONNX, unsupported opset) so the fallback to the
-/// dynamic-only path is visible in ops, not silent. In that case the
-/// model still serves correctly via the dynamic pool.
-fn load_static_session_pool(
+/// Recognises:
+///   - `model_quantized_static_b<N>.onnx` — explicit batch axis (N>=1).
+///   - `model_quantized_static.onnx` — legacy PR #27 convention,
+///     treated as `b=1`.
+///
+/// If both an explicit `_b1` file AND the legacy unsuffixed file exist,
+/// the explicit file wins (explicit > implicit) and the duplicate is
+/// logged at `warn`. Files matching the prefix but failing the
+/// `_b<digits>` regex (e.g. `_btest`, `_b1.bak`) are ignored with a
+/// `debug` log.
+///
+/// Returns an empty map when no static files are present — that's the
+/// expected default for any reranker without an export, not an error.
+fn discover_static_shape_files(name: &str, dir: &Path) -> BTreeMap<usize, PathBuf> {
+    const PREFIX_EXPLICIT: &str = "model_quantized_static_b";
+    const LEGACY_FILENAME: &str = "model_quantized_static.onnx";
+
+    let mut out: BTreeMap<usize, PathBuf> = BTreeMap::new();
+
+    // Phase 1 — scan the directory for `model_quantized_static_b<N>.onnx`.
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::debug!(
+                model = %name,
+                dir = %dir.display(),
+                error = %e,
+                "static-shape discovery: read_dir failed (treating as empty)"
+            );
+            return out;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !file_name.starts_with(PREFIX_EXPLICIT) || !file_name.ends_with(".onnx") {
+            continue;
+        }
+        // Carve out the `<N>` between the prefix and `.onnx`.
+        let mid = &file_name[PREFIX_EXPLICIT.len()..file_name.len() - ".onnx".len()];
+        match mid.parse::<usize>() {
+            Ok(0) => {
+                tracing::warn!(
+                    model = %name,
+                    path = %path.display(),
+                    "static-shape file has batch=0 — ignoring (no zero-batch graph is meaningful)"
+                );
+            }
+            Ok(n) => {
+                if let Some(prev) = out.insert(n, path.clone()) {
+                    tracing::warn!(
+                        model = %name,
+                        batch = n,
+                        kept = %path.display(),
+                        dropped = %prev.display(),
+                        "duplicate static-shape file for same batch size — keeping last-seen"
+                    );
+                }
+            }
+            Err(_) => {
+                tracing::debug!(
+                    model = %name,
+                    path = %path.display(),
+                    suffix = %mid,
+                    "static-shape filename matches prefix but suffix is not a number — ignoring"
+                );
+            }
+        }
+    }
+
+    // Phase 2 — legacy PR #27 convention: unsuffixed file = batch=1.
+    let legacy = dir.join(LEGACY_FILENAME);
+    if legacy.exists() {
+        match out.insert(1, legacy.clone()) {
+            None => {
+                // Most common path: only the legacy file is present, no
+                // explicit `_b1`. Use it as `b=1` silently.
+            }
+            Some(replaced) => {
+                // Conflict: explicit `_b1.onnx` was already in the map.
+                // Restore the explicit file (explicit > implicit) and
+                // warn about the duplicate so ops can clean up.
+                tracing::warn!(
+                    model = %name,
+                    explicit = %replaced.display(),
+                    legacy = %legacy.display(),
+                    "both model_quantized_static_b1.onnx and model_quantized_static.onnx present — \
+                     keeping the explicit _b1 file; remove the legacy file to silence this warning"
+                );
+                out.insert(1, replaced);
+            }
+        }
+    }
+
+    out
+}
+
+/// Phase H.20 + 2026-05-02 multi-shape extension — load every
+/// `model_quantized_static_b<N>.onnx` discovered under `dir` as a
+/// per-shape session pool. Returns an empty `BTreeMap` (with `debug`
+/// log) when no static files are present — that's the normal case for
+/// rerankers that don't have a static export, and not an error.
+///
+/// Logs a `warn` (and skips that shape) when a discovered file fails
+/// session creation (e.g. corrupted ONNX, unsupported opset) so the
+/// fallback to the dynamic-only path for that batch size is visible in
+/// ops, not silent. The model still serves correctly via the dynamic
+/// pool for the failed shape; other successfully loaded shapes are
+/// unaffected.
+fn load_static_session_pools(
     name: &str,
     dir_p: &Path,
     opt_level: GraphOptimizationLevel,
     intra_threads: usize,
     allow_spinning: bool,
-) -> Option<Vec<Mutex<Session>>> {
-    let static_path = dir_p.join("model_quantized_static.onnx");
-    if !static_path.exists() {
+) -> BTreeMap<usize, Vec<Mutex<Session>>> {
+    let discovered = discover_static_shape_files(name, dir_p);
+    if discovered.is_empty() {
         tracing::debug!(
             model = %name,
-            "no static-shape ONNX sibling found — dynamic-only inference path"
+            "no static-shape ONNX siblings found — dynamic-only inference path"
         );
-        return None;
+        return BTreeMap::new();
     }
-    tracing::info!(
-        model = %name,
-        path = %static_path.display(),
-        "loading static-shape ONNX fast-path session pool"
-    );
-    // Pool size 2 — same default as the dynamic pool. Memory cost on
-    // ARM Neoverse-N1 / 8 GiB container: ~510 MiB extra for ModernBERT
-    // (255 MiB × 2). Fits under the 3 GiB shared arena cap (Phase H.16).
-    match build_session_pool(
-        name,
-        &static_path,
-        opt_level,
-        intra_threads,
-        2,
-        allow_spinning,
-    ) {
-        Ok(p) => Some(p),
-        Err(e) => {
-            tracing::warn!(
-                model = %name,
-                error = %e,
-                "static-shape ONNX session creation failed — falling back to dynamic-only"
-            );
-            None
+
+    let mut pools: BTreeMap<usize, Vec<Mutex<Session>>> = BTreeMap::new();
+    for (batch, path) in discovered {
+        tracing::info!(
+            model = %name,
+            batch,
+            path = %path.display(),
+            pool_size = STATIC_POOL_SIZE_PER_SHAPE,
+            "loading static-shape ONNX fast-path session pool"
+        );
+        // Pool size hard-coded to STATIC_POOL_SIZE_PER_SHAPE — same
+        // default as the dynamic pool. Memory cost on ARM Neoverse-N1 /
+        // 8 GiB container: ~510 MiB per shape for ModernBERT
+        // (255 MiB × 2). Fits under the 3 GiB shared arena cap (Phase H.16).
+        // See docs/plans/2026-05-02-multi-shape-static-export.md
+        // § Memory budget for the {b=1, b=5} math.
+        match build_session_pool(
+            name,
+            &path,
+            opt_level,
+            intra_threads,
+            STATIC_POOL_SIZE_PER_SHAPE,
+            allow_spinning,
+        ) {
+            Ok(p) => {
+                tracing::info!(
+                    model = %name,
+                    batch,
+                    count = p.len(),
+                    "loaded static session pool: model={} batch={} count={}",
+                    name,
+                    batch,
+                    p.len()
+                );
+                pools.insert(batch, p);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    model = %name,
+                    batch,
+                    error = %e,
+                    "static-shape ONNX session creation failed — \
+                     falling back to dynamic for this batch size"
+                );
+            }
         }
     }
+    pools
 }
 
 /// Build N independent ONNX sessions over the same model file. ORT loads
@@ -335,4 +490,144 @@ fn discover_pad_id(tokenizer: &Tokenizer) -> u32 {
                 .or_else(|| tokenizer.token_to_id("[PAD]"))
                 .unwrap_or(0)
         })
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    //! Unit tests for `discover_static_shape_files`. The discovery
+    //! function is pure (only `read_dir` + filename parsing — no ORT
+    //! session build), so synthetic temp directories with empty
+    //! placeholder files are sufficient to drive the parser through
+    //! every branch. No real ONNX bytes required.
+    //!
+    //! Tests cover:
+    //!   - empty dir → empty map
+    //!   - single explicit file `_b1.onnx` → `{1: ...}`
+    //!   - multiple explicit files `_b1.onnx + _b5.onnx` → `{1: ..., 5: ...}`
+    //!   - legacy unsuffixed file → treated as `b=1`
+    //!   - legacy + explicit `_b1` both present → explicit wins
+    //!   - filename matches prefix but suffix is non-numeric → ignored
+    //!   - explicit `_b0.onnx` → ignored (not meaningful)
+    //!   - dir does not exist → empty map (no panic)
+    //!
+    //! Integration tests for the full session-pool load + score path
+    //! live in `tests.rs`, gated on a real ModernBERT ONNX file being
+    //! present on disk.
+    use std::fs::File;
+
+    use super::*;
+
+    fn touch(dir: &Path, name: &str) -> PathBuf {
+        let p = dir.join(name);
+        File::create(&p).expect("create test file");
+        p
+    }
+
+    #[test]
+    fn discovery_empty_dir_returns_empty_map() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let map = discover_static_shape_files("test-model", tmp.path());
+        assert!(
+            map.is_empty(),
+            "no files in dir → no static pools, got {map:?}"
+        );
+    }
+
+    #[test]
+    fn discovery_finds_explicit_b1_only() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let p1 = touch(tmp.path(), "model_quantized_static_b1.onnx");
+        let map = discover_static_shape_files("test-model", tmp.path());
+        assert_eq!(map.len(), 1, "exactly one shape discovered");
+        assert_eq!(map.get(&1), Some(&p1), "b=1 must point at _b1 file");
+    }
+
+    #[test]
+    fn discovery_finds_b1_and_b5() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let p1 = touch(tmp.path(), "model_quantized_static_b1.onnx");
+        let p5 = touch(tmp.path(), "model_quantized_static_b5.onnx");
+        // Realistic dir also has the dynamic + tokenizer files; they
+        // must not appear in the discovery output.
+        touch(tmp.path(), "model_quantized.onnx");
+        touch(tmp.path(), "tokenizer.json");
+
+        let map = discover_static_shape_files("test-model", tmp.path());
+        assert_eq!(map.len(), 2, "two static shapes discovered, got {map:?}");
+        assert_eq!(map.get(&1), Some(&p1));
+        assert_eq!(map.get(&5), Some(&p5));
+        // BTreeMap iteration is sorted — tests that depend on ordering
+        // (logging, deterministic load sequence) get it for free.
+        let keys: Vec<usize> = map.keys().copied().collect();
+        assert_eq!(keys, vec![1, 5], "keys must be sorted ascending");
+    }
+
+    #[test]
+    fn discovery_legacy_unsuffixed_treated_as_b1() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // PR #27 convention — unsuffixed file. Backwards-compat
+        // contract: existing prod deployments keep working with no
+        // operator action on this branch.
+        let legacy = touch(tmp.path(), "model_quantized_static.onnx");
+        let map = discover_static_shape_files("test-model", tmp.path());
+        assert_eq!(map.len(), 1);
+        assert_eq!(
+            map.get(&1),
+            Some(&legacy),
+            "legacy unsuffixed file is treated as b=1 for PR #27 backwards compat"
+        );
+    }
+
+    #[test]
+    fn discovery_explicit_b1_wins_over_legacy_when_both_present() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _legacy = touch(tmp.path(), "model_quantized_static.onnx");
+        let explicit = touch(tmp.path(), "model_quantized_static_b1.onnx");
+        let map = discover_static_shape_files("test-model", tmp.path());
+        assert_eq!(map.len(), 1, "still one b=1 entry, not two");
+        assert_eq!(
+            map.get(&1),
+            Some(&explicit),
+            "explicit _b1 file takes precedence over the unsuffixed legacy file"
+        );
+    }
+
+    #[test]
+    fn discovery_ignores_non_numeric_suffix() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Stray files matching the prefix but not the `_b<digits>.onnx`
+        // shape — must not panic, must not appear.
+        touch(tmp.path(), "model_quantized_static_btest.onnx");
+        touch(tmp.path(), "model_quantized_static_b1.onnx.bak");
+        // A real `_b1` file SHOULD still be found.
+        let p1 = touch(tmp.path(), "model_quantized_static_b1.onnx");
+        let map = discover_static_shape_files("test-model", tmp.path());
+        assert_eq!(map.len(), 1, "non-numeric / .bak suffixes ignored");
+        assert_eq!(map.get(&1), Some(&p1));
+    }
+
+    #[test]
+    fn discovery_ignores_b0() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // `b=0` is not a meaningful graph shape; reject explicitly so a
+        // typo like `_b0` doesn't load a corrupted graph and crash at
+        // first inference.
+        touch(tmp.path(), "model_quantized_static_b0.onnx");
+        let map = discover_static_shape_files("test-model", tmp.path());
+        assert!(
+            map.is_empty(),
+            "b=0 must not produce a discovered shape, got {map:?}"
+        );
+    }
+
+    #[test]
+    fn discovery_missing_dir_returns_empty_map_no_panic() {
+        // Non-existent dir → debug log, empty map. Loader stays
+        // dynamic-only without aborting model boot.
+        let map = discover_static_shape_files(
+            "test-model",
+            Path::new("/definitely/not/a/real/path/embed-server-tests"),
+        );
+        assert!(map.is_empty());
+    }
 }
