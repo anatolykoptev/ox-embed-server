@@ -78,6 +78,23 @@ pub struct RerankerModel {
     /// so other reranker kinds (e.g. bge-reranker-base — BERT, pad_id=0)
     /// don't need a hand-coded override.
     pub(super) pad_id: u32,
+    /// Phase H.20 — optional fast-path session pool with FIXED static shape
+    /// `[1, max_len]`. Loaded only if `<dir>/model_quantized_static.onnx`
+    /// exists alongside the dynamic file. ORT pre-folds 700+ runtime
+    /// shape-computation nodes into constants, giving 1.74x speedup
+    /// per-call vs the dynamic graph (bench: 1359ms → 781ms on
+    /// gte-reranker-modernbert-base, batch=1, seq=256, ARM Neoverse-N1).
+    ///
+    /// Routing: `score_pairs` checks the actual batch size — a single-pair
+    /// call (batch=1, the dominant prod path for memdb-go's per-pair
+    /// rerank loop) goes through the static pool; multi-pair calls
+    /// (batch>1) keep using the dynamic pool because the static graph's
+    /// input shape is literally `[1, ?]` and ORT will reject `[N, ?]`.
+    pub(super) static_sessions: Option<Vec<Mutex<Session>>>,
+    /// Round-robin cursor for the static pool. Separate from `next` so
+    /// the two pools cycle independently and a busy dynamic pool can't
+    /// stall the static fast path.
+    pub(super) static_next: AtomicUsize,
 }
 
 impl RerankerModel {
@@ -145,6 +162,19 @@ impl RerankerModel {
             return Ok(vec![]);
         }
 
+        // Phase H.20 fast path: route batch=1 calls to the static-shape
+        // session if loaded. The static graph is `[1, max_len]` fixed —
+        // ORT pre-folded ~700 runtime shape ops into constants giving
+        // 1.74× speedup vs the dynamic graph (1359ms → 781ms standalone
+        // bench, gte-reranker-modernbert-base, ARM Neoverse-N1).
+        // batch>1 falls through to the dynamic path below because the
+        // static graph rejects shapes other than `[1, max_len]`.
+        if token_ids.len() == 1
+            && let Some(static_sessions) = &self.static_sessions
+        {
+            return self.score_pairs_static(token_ids, static_sessions);
+        }
+
         let max_seq = token_ids
             .iter()
             .map(|v| v.len())
@@ -210,6 +240,70 @@ impl RerankerModel {
             ));
         }
         Ok((0..batch).map(|i| raw[[i, 0]]).collect())
+    }
+
+    /// Phase H.20 fast-path inference for batch=1 calls. Uses the
+    /// static-shape session pool (`[1, max_len]` fixed graph) which
+    /// avoids the ~700 runtime shape-computation nodes of the dynamic
+    /// graph. Always pads to `self.max_len` (no per-call max_seq calc)
+    /// because that's literally the only shape the static graph accepts.
+    ///
+    /// Trade-off: short single-pair calls pad to full max_len even when
+    /// the actual content is shorter (lose padding-waste advantage of
+    /// the dynamic path). The 1.74× per-call speedup more than offsets
+    /// this for typical seq>=64; for seq<32 the dynamic path may be
+    /// faster but the difference is sub-millisecond and not worth
+    /// switching back per call.
+    fn score_pairs_static(
+        &self,
+        token_ids: &[Vec<u32>],
+        static_sessions: &[Mutex<Session>],
+    ) -> Result<Vec<f32>, String> {
+        debug_assert_eq!(token_ids.len(), 1);
+        let static_seq = self.max_len;
+        let real_tokens = token_ids[0].len().min(static_seq);
+
+        let (ids, mask_i64, _tti) =
+            pool::build_tensors_from_ids(token_ids, 1, static_seq, self.pad_id);
+
+        let ids_arr = Array2::from_shape_vec([1, static_seq], ids)
+            .map_err(|e| format!("static ids shape: {e}"))?;
+        let mask_arr = Array2::from_shape_vec([1, static_seq], mask_i64)
+            .map_err(|e| format!("static mask shape: {e}"))?;
+
+        let ids_tensor =
+            Tensor::from_array(ids_arr).map_err(|e| format!("static ids tensor: {e}"))?;
+        let mask_tensor =
+            Tensor::from_array(mask_arr).map_err(|e| format!("static mask tensor: {e}"))?;
+
+        let idx = self.static_next.fetch_add(1, Ordering::Relaxed) % static_sessions.len();
+        let acquire_start = Instant::now();
+        let mut session = static_sessions[idx]
+            .lock()
+            .map_err(|e| format!("lock static session #{idx}: {e}"))?;
+        crate::metrics::record_rerank_pool_acquire(&self.name, acquire_start.elapsed());
+
+        let inference_start = Instant::now();
+        let outputs = session
+            .run(ort::inputs! {
+                "input_ids" => ids_tensor,
+                "attention_mask" => mask_tensor,
+            })
+            .map_err(|e| format!("static reranker inference: {e}"))?;
+        crate::metrics::record_rerank_inference(&self.name, inference_start.elapsed(), 1);
+        crate::metrics::record_rerank_padding_waste(&self.name, static_seq, real_tokens);
+
+        let raw = outputs[0]
+            .try_extract_array::<f32>()
+            .map_err(|e| format!("static extract logits: {e}"))?;
+        let shape = raw.shape();
+        if shape.len() != 2 || shape[0] != 1 || shape[1] != 1 {
+            return Err(format!(
+                "unexpected static reranker output shape: {:?}, expected [1, 1]",
+                shape
+            ));
+        }
+        Ok(vec![raw[[0, 0]]])
     }
 
     /// Run a tiny dummy inference on every session in the pool to force
