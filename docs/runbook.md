@@ -131,6 +131,68 @@ groups:
   build is taking 40 minutes, check `# syntax=docker/dockerfile:1.4` is
   the first line and `--mount=type=cache,target=/...` directives intact.
 
+## Static-shape reranker fast-path (Phase H.20 + 2026-05-02 multi-shape)
+
+The reranker loader scans its model dir for static-shape ONNX siblings
+and routes `score_pairs` calls whose batch size exactly matches an
+exported shape through the matching session pool. Exact-match only —
+no pad-up, no fallback shape coercion. Misses fall through to the
+dynamic pool unchanged.
+
+**Filename convention** (`src/model_reranker/load.rs`):
+
+| File                               | Activates             |
+|------------------------------------|-----------------------|
+| `model_quantized_static_b1.onnx`   | batch=1 fast path     |
+| `model_quantized_static_b5.onnx`   | batch=5 fast path     |
+| `model_quantized_static_b<N>.onnx` | batch=N fast path     |
+| `model_quantized_static.onnx`      | batch=1 (PR #27 legacy, kept for backwards compat) |
+
+If both `model_quantized_static_b1.onnx` and `model_quantized_static.onnx`
+exist, the explicit `_b1` file wins and a `warn` log flags the
+duplicate.
+
+### Adding a new shape
+
+1. Run `scripts/export_static_modernbert.sh` on a dev box (NOT on
+   krolik — the export saturates CPU and disk for tens of minutes):
+   ```bash
+   BATCH_SIZES="1 5" ./scripts/export_static_modernbert.sh
+   ```
+2. rsync the resulting files into krolik's model dir:
+   ```bash
+   rsync -avh ./gte-reranker-modernbert-base-static/model_quantized_static_b*.onnx \
+     krolik:/home/krolik/deploy/krolik-server/models/gte-reranker-modernbert-base/
+   ```
+3. Recreate the embed-server container:
+   ```bash
+   ssh krolik 'cd ~/deploy/krolik-server && docker compose up -d --no-deps --force-recreate embed-server'
+   ```
+4. Confirm the new shapes loaded:
+   ```bash
+   ssh krolik 'docker logs embed-server --since 1m | grep "static-shape ONNX"'
+   ```
+   One info line per shape: `loading static-shape ONNX fast-path
+   session pool batch=N path=...`.
+
+### Validating impact
+
+Use `bench.py` to compare before/after — pin the same `(model, size,
+docs_per_req)` knobs across the two runs. PR #27's prod measurement
+showed ~1.04× uplift over dynamic on quantized int8 ModernBERT at
+batch=1, vs 1.74× standalone — the int8 quant/dequant cost absorbs
+most of the static-graph win. Validate at batch=5 before promising
+the optimization to memdb-go. A negative result is fine; revert is
+`rm` on the static file.
+
+### Memory budget
+
+Each ModernBERT static session ~255 MiB; pool size 2 = ~510 MiB per
+shape. Default {b=1} = ~1 GiB total. With {b=1, b=5} = ~1.5 GiB.
+Container shared CPU arena cap is 3 GiB (Phase H.16), with embed +
+SPLADE consuming the rest. Don't enable more than {1, 5} without
+re-doing the budget math.
+
 ## Future work
 
 - Model swap candidate: `nomic-ai/CodeRankEmbed` (137M, Apache 2.0, code
