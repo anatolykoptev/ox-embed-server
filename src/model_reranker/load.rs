@@ -36,6 +36,21 @@ fn parse_opt_level() -> GraphOptimizationLevel {
     }
 }
 
+/// Parse `ORT_INTRA_OP_SPINNING` — controls whether ORT's intra-op thread
+/// pool busy-waits before parking. Default `false` because embed-server
+/// shares a 4-core ARM Neoverse-N1 host with memdb-go, postgres, and
+/// other services; busy-waiting wastes CPU that other services need
+/// during their own spikes. Flip to `1` only on dedicated-CPU hardware
+/// where the ~5-15% latency reduction justifies a 100%-of-allocated-cores
+/// idle CPU floor while inference is in flight. Per ORT docs: spinning
+/// faster on tight inference loops, worse on bursty multi-tenant boxes.
+fn parse_intra_op_spinning() -> bool {
+    matches!(
+        std::env::var("ORT_INTRA_OP_SPINNING").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
+
 impl RerankerModel {
     /// Load the ONNX session(s) + tokenizer from `dir`. Expects
     /// `model_quantized.onnx` and `tokenizer.json` at the top level —
@@ -84,15 +99,24 @@ impl RerankerModel {
         }
 
         let opt_level = parse_opt_level();
+        let allow_spinning = parse_intra_op_spinning();
         tracing::info!(
             path = %onnx_path.display(),
             ?opt_level,
             pool_size,
             intra_threads,
+            allow_spinning,
             "creating reranker ONNX session(s)"
         );
 
-        let sessions = build_session_pool(name, &onnx_path, opt_level, intra_threads, pool_size)?;
+        let sessions = build_session_pool(
+            name,
+            &onnx_path,
+            opt_level,
+            intra_threads,
+            pool_size,
+            allow_spinning,
+        )?;
         introspect_graph_inputs(name, &sessions)?;
 
         tracing::info!(path = %tok_path.display(), "loading reranker tokenizer");
@@ -139,6 +163,7 @@ fn build_session_pool(
     opt_level: GraphOptimizationLevel,
     intra_threads: usize,
     pool_size: usize,
+    allow_spinning: bool,
 ) -> Result<Vec<Mutex<Session>>, String> {
     let mut sessions: Vec<Mutex<Session>> = Vec::with_capacity(pool_size);
     for i in 0..pool_size {
@@ -151,6 +176,12 @@ fn build_session_pool(
             .map_err(|e| format!("set opt level #{i}: {e}"))?
             .with_intra_threads(intra_threads)
             .map_err(|e| format!("set threads #{i}: {e}"))?
+            // Phase 3B (Plan 2026-05-01) — gate ORT's intra-op spin via env.
+            // `OMP_WAIT_POLICY=PASSIVE` only governs OpenMP, NOT ORT's own
+            // intra pool — explicit `with_intra_op_spinning(false)` is the
+            // only way to stop the spin on a shared multi-tenant CPU.
+            .with_intra_op_spinning(allow_spinning)
+            .map_err(|e| format!("set intra spinning #{i}: {e}"))?
             // 2026-05-01 — kept disabled. Tried `with_memory_pattern(padded_model)`
             // for the padded gte-multi case but bench showed regression on
             // n=10 batch (3.55s → 6.87s). Hypothesis: even with padded

@@ -73,7 +73,7 @@ def _post(url: str, payload: dict) -> float:
         url, data=data, headers={"Content-Type": "application/json"}
     )
     t0 = time.monotonic()
-    with urllib.request.urlopen(req, timeout=120) as r:
+    with urllib.request.urlopen(req, timeout=300) as r:
         r.read()
     return (time.monotonic() - t0) * 1000.0
 

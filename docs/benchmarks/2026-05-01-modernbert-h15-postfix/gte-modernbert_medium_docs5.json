@@ -1,0 +1,25 @@
+{
+  "kind": "rerank",
+  "size": "medium",
+  "url": "http://127.0.0.1:8082/v1/rerank",
+  "model": "gte-modernbert",
+  "request_shape": {
+    "endpoint": "/v1/rerank",
+    "docs_per_req": 5,
+    "query_chars": 25,
+    "doc_chars": 660
+  },
+  "scenarios": [
+    {
+      "concurrency": 1,
+      "iterations": 5,
+      "wall_ms": 28594.1,
+      "throughput_req_per_s": 0.17,
+      "p50_ms": 5808.7,
+      "p90_ms": 6046.5,
+      "p99_ms": 6046.5,
+      "avg_ms": 5718.7,
+      "worst_ms": 6046.5
+    }
+  ]
+}

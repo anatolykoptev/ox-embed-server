@@ -52,18 +52,42 @@ pub fn register_shared_cpu_arena() -> Result<(), String> {
         return Err("CreateCpuMemoryInfo returned non-null status".into());
     }
 
-    // 2. Arena cfg with extend_strategy = kSameAsRequested (=1). The other
-    //    fields use ORT defaults (-1 sentinels): initial_chunk_size_bytes
-    //    stays at 1 MiB, max_dead_bytes_per_chunk at 128 MiB. We don't cap
-    //    max_mem since we still want arena reuse within the requested size;
-    //    the OS / cgroup memory limit is the real ceiling.
+    // 2. Arena cfg — Phase H.16 (2026-05-01) hardened bounds.
+    //
+    // History: previous config used `max_mem=0` (unlimited) with the
+    // theory that kSameAsRequested would prevent power-of-two overshoot
+    // and cgroup cap was the real ceiling. **That theory was wrong.**
+    // kSameAsRequested removes per-extend rounding but does NOT cap total
+    // arena ownership — every new (batch, seq_len) shape triggers a
+    // permanent extend, and BFCArena never returns owned chunks until the
+    // dead-bytes-per-chunk threshold is crossed (default 128 MiB — too
+    // generous on an 8 GiB container). Empirical: arena reached 12.3 GiB
+    // on an 8 GiB cgroup → kernel reclaim thrashed, ce_rerank latency
+    // spiked from 1 s to 15 s under bench load (CLAUDE.md memory note
+    // 2026-04-29).
+    //
+    // The fix bounds growth at the allocator layer, not just the cgroup:
+    //   - `max_mem = 3 GiB` — hard ceiling. Across 5 sessions sharing
+    //     this arena. Container has 8 GiB; deduct ~3.6 GiB model weights
+    //     + ~0.7 GiB process overhead + ~0.5 GiB headroom = ~3 GiB
+    //     safely available. A new allocation that won't fit returns
+    //     ORT OOM (HTTP 500 to the client), which is strictly better
+    //     than cgroup OOM-kill (whole container restarts, all in-flight
+    //     requests fail).
+    //   - `extend_strategy = kSameAsRequested` — keep. With max_mem cap,
+    //     this avoids power-of-two overshoot wasting precious quota.
+    //   - `initial_chunk_size_bytes = 1 MiB` — explicit (was default sentinel).
+    //   - `max_dead_bytes_per_chunk = 32 MiB` — aggressive vs default 128 MiB.
+    //     Forces BFCArena to consolidate dead memory back into free chunks
+    //     sooner, so we reuse instead of asking OS for more under variable
+    //     batch shapes (the workload that exposed the bug).
     let mut arena_cfg: *mut OrtArenaCfg = ptr::null_mut();
     let status = unsafe {
         (api.CreateArenaCfg)(
-            0,  // max_mem (0 = unlimited)
-            1,  // arena_extend_strategy = kSameAsRequested
-            -1, // initial_chunk_size_bytes (default)
-            -1, // max_dead_bytes_per_chunk (default)
+            3 * 1024 * 1024 * 1024, // max_mem = 3 GiB
+            1,                      // arena_extend_strategy = kSameAsRequested
+            1024 * 1024,            // initial_chunk_size_bytes = 1 MiB
+            32 * 1024 * 1024,       // max_dead_bytes_per_chunk = 32 MiB
             &mut arena_cfg,
         )
     };
