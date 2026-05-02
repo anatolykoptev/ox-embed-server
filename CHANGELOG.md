@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.6.0](https://github.com/anatolykoptev/ox-embed-server/compare/embed-server-v0.5.0...embed-server-v0.6.0) (2026-05-02)
+
+
+### Features
+
+* **otel:** distributed tracing via OTLP gRPC to Jaeger (Phase H.18) ([#25](https://github.com/anatolykoptev/ox-embed-server/issues/25)) ([fec365f](https://github.com/anatolykoptev/ox-embed-server/commit/fec365f170175996ad3f70e4c7d5dd5cd20458f9))
+* **rerank:** Phase H — RERANKER_BATCH_MAX, semaphore, ModernBERT mount, token cache ([#21](https://github.com/anatolykoptev/ox-embed-server/issues/21)) ([f2092cd](https://github.com/anatolykoptev/ox-embed-server/commit/f2092cd167fd975c80424dbdd0a706907f030e64))
+* **rerank:** static-shape ONNX fast-path for batch=1 calls (Phase H.20) ([#27](https://github.com/anatolykoptev/ox-embed-server/issues/27)) ([c5ac856](https://github.com/anatolykoptev/ox-embed-server/commit/c5ac856570cf19acc6f22996d2442562a72157cf))
+
+
+### Bug Fixes
+
+* **arena:** cap shared CPU arena at 3 GiB + Phase 3B spin knob + Phase 2 baseline data ([#23](https://github.com/anatolykoptev/ox-embed-server/issues/23)) ([df7b0ca](https://github.com/anatolykoptev/ox-embed-server/commit/df7b0ca2ca14acf76a853545d38109d3c5291b80))
+* **arena:** re-enable memory_pattern + Phase H.17 root-cause autopsy ([#24](https://github.com/anatolykoptev/ox-embed-server/issues/24)) ([fab82e5](https://github.com/anatolykoptev/ox-embed-server/commit/fab82e5d98898f78dd0c4d0203630034f8e2ae94))
+* disable ONNX memory pattern for all models — fixes unbounded arena growth ([#19](https://github.com/anatolykoptev/ox-embed-server/issues/19)) ([bc71be0](https://github.com/anatolykoptev/ox-embed-server/commit/bc71be0eaa6e6a640e27eeeec09e9664e53f346b))
+* **otel:** re-attach EnvFilter to fmt subscriber (Phase H.18 hot-fix) ([#26](https://github.com/anatolykoptev/ox-embed-server/issues/26)) ([eec5cf3](https://github.com/anatolykoptev/ox-embed-server/commit/eec5cf348dc289dd67a4d521a6d38f47a72731c4))
+* shared CPU arena allocator with kSameAsRequested extend strategy ([#20](https://github.com/anatolykoptev/ox-embed-server/issues/20)) ([65b85c0](https://github.com/anatolykoptev/ox-embed-server/commit/65b85c0cd8481a791951a629bfc41126cd34aeb0))
+
 ## [0.3.0](https://github.com/anatolykoptev/ox-embed-server/compare/embed-server-v0.2.0...embed-server-v0.3.0) (2026-04-18)
 
 
