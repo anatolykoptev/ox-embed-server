@@ -5,9 +5,10 @@
 //! `Session::with_optimization_level(Level3)` runs constant folding,
 //! redundant-node elimination, layout transforms, etc. on every model load.
 //! For a ~340-550 MB reranker / e5-large model on ARM Neoverse-N1 this is
-//! ~5-10 sec of CPU work *per session*. With a 2-session pool × 2 rerankers
-//! + 1 embedder + 1 splade, container restart pays ~30-60 sec of repeat
-//! optimization work. ORT exposes `with_optimized_model_path(p)` which
+//! ~5-10 sec of CPU work *per session*. With a 2-session pool times 2
+//! rerankers, plus 1 embedder, plus 1 splade, container restart pays
+//! ~30-60 sec of repeat optimization work. ORT exposes
+//! `with_optimized_model_path(p)` which
 //! serializes the post-optimization graph as a side effect of the first
 //! load; subsequent loads can read that file directly with
 //! `GraphOptimizationLevel::Disable` and skip the optimization passes.
@@ -107,9 +108,7 @@ impl CacheDir {
     pub fn cache_path(&self, source: &Path) -> Option<PathBuf> {
         let basename = source.file_name()?.to_str()?;
         let mtime_ns = mtime_ns(source)?;
-        Some(self.0.join(format!(
-            "{basename}.{mtime_ns}.optimized.onnx"
-        )))
+        Some(self.0.join(format!("{basename}.{mtime_ns}.optimized.onnx")))
     }
 }
 
@@ -244,7 +243,9 @@ pub fn observe_post_commit(plan: &LoadPlan, elapsed_ms: u128) {
             );
         }
         LoadPlan::Miss { target } => {
-            let size_mib = std::fs::metadata(target).ok().map(|m| m.len() / (1024 * 1024));
+            let size_mib = std::fs::metadata(target)
+                .ok()
+                .map(|m| m.len() / (1024 * 1024));
             match size_mib {
                 Some(mib) => tracing::info!(
                     target = %target.display(),
@@ -532,8 +533,7 @@ mod tests {
         let plan_cold = LoadPlan::NoCache;
         let t0 = Instant::now();
         let builder = Session::builder().unwrap();
-        let builder =
-            apply_plan(builder, &plan_cold, GraphOptimizationLevel::Level3).unwrap();
+        let builder = apply_plan(builder, &plan_cold, GraphOptimizationLevel::Level3).unwrap();
         let _s = builder
             .with_intra_threads(1)
             .unwrap()
