@@ -437,10 +437,18 @@ impl RerankerModel {
                 ids[..len].to_vec()
             })
             .collect();
-        // All rows tokenize identically (same query + doc), so max =
-        // their common length. Compute defensively in case a future
-        // tokenizer change breaks that assumption.
-        let max_seq = token_ids.iter().map(|v| v.len()).max().unwrap_or(0);
+        // Pad to `self.max_len` so warmup compiles ORT kernels and primes
+        // BFCArena for the **worst-case prod shape**. Warming at the
+        // natural ~8-token tokenizer output of the dummy text leaves
+        // production traffic - which routinely hits `[batch, max_len]`
+        // when docs are long - entirely cold; the first real request
+        // then re-pays kernel-binding + arena-extend cost (observed
+        // post-H.21 deploy: first prod batch=5 = 2683ms vs steady 1672ms).
+        // `build_tensors_from_ids` fills positions beyond the real token
+        // count with `pad_id` and sets `attention_mask=0`, which is byte-
+        // for-byte identical to what `score_pairs` produces when prod
+        // tokens fill less than `max_len`.
+        let max_seq = self.max_len;
         let (ids, mask_i64, _tti) =
             pool::build_tensors_from_ids(&token_ids, batch, max_seq, self.pad_id);
 
