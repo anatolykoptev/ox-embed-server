@@ -146,6 +146,51 @@ fn score_pairs_empty_input_returns_empty() {
     assert!(scores.is_empty());
 }
 
+/// `warmup(&[1])` and `warmup(&[1, 5])` must both return Ok and not
+/// touch state visible to subsequent inference calls. SKIPs without
+/// model files — the integration coverage we get is "the new
+/// shape-list signature actually executes the inference path the same
+/// way score_pairs does." Parser-level coverage of the env-var
+/// parsing lives in `config::tests::warmup_batch_sizes_*`.
+#[test]
+fn warmup_runs_for_all_requested_shapes() {
+    let Some(m) = load_reranker_or_skip() else {
+        return;
+    };
+    // Single-shape call — parity with the legacy single-warmup path
+    // (which used to be `warmup()` with no args, hard-coded batch=2).
+    m.warmup(&[1]).expect("warmup at batch=1");
+    // Multi-shape call — the load-bearing new behaviour. Both shapes
+    // should compile their kernels; the function returns Ok even if
+    // one shape internally fails (best-effort logging contract).
+    m.warmup(&[1, 5]).expect("warmup at batches [1, 5]");
+    // Empty shape list is a no-op (logged as a warning) — must not
+    // error or panic. Defensive coverage: `parse_warmup_batch_sizes`
+    // already falls back to defaults on empty input, so production
+    // can't reach here, but direct callers (future code paths,
+    // tests) shouldn't have to know that.
+    m.warmup(&[]).expect("warmup with empty shapes");
+    // Post-warmup, inference still works at both shapes — assert the
+    // warmup didn't somehow pollute session state. Uses the same
+    // semantic spread `score_pairs_relevant_outscores_unrelated`
+    // checks (relevant doc beats unrelated by >3.0 logits).
+    let ids = m
+        .tokenize_pairs(
+            "what is a cat",
+            &[
+                "a cat is a small domestic feline mammal".into(),
+                "the price of oil dropped yesterday".into(),
+            ],
+        )
+        .expect("post-warmup tokenize");
+    let scores = m.score_pairs(&ids).expect("post-warmup score");
+    assert_eq!(scores.len(), 2);
+    assert!(
+        scores[0] > scores[1],
+        "post-warmup: relevant > unrelated (got {scores:?})"
+    );
+}
+
 /// With `pool_size=2`, two threads calling `score_pairs` concurrently
 /// must both succeed and return correctly shaped output. The point is
 /// to prove the pool doesn't serialize through one mutex — a regression

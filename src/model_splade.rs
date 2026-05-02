@@ -41,6 +41,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use ndarray::Array2;
 use ort::session::Session;
@@ -372,6 +373,97 @@ impl SpladeModel {
         entries.sort_by(|a, b| b.1.total_cmp(&a.1));
         entries.truncate(top_k);
         Ok(entries)
+    }
+
+    /// Pre-warm every session in the pool by running one dummy
+    /// inference per requested shape. SPLADE's `encode_sparse` is
+    /// hard-coded to `batch=1` (single text in, sparse vector out), so
+    /// each entry in `shapes` triggers a batch=1 inference — the list
+    /// length controls how many warmup passes run, not the input shape
+    /// itself. Default `[1]` runs one warmup per session, the legacy
+    /// (pre-shape-warmup) coverage.
+    ///
+    /// Best-effort per shape: a failure logs a warn and we move on,
+    /// matching `RerankerModel::warmup` and `EmbedModel::warmup`.
+    pub fn warmup(&self, shapes: &[usize]) -> Result<(), String> {
+        if shapes.is_empty() {
+            tracing::warn!(
+                model = %self.name,
+                "splade warmup called with empty shapes — skipping"
+            );
+            return Ok(());
+        }
+        for &batch in shapes {
+            if let Err(e) = self.warmup_at_shape(batch) {
+                tracing::warn!(
+                    model = %self.name,
+                    batch,
+                    error = %e,
+                    "splade shape warmup failed (continuing with remaining shapes)"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// One warmup pass. SPLADE always runs batch=1 inference at the
+    /// graph level (the wrapping API takes a single `Vec<u32>`), so
+    /// `batch` here is informational — we still feed a `[1, seq]`
+    /// tensor. Logging stamps the requested batch so the operator can
+    /// confirm their `SPLADE_WARMUP_BATCH_SIZES` was honoured.
+    fn warmup_at_shape(&self, batch: usize) -> Result<(), String> {
+        // Mirror `encode_sparse` shape-construction: tokenize a tiny
+        // placeholder and build [1, seq_len] tensors directly. The
+        // tokenizer is configured with truncation at load time so
+        // we're bounded above by `self.max_len`.
+        let token_ids = self
+            .tokenize("warmup splade")
+            .map_err(|e| format!("warmup tokenize (batch={batch}): {e}"))?;
+        if token_ids.is_empty() {
+            return Err("warmup tokens produced empty sequence".to_string());
+        }
+        let seq_len = token_ids.len().min(self.max_len);
+        let ids_i64: Vec<i64> = token_ids[..seq_len].iter().map(|&id| id as i64).collect();
+        let mask_i64: Vec<i64> = vec![1i64; seq_len];
+
+        // Warm EVERY session in the pool — same rationale as the
+        // reranker. Round-robin would otherwise leave session #1+ cold
+        // until prod traffic happens to land there.
+        for (i, sess_mu) in self.sessions.iter().enumerate() {
+            let ids_arr = Array2::from_shape_vec([1, seq_len], ids_i64.clone())
+                .map_err(|e| format!("warmup ids shape (batch={batch}): {e}"))?;
+            let mask_arr = Array2::from_shape_vec([1, seq_len], mask_i64.clone())
+                .map_err(|e| format!("warmup mask shape (batch={batch}): {e}"))?;
+            let ids_tensor = Tensor::from_array(ids_arr)
+                .map_err(|e| format!("warmup ids tensor (batch={batch}): {e}"))?;
+            let mask_tensor = Tensor::from_array(mask_arr)
+                .map_err(|e| format!("warmup mask tensor (batch={batch}): {e}"))?;
+
+            let start = Instant::now();
+            let mut session = sess_mu
+                .lock()
+                .map_err(|e| format!("warmup lock session #{i} (batch={batch}): {e}"))?;
+            match session.run(ort::inputs! {
+                "input_ids" => ids_tensor,
+                "attention_mask" => mask_tensor,
+            }) {
+                Ok(_) => tracing::info!(
+                    model = %self.name,
+                    session = i,
+                    batch,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "splade session warmed"
+                ),
+                Err(e) => tracing::error!(
+                    model = %self.name,
+                    session = i,
+                    batch,
+                    error = %e,
+                    "splade session warmup failed (continuing)"
+                ),
+            }
+        }
+        Ok(())
     }
 }
 

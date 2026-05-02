@@ -306,34 +306,75 @@ impl RerankerModel {
         Ok(vec![raw[[0, 0]]])
     }
 
-    /// Run a tiny dummy inference on every session in the pool to force
-    /// ORT graph compilation, kernel selection, and arena allocation
-    /// up-front. Without this the FIRST production request pays the full
-    /// startup cost (~3s observed for gte-multi-rerank, vs ~1.5s steady
-    /// state) — a tail-latency spike that's pure boot-time work.
+    /// Run a tiny dummy inference on every session in the pool, once per
+    /// requested batch shape, to force ORT graph compilation, kernel
+    /// selection, and arena allocation up-front. Without this the FIRST
+    /// production request at a given batch shape pays the full startup
+    /// cost (~3s observed for gte-multi-rerank cold, vs ~1.5s steady) —
+    /// a tail-latency spike that's pure boot-time work and that ALSO
+    /// re-fires when production traffic shifts to a new batch size
+    /// (e.g. memdb-go's batch=5 fanout vs batch=1 single-pair calls).
     ///
-    /// Best-effort: any session that fails to warm logs an error and we
-    /// continue. The server still serves correctly without warmup; this
-    /// is purely a latency optimization.
-    pub fn warmup(&self) -> Result<(), String> {
-        // Two short pairs so the batch dim isn't 1 (some kernels have
-        // separate codepaths for batch=1 vs batch>1; we want to compile
-        // the common path). Picked deliberately tiny so we don't hold
-        // the lock long.
-        let dummy_pairs = vec![
-            (
-                "warmup query".to_string(),
-                "warmup document one".to_string(),
-            ),
-            (
-                "warmup query".to_string(),
-                "warmup document two".to_string(),
-            ),
-        ];
+    /// `shapes` is a list of batch sizes (operator-controlled via
+    /// `RERANK_WARMUP_BATCH_SIZES`). For each shape `B` we synthesise
+    /// `B` dummy `(query, doc)` pairs so ORT compiles its kernels for
+    /// that exact `[B, max_seq]` graph shape. Order in `shapes` is
+    /// preserved — the first listed shape is compiled first and is the
+    /// "best path" if the static-shape fast-path (Phase H.20) is
+    /// loaded; the rest force the dynamic graph to bind kernels for the
+    /// other shapes prod will see.
+    ///
+    /// Best-effort per shape: a single shape failing (e.g. operator put
+    /// `batch=99` and the static graph rejects it) only logs a warn and
+    /// the next shape proceeds. Total startup cost is bounded by
+    /// `shapes.len() * sessions.len()` — `parse_warmup_batch_sizes`
+    /// dedupes the input so duplicate shapes don't double-count.
+    pub fn warmup(&self, shapes: &[usize]) -> Result<(), String> {
+        if shapes.is_empty() {
+            // Defensive — `parse_warmup_batch_sizes` falls back to
+            // defaults on empty input, so this branch never trips in
+            // production. Still guard against direct callers (tests,
+            // future code paths) so `shapes[0]` indexing in the loop
+            // can't panic.
+            tracing::warn!(
+                model = %self.name,
+                "reranker warmup called with empty shapes — skipping"
+            );
+            return Ok(());
+        }
+        for &batch in shapes {
+            if let Err(e) = self.warmup_at_shape(batch) {
+                // Per-shape failure is non-fatal: log and try the next
+                // shape. The static-shape fast-path will loudly reject
+                // batch>1 with `[N, ?]` — that's expected for any shape
+                // we throw at it that isn't 1, so we just continue.
+                tracing::warn!(
+                    model = %self.name,
+                    batch,
+                    error = %e,
+                    "reranker shape warmup failed (continuing with remaining shapes)"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Run one pre-warm pass at exactly `batch` items across every
+    /// session in the dynamic pool. Helper extracted from `warmup` so
+    /// per-shape error handling stays clean (one fallible scope per
+    /// shape, no manual cleanup of partial state).
+    fn warmup_at_shape(&self, batch: usize) -> Result<(), String> {
+        // `batch` of the same query-doc pair — content doesn't matter,
+        // only the resulting `[batch, max_seq]` tensor shape does.
+        // Tiny strings keep tokenization cheap; we cap to `max_len`
+        // below so the mask shape matches what production traffic
+        // produces at this batch dim.
+        let pairs: Vec<(&str, &str)> =
+            (0..batch).map(|_| ("warmup query", "warmup document")).collect();
         let encodings = self
             .tokenizer
-            .encode_batch(dummy_pairs, /*add_special_tokens*/ true)
-            .map_err(|e| format!("warmup tokenize: {e}"))?;
+            .encode_batch(pairs, /*add_special_tokens*/ true)
+            .map_err(|e| format!("warmup tokenize batch={batch}: {e}"))?;
         let token_ids: Vec<Vec<u32>> = encodings
             .iter()
             .map(|e| {
@@ -342,9 +383,10 @@ impl RerankerModel {
                 ids[..len].to_vec()
             })
             .collect();
-
+        // All rows tokenize identically (same query + doc), so max =
+        // their common length. Compute defensively in case a future
+        // tokenizer change breaks that assumption.
         let max_seq = token_ids.iter().map(|v| v.len()).max().unwrap_or(0);
-        let batch = token_ids.len();
         let (ids, mask_i64, _tti) =
             pool::build_tensors_from_ids(&token_ids, batch, max_seq, self.pad_id);
 
@@ -353,17 +395,17 @@ impl RerankerModel {
         // pay the cold-start cost on its first concurrent request.
         for (i, sess_mu) in self.sessions.iter().enumerate() {
             let ids_arr = Array2::from_shape_vec([batch, max_seq], ids.clone())
-                .map_err(|e| format!("warmup ids shape: {e}"))?;
+                .map_err(|e| format!("warmup ids shape (batch={batch}): {e}"))?;
             let mask_arr = Array2::from_shape_vec([batch, max_seq], mask_i64.clone())
-                .map_err(|e| format!("warmup mask shape: {e}"))?;
-            let ids_tensor =
-                Tensor::from_array(ids_arr).map_err(|e| format!("warmup ids tensor: {e}"))?;
-            let mask_tensor =
-                Tensor::from_array(mask_arr).map_err(|e| format!("warmup mask tensor: {e}"))?;
+                .map_err(|e| format!("warmup mask shape (batch={batch}): {e}"))?;
+            let ids_tensor = Tensor::from_array(ids_arr)
+                .map_err(|e| format!("warmup ids tensor (batch={batch}): {e}"))?;
+            let mask_tensor = Tensor::from_array(mask_arr)
+                .map_err(|e| format!("warmup mask tensor (batch={batch}): {e}"))?;
             let start = Instant::now();
             let mut session = sess_mu
                 .lock()
-                .map_err(|e| format!("warmup lock session #{i}: {e}"))?;
+                .map_err(|e| format!("warmup lock session #{i} (batch={batch}): {e}"))?;
             match session.run(ort::inputs! {
                 "input_ids" => ids_tensor,
                 "attention_mask" => mask_tensor,
@@ -371,12 +413,14 @@ impl RerankerModel {
                 Ok(_) => tracing::info!(
                     model = %self.name,
                     session = i,
+                    batch,
                     elapsed_ms = start.elapsed().as_millis() as u64,
                     "reranker session warmed"
                 ),
                 Err(e) => tracing::error!(
                     model = %self.name,
                     session = i,
+                    batch,
                     error = %e,
                     "reranker session warmup failed (continuing)"
                 ),

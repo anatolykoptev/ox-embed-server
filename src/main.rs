@@ -181,6 +181,14 @@ async fn main() {
             eprintln!("failed to load model '{}': {e}", def.name);
             std::process::exit(1);
         });
+        // Pre-warm at every configured embed batch shape (default `[1, 8]`
+        // — covers trivial single-text callers AND memdb-go's
+        // texts_per_req=8 default). Best-effort: per-shape errors log a
+        // warn and the next shape proceeds. Override via
+        // `EMBED_WARMUP_BATCH_SIZES`.
+        if let Err(e) = m.warmup(&def.name, &cfg.embed_warmup_batch_sizes) {
+            tracing::error!(model = %def.name, error = %e, "embed warmup failed (non-fatal)");
+        }
         raw_models.insert(def.name.clone(), Arc::new(m));
     }
 
@@ -238,12 +246,16 @@ async fn main() {
             eprintln!("failed to load reranker '{}': {e}", def.name);
             std::process::exit(1);
         });
-        // Pre-warm every session in the pool so the FIRST production
-        // request doesn't pay graph compile + arena alloc cost (~3s
-        // observed on cold gte-multi-rerank vs ~1.5s steady state).
-        // Best-effort: warmup failure is logged but does not abort boot
-        // — the server still serves correctly without it.
-        if let Err(e) = m.warmup() {
+        // Pre-warm every session in the pool at every configured batch
+        // shape so the FIRST production request at each shape doesn't
+        // pay graph compile + arena alloc cost (~3s observed on cold
+        // gte-multi-rerank vs ~1.5s steady state). Default shape list is
+        // `[1, 5]` — batch=1 covers the static fast-path single-pair
+        // calls, batch=5 covers memdb-go's D7 sub-query fanout default.
+        // Override via `RERANK_WARMUP_BATCH_SIZES`. Best-effort:
+        // warmup failure is logged but does not abort boot — the
+        // server still serves correctly without it.
+        if let Err(e) = m.warmup(&cfg.rerank_warmup_batch_sizes) {
             tracing::error!(reranker = %def.name, error = %e, "reranker warmup failed (non-fatal)");
         }
         let model_arc = Arc::new(m);
@@ -304,6 +316,14 @@ async fn main() {
             eprintln!("failed to load splade '{}': {e}", def.name);
             std::process::exit(1);
         });
+        // Pre-warm every SPLADE session. SPLADE inference is intrinsically
+        // batch=1 (single text in, sparse vector out — see model_splade.rs),
+        // so the shape list for SPLADE typically has one entry; default
+        // is `[1]`. Override via `SPLADE_WARMUP_BATCH_SIZES` only if a
+        // future SPLADE batched API lands.
+        if let Err(e) = m.warmup(&cfg.splade_warmup_batch_sizes) {
+            tracing::error!(splade = %def.name, error = %e, "splade warmup failed (non-fatal)");
+        }
         splade_entries.insert(
             def.name.clone(),
             SpladeEntry {

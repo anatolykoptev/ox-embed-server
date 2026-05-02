@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::Instant;
 
 use ndarray::Array2;
 use ort::session::Session;
@@ -246,6 +247,120 @@ impl EmbedModel {
             .map_err(|e| format!("mask_f shape: {e}"))?;
 
         pool::mean_pool_normalize(&raw, &mask_arr_f, batch, max_seq, self.dim)
+    }
+
+    /// Run a dummy inference at each requested batch shape to force ORT
+    /// kernel binding + arena allocation BEFORE the first production
+    /// request. Same motivation as `RerankerModel::warmup`: the cold
+    /// path on `[B, max_seq]` is meaningfully slower than steady-state,
+    /// and prod sees several distinct B values (1 for trivial callers,
+    /// 8 for memdb's `texts_per_req` default — and operators may set
+    /// `EMBED_WARMUP_BATCH_SIZES` for other deployments).
+    ///
+    /// Each shape's pass uses the SAME bytes through the SAME tensor
+    /// builders that production traffic uses (`pool::build_tensors_from_ids`),
+    /// so ORT's per-shape memory pattern records what real inference
+    /// will need rather than a pathological alternate code path.
+    ///
+    /// Best-effort: per-shape failure logs a warn and we continue with
+    /// the next shape. The server still serves correctly without
+    /// warmup; this is purely a tail-latency optimisation.
+    pub fn warmup(&self, name: &str, shapes: &[usize]) -> Result<(), String> {
+        if shapes.is_empty() {
+            tracing::warn!(
+                model = %name,
+                "embed warmup called with empty shapes — skipping"
+            );
+            return Ok(());
+        }
+        for &batch in shapes {
+            if let Err(e) = self.warmup_at_shape(name, batch) {
+                tracing::warn!(
+                    model = %name,
+                    batch,
+                    error = %e,
+                    "embed shape warmup failed (continuing with remaining shapes)"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// One pass at exactly `batch` items. Synthesises `batch` short
+    /// dummy texts (content irrelevant — only the resulting tensor
+    /// shape `[batch, max_seq]` matters for ORT pre-binding).
+    fn warmup_at_shape(&self, name: &str, batch: usize) -> Result<(), String> {
+        // `batch` copies of a tiny placeholder. We deliberately keep
+        // the text very short so tokenization is cheap; the ONNX
+        // forward pass dominates wall time anyway.
+        let texts: Vec<String> = (0..batch).map(|_| "warmup".to_string()).collect();
+        let token_ids = self.tokenize(&texts)?;
+        let max_seq = token_ids
+            .iter()
+            .map(|v| v.len())
+            .max()
+            .unwrap_or(0)
+            .min(self.max_len);
+        if max_seq == 0 {
+            return Err("warmup tokens produced empty sequence".to_string());
+        }
+        let (ids, mask_i64, tti) =
+            pool::build_tensors_from_ids(&token_ids, batch, max_seq, self.pad_id);
+        let ids_arr = Array2::from_shape_vec([batch, max_seq], ids)
+            .map_err(|e| format!("warmup ids shape (batch={batch}): {e}"))?;
+        let mask_arr = Array2::from_shape_vec([batch, max_seq], mask_i64)
+            .map_err(|e| format!("warmup mask shape (batch={batch}): {e}"))?;
+        let ids_tensor =
+            Tensor::from_array(ids_arr).map_err(|e| format!("warmup ids tensor: {e}"))?;
+        let mask_tensor =
+            Tensor::from_array(mask_arr).map_err(|e| format!("warmup mask tensor: {e}"))?;
+
+        let start = Instant::now();
+        let mut session = self
+            .session
+            .lock()
+            .map_err(|e| format!("warmup lock (batch={batch}): {e}"))?;
+
+        let run_result = if self.has_token_type_ids {
+            let tti_arr = Array2::from_shape_vec([batch, max_seq], tti)
+                .map_err(|e| format!("warmup tti shape (batch={batch}): {e}"))?;
+            let tti_tensor =
+                Tensor::from_array(tti_arr).map_err(|e| format!("warmup tti tensor: {e}"))?;
+            session.run(ort::inputs! {
+                "input_ids" => ids_tensor,
+                "attention_mask" => mask_tensor,
+                "token_type_ids" => tti_tensor,
+            })
+        } else {
+            session.run(ort::inputs! {
+                "input_ids" => ids_tensor,
+                "attention_mask" => mask_tensor,
+            })
+        };
+
+        match run_result {
+            Ok(_) => tracing::info!(
+                model = %name,
+                // EmbedModel currently holds a single Mutex<Session>
+                // (no pool support yet — see struct comment). Stamp
+                // session=0 so the log shape is identical across the
+                // three model kinds; future EmbedModel pooling can
+                // expand this to a `for (i, s) in pool.iter()` loop
+                // without changing the log schema.
+                session = 0,
+                batch,
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "embed session warmed"
+            ),
+            Err(e) => tracing::error!(
+                model = %name,
+                session = 0,
+                batch,
+                error = %e,
+                "embed session warmup failed (continuing)"
+            ),
+        }
+        Ok(())
     }
 }
 
