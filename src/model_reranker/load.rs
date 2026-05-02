@@ -132,11 +132,21 @@ impl RerankerModel {
 
         let pad_id = discover_pad_id(&tokenizer);
 
+        // Phase H.20 — opportunistically load a static-shape sibling
+        // session pool from `<dir>/model_quantized_static.onnx` if it
+        // exists. Convention-based, no env config — operators drop the
+        // file in place and `score_pairs` automatically routes batch=1
+        // calls to it. Pool size hard-coded to 2 (mirrors the dynamic
+        // default and matches the typical 4-core / 4-inflight config).
+        let static_sessions =
+            load_static_session_pool(name, dir_p, opt_level, intra_threads, allow_spinning);
+
         tracing::info!(
             model = %name,
             max_len,
             pad_id,
             padded_model,
+            static_sessions = static_sessions.as_ref().map(|s| s.len()).unwrap_or(0),
             "loaded reranker model"
         );
 
@@ -148,7 +158,61 @@ impl RerankerModel {
             max_len,
             padded_model,
             pad_id,
+            static_sessions,
+            static_next: AtomicUsize::new(0),
         })
+    }
+}
+
+/// Phase H.20 — load `model_quantized_static.onnx` from `dir` as a
+/// fast-path session pool when present. Returns `None` (with debug log)
+/// when the file is absent — that's the normal case for rerankers that
+/// don't have a static export, and not an error.
+///
+/// Logs a `warn` when the file IS present but session creation fails
+/// (e.g. corrupted ONNX, unsupported opset) so the fallback to the
+/// dynamic-only path is visible in ops, not silent. In that case the
+/// model still serves correctly via the dynamic pool.
+fn load_static_session_pool(
+    name: &str,
+    dir_p: &Path,
+    opt_level: GraphOptimizationLevel,
+    intra_threads: usize,
+    allow_spinning: bool,
+) -> Option<Vec<Mutex<Session>>> {
+    let static_path = dir_p.join("model_quantized_static.onnx");
+    if !static_path.exists() {
+        tracing::debug!(
+            model = %name,
+            "no static-shape ONNX sibling found — dynamic-only inference path"
+        );
+        return None;
+    }
+    tracing::info!(
+        model = %name,
+        path = %static_path.display(),
+        "loading static-shape ONNX fast-path session pool"
+    );
+    // Pool size 2 — same default as the dynamic pool. Memory cost on
+    // ARM Neoverse-N1 / 8 GiB container: ~510 MiB extra for ModernBERT
+    // (255 MiB × 2). Fits under the 3 GiB shared arena cap (Phase H.16).
+    match build_session_pool(
+        name,
+        &static_path,
+        opt_level,
+        intra_threads,
+        2,
+        allow_spinning,
+    ) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::warn!(
+                model = %name,
+                error = %e,
+                "static-shape ONNX session creation failed — falling back to dynamic-only"
+            );
+            None
+        }
     }
 }
 
