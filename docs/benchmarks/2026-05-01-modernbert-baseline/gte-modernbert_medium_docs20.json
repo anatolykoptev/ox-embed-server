@@ -1,0 +1,36 @@
+{
+  "kind": "rerank",
+  "size": "medium",
+  "url": "http://127.0.0.1:8082/v1/rerank",
+  "model": "gte-modernbert",
+  "request_shape": {
+    "endpoint": "/v1/rerank",
+    "docs_per_req": 20,
+    "query_chars": 25,
+    "doc_chars": 660
+  },
+  "scenarios": [
+    {
+      "concurrency": 1,
+      "iterations": 10,
+      "wall_ms": 79569.6,
+      "throughput_req_per_s": 0.13,
+      "p50_ms": 8010.3,
+      "p90_ms": 8129.0,
+      "p99_ms": 8129.0,
+      "avg_ms": 7956.7,
+      "worst_ms": 8129.0
+    },
+    {
+      "concurrency": 4,
+      "iterations": 20,
+      "wall_ms": 196018.4,
+      "throughput_req_per_s": 0.1,
+      "p50_ms": 37973.4,
+      "p90_ms": 68061.4,
+      "p99_ms": 78013.9,
+      "avg_ms": 37633.6,
+      "worst_ms": 78013.9
+    }
+  ]
+}

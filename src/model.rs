@@ -122,8 +122,8 @@ impl EmbedModel {
             .map_err(|e| format!("set threads: {e}"))?
             .with_memory_pattern(false)
             .map_err(|e| format!("disable memory pattern: {e}"))?
-            // Use the shared env-level arena registered in arena.rs (kSameAsRequested).
-            // Avoids per-session BFCArena duplication and unbounded power-of-two growth.
+            // Use the shared env-level arena registered in arena.rs (kSameAsRequested + bounded max_mem).
+            // Avoids per-session BFCArena duplication and unbounded extension growth.
             .with_env_allocators()
             .map_err(|e| format!("enable env allocators: {e}"))?
             .commit_from_file(&onnx_path)
