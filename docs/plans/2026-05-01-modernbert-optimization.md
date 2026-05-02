@@ -99,8 +99,18 @@ Add embed-server `:8082/metrics` to scrape jobs. Reload Prometheus.
 
 ### Phase 2 — Baseline measurements
 
+**Important precondition**: `CROSS_ENCODER_MODEL` is currently `gte-multi-rerank` in both `compose/memdb.yml:342` and `compose/search.yml:71` — ModernBERT is loaded into embed-server but **receives zero production traffic**. Phase 2 benches it via direct `/v1/rerank` calls with `model=gte-modernbert` in the payload. Production `CROSS_ENCODER_MODEL` flip is gated on Phase 4 results — not done in this branch.
+
+**Real consumer pattern (memdb-go)** — Phase 2 must mirror this, not synthetic shapes:
+- `CROSS_ENCODER_MAX_DOCS=50` per call (envelope cap)
+- `MaxCharsPerDoc=0` — no truncation, real doc lengths (chat memos, web snippets) reach ModernBERT's 256 cap
+- `CROSS_ENCODER_TIMEOUT_MS=2000` — 2 s p99 budget
+- `MAX_CONCURRENT_RERANK_REQUESTS=4` — server-side semaphore (matches truly-parallel capacity on 4-core ARM)
+- D7 sub-query rewrite fans out to 3-5 parallel `/v1/rerank` calls per chat turn
+
 Run `bench.py` on dev/prod against both reranker models:
-- Sweep `docs_per_req ∈ {1, 4, 16, 32}` × concurrency `∈ {1, 4, 10}` × `size ∈ {short, medium, long}`.
+- Sweep `docs_per_req ∈ {5, 20, 50}` × concurrency `∈ {1, 4}` × `size ∈ {short(~100t), medium(~256t), long(~512t)}`.
+- D7 simulation: c=3-5 against same query (worst-case rerank semaphore pressure).
 - Capture: p50/p95/p99 wall latency, throughput, and Prometheus snapshots of new series.
 - Write to `docs/benchmarks/2026-05-01-modernbert-baseline.md`.
 
@@ -116,7 +126,11 @@ Sequenced; each one independently testable.
 
 **3A. Per-model threading config**
 
-Refactor `RERANKER_INTRA_THREADS` / `RERANKER_SESSION_POOL_SIZE` to be **per-model** (extend `RERANKER_MODELS` format or add `RERANKER_THREADS_<model>` overrides). Ship `gte-modernbert` as `intra=4 sessions=1`, keep `gte-multi-rerank` as `intra=2 sessions=2`. Rationale: ModernBERT cross-encoder is dominated by large MatMuls — single-session intra-parallelism beats inter-session contention on 4 cores.
+Refactor `RERANKER_INTRA_THREADS` / `RERANKER_SESSION_POOL_SIZE` to be **per-model** (extend `RERANKER_MODELS` format or add `RERANKER_THREADS_<model>` overrides). The default values stay as today (`intra=2 sessions=2`); the per-model knob is a *capability*, not a behaviour change.
+
+**Decision deferred to Phase 2 data.** Prod compose comment (`compose/memdb.yml`, 2026-05-01 v3) records that `intra=4 sessions=1` was measured WORSE than `intra=2 sessions=2` for `gte-multi-rerank` (568M params): coalesced 20-doc batch took 15s vs sequential 4×5-doc = 7.4s. Cross-encoder pairs are independent — no amortization win from coalescing on the larger model.
+
+But ModernBERT is 149M (~3.8× smaller) — different memory-bandwidth profile, different optimal threading. Phase 2 baseline includes a focused A/B for `gte-modernbert` ONLY (`pool=2 intra=2` vs `pool=1 intra=4`); ship whatever wins. **Do not change `gte-multi-rerank` config** — empirical winner already documented.
 
 **3B. ORT spin disable**
 
