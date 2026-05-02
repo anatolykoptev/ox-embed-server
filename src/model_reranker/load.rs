@@ -149,13 +149,8 @@ impl RerankerModel {
         // place and the matching shape activates automatically. Per-shape
         // pool size hard-coded to 2 (mirrors the dynamic default and
         // matches the typical 4-core / 4-inflight config).
-        let static_session_pools = load_static_session_pools(
-            name,
-            dir_p,
-            opt_level,
-            intra_threads,
-            allow_spinning,
-        );
+        let static_session_pools =
+            load_static_session_pools(name, dir_p, opt_level, intra_threads, allow_spinning);
         let static_session_cursors = static_session_pools
             .keys()
             .map(|k| (*k, AtomicUsize::new(0)))

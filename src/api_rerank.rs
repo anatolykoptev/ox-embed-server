@@ -41,14 +41,26 @@ use crate::types::{AppState, ErrorDetail, ErrorResponse, error_json};
 const SIGMOID_CLAMP: f32 = 50.0;
 
 /// Optional server-side normalization applied to cross-encoder logits
-/// before sort. Default `None` returns raw logits (Cohere/Jina convention).
+/// before sort. Default `Sigmoid` returns [0,1] scores compatible with
+/// quality-floor consumers (memdb-go, Mem0, etc). Send `"normalize":"none"`
+/// in the request body for raw cross-encoder logits (Cohere/Jina
+/// convention) when the downstream consumer expects them.
+///
+/// 2026-05-02 — flipped default from `None` to `Sigmoid` after Run #12
+/// LoCoMo F1 regression (-39% vs Run #8). Root cause: memdb-go consumer
+/// never sent `"normalize"` → received raw logits (often negative for
+/// top-1) → `MEMDB_CE_QUALITY_FLOOR=0.05` floor dropped 99% of CE
+/// results into math fallback (63% low_quality + 36% degraded in prod).
+/// BREAKING for callers that expected raw logits without sending the
+/// field — Cohere SDK consumers must now opt in via `"normalize":"none"`.
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum NormalizeMode {
-    /// Identity — return raw cross-encoder logits (Cohere compat default).
-    #[default]
+    /// Identity — return raw cross-encoder logits. Opt-in for Cohere SDK
+    /// compat: send `"normalize":"none"` in request body.
     None,
-    /// Apply 1/(1+exp(-x)) per score → [0,1].
+    /// Apply 1/(1+exp(-x)) per score → [0,1]. Default since 2026-05-02.
+    #[default]
     Sigmoid,
 }
 
@@ -115,10 +127,11 @@ pub struct RerankRequest {
     /// most clients already have the source text and only need scores.
     #[serde(default)]
     pub return_documents: bool,
-    /// G2: optional server-side score normalization. None (default) returns
-    /// raw logits — preserves Cohere convention. "sigmoid" applies
-    /// 1/(1+exp(-x)) to each score after `score_pairs` and before sort.
-    /// Other values rejected with 400.
+    /// Optional server-side score normalization. When absent the server
+    /// applies the `NormalizeMode` default (`Sigmoid` since 2026-05-02 →
+    /// [0,1] scores). Send `"none"` for raw cross-encoder logits
+    /// (Cohere/Jina convention). `"sigmoid"` is also accepted as an
+    /// explicit opt-in. Other values rejected with 400.
     #[serde(default)]
     pub normalize: Option<NormalizeMode>,
 }
@@ -129,9 +142,10 @@ pub struct RerankResult {
     /// array (0-based). Preserved across sort so clients can map scores
     /// back to the text they sent.
     pub index: usize,
-    /// Cross-encoder relevance score. By default raw logit (matches
-    /// Cohere/Jina convention; higher = more relevant, unbounded). If the
-    /// request had `"normalize":"sigmoid"`, this is sigmoid-normalized to [0,1].
+    /// Cross-encoder relevance score. By default sigmoid-normalized to
+    /// [0,1] (default since 2026-05-02; higher = more relevant). Send
+    /// `"normalize":"none"` in the request for raw logits / Cohere SDK
+    /// compat (unbounded, often negative for low-relevance pairs).
     pub relevance_score: f32,
     /// Set only when the request had `return_documents=true`. Cohere shape:
     /// `{"text": "..."}` object, NOT a bare string.
@@ -839,6 +853,29 @@ mod tests {
             serde_json::from_str(r#"{"query":"q","documents":["a"],"normalize":"sigmoid"}"#)
                 .unwrap();
         assert_eq!(r3.normalize, Some(NormalizeMode::Sigmoid));
+    }
+
+    #[test]
+    fn normalize_mode_default_is_sigmoid() {
+        // Pins the 2026-05-02 default flip: callers that omit `normalize`
+        // get sigmoid-normalized [0,1] scores, not raw logits. Regression
+        // guard against accidental revert that would re-trigger the
+        // memdb-go quality-floor cliff (Run #12 LoCoMo F1 -39%).
+        assert_eq!(NormalizeMode::default(), NormalizeMode::Sigmoid);
+
+        // End-to-end: omitted field → Option::None → handler's
+        // `unwrap_or_default()` → Sigmoid. Verify the apply_normalize
+        // fallback transforms a known logit to its sigmoid value.
+        let mut scores = vec![0.0_f32];
+        apply_normalize(
+            &mut scores,
+            Option::<NormalizeMode>::None.unwrap_or_default(),
+        );
+        assert!(
+            (scores[0] - 0.5).abs() < 1e-6,
+            "default must be sigmoid (sigmoid(0)=0.5), got {}",
+            scores[0]
+        );
     }
 
     #[test]

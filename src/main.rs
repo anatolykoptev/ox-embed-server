@@ -380,20 +380,49 @@ async fn main() {
         "token cache ready"
     );
 
-    // Optional global rerank concurrency cap. Reads
-    // MAX_CONCURRENT_RERANK_REQUESTS — when unset/0, semaphore is None
-    // and the handler accepts unlimited concurrent rerank calls (legacy
-    // behaviour). When set, requests over the cap get HTTP 429 with
-    // Retry-After: 1 BEFORE tokenizer CPU is spent — load-shed at the
-    // edge per TEI's `Infer::try_acquire_permit` pattern.
-    let rerank_semaphore = std::env::var("MAX_CONCURRENT_RERANK_REQUESTS")
+    // Global rerank concurrency cap. Load-shed at HTTP edge per TEI's
+    // `Infer::try_acquire_permit` pattern — 429 + Retry-After: 1 BEFORE
+    // tokenizer CPU is spent on requests that will queue behind capacity.
+    //
+    // Auto-default for burst headroom: `pool × intra × 8` truly-parallel
+    // inference slots. The permit is held for the full request lifetime
+    // (tokenize + batcher wait + inference, often 1–3s per call), so
+    // capping at exactly `pool × intra` (e.g. 4 for prod's 2×2) leaves
+    // zero headroom for tokenize / queue burst — production saw ~1%
+    // 429s on a chat-50 sweep (22/1779 calls). 8× covers realistic
+    // bursts without becoming an unlimited firehose. Floor of 16 keeps
+    // tiny pool=1+intra=1 dev setups from getting an absurd 8-permit cap.
+    //
+    // Override via `MAX_CONCURRENT_RERANK_REQUESTS` env. Set to `0` to
+    // disable the semaphore entirely (legacy unlimited behaviour).
+    let auto_cap = cfg
+        .reranker_pool_size
+        .saturating_mul(cfg.reranker_intra_threads)
+        .saturating_mul(8)
+        .max(16);
+    let env_override = std::env::var("MAX_CONCURRENT_RERANK_REQUESTS")
         .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .map(|n| {
-            tracing::info!(cap = n, "rerank semaphore enabled");
-            Arc::new(tokio::sync::Semaphore::new(n))
-        });
+        .and_then(|s| s.parse::<usize>().ok());
+    let rerank_semaphore = match env_override {
+        Some(0) => {
+            tracing::info!("rerank semaphore disabled via MAX_CONCURRENT_RERANK_REQUESTS=0");
+            None
+        }
+        Some(n) => {
+            tracing::info!(cap = n, source = "env", "rerank semaphore enabled");
+            Some(Arc::new(tokio::sync::Semaphore::new(n)))
+        }
+        None => {
+            tracing::info!(
+                cap = auto_cap,
+                source = "auto",
+                pool = cfg.reranker_pool_size,
+                intra = cfg.reranker_intra_threads,
+                "rerank semaphore enabled with auto headroom (pool × intra × 8)"
+            );
+            Some(Arc::new(tokio::sync::Semaphore::new(auto_cap)))
+        }
+    };
 
     let state = Arc::new(AppState {
         models: model_entries,
