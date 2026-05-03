@@ -65,7 +65,9 @@ pub fn init(version: &str) -> PrometheusHandle {
         .expect("set batch tokens buckets")
         .set_buckets_for_metric(
             texts_per_req_matcher,
-            &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0],
+            &[
+                1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0,
+            ],
         )
         .expect("set texts per request buckets")
         .set_buckets_for_metric(
