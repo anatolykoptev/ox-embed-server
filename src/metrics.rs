@@ -22,6 +22,16 @@ pub fn init(version: &str) -> PrometheusHandle {
     // (median > 0.4 → length-bucketing payoff per Phase 3C plan).
     let waste_matcher =
         metrics_exporter_prometheus::Matcher::Suffix("padding_waste_ratio".to_string());
+    // Token count per batcher batch: [batch_size × max_seq_len] (padded-model formula).
+    // Max for e5-large: 8 × 256 = 2048; for jina: 8 × 512 = 4096; BATCH_MAX_TOKENS cap = 8192.
+    let batch_tokens_matcher =
+        metrics_exporter_prometheus::Matcher::Full("embed_batch_tokens".to_string());
+    // Texts per HTTP request: go-search sends 1-50, bulk ingest up to ~1500.
+    let texts_per_req_matcher =
+        metrics_exporter_prometheus::Matcher::Full("embed_texts_per_request".to_string());
+    // Pairs per /v1/rerank request: typically CROSS_ENCODER_MAX_DOCS = 15.
+    let rerank_pairs_matcher =
+        metrics_exporter_prometheus::Matcher::Full("embed_rerank_pairs_per_request".to_string());
 
     let handle = PrometheusBuilder::new()
         .set_buckets_for_metric(
@@ -48,6 +58,23 @@ pub fn init(version: &str) -> PrometheusHandle {
             &[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
         )
         .expect("set padding waste buckets")
+        .set_buckets_for_metric(
+            batch_tokens_matcher,
+            &[128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0, 16384.0],
+        )
+        .expect("set batch tokens buckets")
+        .set_buckets_for_metric(
+            texts_per_req_matcher,
+            &[
+                1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0,
+            ],
+        )
+        .expect("set texts per request buckets")
+        .set_buckets_for_metric(
+            rerank_pairs_matcher,
+            &[1.0, 5.0, 10.0, 15.0, 20.0, 30.0, 50.0, 100.0],
+        )
+        .expect("set rerank pairs buckets")
         .install_recorder()
         .expect("install Prometheus recorder");
 

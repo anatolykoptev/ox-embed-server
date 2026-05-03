@@ -144,11 +144,9 @@ impl SpladeModel {
             let session = builder
                 .with_intra_threads(intra_threads)
                 .map_err(|e| format!("set threads #{i}: {e}"))?
-                // Phase H.17 — see model.rs for rationale. SPLADE's
-                // sparse output is a one-hot-ish vocab projection per
-                // token; bounded BATCH_MAX_TOKENS=8192 limits batch shapes.
-                .with_memory_pattern(true)
-                .map_err(|e| format!("enable memory pattern #{i}: {e}"))?
+                // memory_pattern=false: same rationale as model.rs.
+                .with_memory_pattern(false)
+                .map_err(|e| format!("disable memory pattern #{i}: {e}"))?
                 .with_env_allocators()
                 .map_err(|e| format!("enable env allocators #{i}: {e}"))?
                 .commit_from_file(&load_path)
