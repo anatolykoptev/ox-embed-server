@@ -215,13 +215,24 @@ impl EmbedModel {
             return Ok(vec![]);
         }
 
-        // Pad to the longest sequence in the batch, capped at model max.
-        let max_seq = token_ids
+        // Pad to the longest sequence in the batch, capped at model max,
+        // then round UP to the next power of two (also capped at
+        // `self.max_len`). NEON INT8 GEMM tile sizes on ARM Neoverse-N1
+        // are 4×4 / 8×8 — power-of-two seq dims hit cleaner tiling and
+        // typically save a partial-tile epilogue on the last block.
+        // Correctness is preserved: `pool::build_tensors_from_ids` zero-
+        // fills the mask over padded positions, and
+        // `pool::mean_pool_normalize` averages only positions where
+        // mask > 0, so the extra padded tokens contribute neither to the
+        // mean nor to the L2 norm. Kept on its own commit so it can be
+        // reverted in isolation if a future model produces drift.
+        let real_max_seq = token_ids
             .iter()
             .map(|v| v.len())
             .max()
             .unwrap_or(0)
             .min(self.max_len);
+        let max_seq = round_up_seq_len(real_max_seq, self.max_len);
 
         let batch = token_ids.len();
         let (ids, mask_i64, tti) =
@@ -409,6 +420,25 @@ impl EmbedModel {
     }
 }
 
+/// Round `n` up to the next power of two, capped at `cap` (and at least
+/// 1). Used by `embed_tokens` to align the per-batch `max_seq` to NEON
+/// INT8 GEMM tile sizes (4×4 / 8×8 on ARM Neoverse-N1) while never
+/// exceeding the model's static `max_len`. `n == 0` → 1, `n == cap` →
+/// `cap` (no rounding above the cap), `n` already a power of two →
+/// itself.
+fn round_up_seq_len(n: usize, cap: usize) -> usize {
+    if n <= 1 {
+        // Empty/singleton input → 1-token tensor. `max_len` is always
+        // >= 1 for any real model (config parser would reject 0), so
+        // we don't bother re-clamping at the cap here.
+        return 1;
+    }
+    // `next_power_of_two` is a no-op when `n` is already a power of two.
+    // Saturating math protects against the (theoretical) overflow on
+    // very large `cap` — in practice `cap == self.max_len ≤ 512`.
+    n.next_power_of_two().min(cap)
+}
+
 /// Build N independent ONNX sessions over the same model file. Mirrors
 /// the reranker `build_session_pool` in `model_reranker/load.rs` —
 /// there is no shared-weights mode in ort 2.0-rc, so each session pays
@@ -464,6 +494,62 @@ fn build_session_pool(
     }
     tracing::info!(count = sessions.len(), "embed ONNX session(s) created");
     Ok(sessions)
+}
+
+#[cfg(test)]
+mod seq_pad_tests {
+    use super::round_up_seq_len;
+
+    #[test]
+    fn zero_rounds_to_one() {
+        // Empty input — degenerate, but an empty batch should not
+        // produce a 0-dim tensor. Cap=256 is a normal e5-large limit.
+        assert_eq!(round_up_seq_len(0, 256), 1);
+    }
+
+    #[test]
+    fn one_stays_one() {
+        // Power of two already; no rounding work.
+        assert_eq!(round_up_seq_len(1, 256), 1);
+    }
+
+    #[test]
+    fn rounds_up_to_next_power_of_two() {
+        // Sub-power values lift to the next tile boundary.
+        assert_eq!(round_up_seq_len(3, 256), 4);
+        assert_eq!(round_up_seq_len(5, 256), 8);
+        assert_eq!(round_up_seq_len(9, 256), 16);
+        assert_eq!(round_up_seq_len(17, 256), 32);
+        assert_eq!(round_up_seq_len(65, 256), 128);
+    }
+
+    #[test]
+    fn already_power_of_two_passes_through() {
+        for n in [2usize, 4, 8, 16, 32, 64, 128, 256] {
+            assert_eq!(
+                round_up_seq_len(n, 256),
+                n,
+                "{n} is already a power of two, must not round up"
+            );
+        }
+    }
+
+    #[test]
+    fn capped_at_model_max_len() {
+        // 200 → 256 if cap allows, else clamp at cap.
+        assert_eq!(round_up_seq_len(200, 256), 256);
+        // The static-shape cap is 256 — never exceed the model's
+        // declared max_len even if the next power of two would.
+        assert_eq!(round_up_seq_len(200, 200), 200);
+        assert_eq!(round_up_seq_len(257, 256), 256);
+        // Non-power-of-two cap (e.g. jina-code-v2 max_len=512 is fine,
+        // but cap=300 would clamp).
+        assert_eq!(round_up_seq_len(150, 300), 256);
+        // 250.next_power_of_two() == 256, well under cap=300.
+        assert_eq!(round_up_seq_len(250, 300), 256);
+        // 257.next_power_of_two() == 512, capped to 300.
+        assert_eq!(round_up_seq_len(257, 300), 300);
+    }
 }
 
 #[cfg(test)]
