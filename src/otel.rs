@@ -41,13 +41,90 @@ use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::SdkTracerProvider;
+use tracing::Subscriber;
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::Layer;
+use tracing_subscriber::layer::Context;
 use tracing_subscriber::prelude::*;
+use tracing_subscriber::registry::LookupSpan;
 
 /// Service name advertised on every span. Visible in Jaeger's service
 /// dropdown and as the `service.name` resource attribute.
 const SERVICE_NAME: &str = "embed-server";
+
+// ── ORT log interception layer ────────────────────────────────────────────────
+
+/// A `tracing_subscriber::Layer` that intercepts ORT log events from the
+/// `ort::logging` target and parses them into Prometheus counters.
+///
+/// ORT emits arena events at INFO level (target = `ort::logging`) with
+/// messages like:
+///   "Extending BFCArena for Cpu. bin_num:20 num_bytes:1258291200"
+///
+/// We parse those into `embed_arena_extend_total{model,bin_num}`.
+///
+/// The layer is zero-cost when there are no matching events — the visit
+/// closure is only called for events that match the `ort::logging` target.
+pub struct OrtLogLayer;
+
+impl<S> Layer<S> for OrtLogLayer
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        // Only process events from ORT's logging bridge.
+        if event.metadata().target() != "ort::logging" {
+            return;
+        }
+        // Collect the message field via a visitor.
+        let mut visitor = OrtMessageVisitor::default();
+        event.record(&mut visitor);
+        let msg = visitor.message;
+
+        // Parse: "Extending BFCArena for Cpu. bin_num:N num_bytes:M"
+        if let Some(bin_num) = parse_bfc_extend(&msg) {
+            // The ORT log doesn't carry a model name; use "unknown" so the
+            // metric still appears. Once we can disambiguate sessions
+            // (future ort API), we can pass the real name.
+            crate::metrics::record_arena_extend("unknown", bin_num);
+        }
+    }
+}
+
+/// Visitor that extracts the `message` field from a tracing event.
+#[derive(Default)]
+struct OrtMessageVisitor {
+    message: String,
+}
+
+impl tracing::field::Visit for OrtMessageVisitor {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.message = value.to_string();
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = format!("{value:?}");
+        }
+    }
+}
+
+/// Parse a BFCArena extend message.
+///
+/// Expected format: `"Extending BFCArena for Cpu. bin_num:N num_bytes:M"`
+/// Returns `Some(bin_num)` on success, `None` if the message doesn't match.
+fn parse_bfc_extend(msg: &str) -> Option<u32> {
+    if !msg.contains("Extending BFCArena") {
+        return None;
+    }
+    // Find "bin_num:" and parse the integer that follows.
+    let bin_start = msg.find("bin_num:")?;
+    let after = &msg[bin_start + "bin_num:".len()..];
+    let end = after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len());
+    after[..end].parse::<u32>().ok()
+}
 
 /// Initialise tracing with OTLP exporter when configured, falling back
 /// to plain stdout-JSON when `OTEL_EXPORTER_OTLP_ENDPOINT` is unset.
@@ -76,9 +153,14 @@ pub fn init() -> Option<SdkTracerProvider> {
             // baseline the pre-Phase-H.18 main.rs used: info + ort::logging=warn.
             // Without this, the global subscriber falls back to TRACE and
             // ort::logging floods stdout with per-allocation messages.
+            // ORT arena logging: allow INFO for the ort::logging target so
+            // OrtLogLayer can parse "Extending BFCArena" events.  The fmt
+            // layer still suppresses them via its own filter — OrtLogLayer
+            // intercepts at the registry level before fmt filtering.
             let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,ort::logging=warn".parse().unwrap());
+                .unwrap_or_else(|_| "info,ort::logging=info".parse().unwrap());
             tracing_subscriber::registry()
+                .with(OrtLogLayer)
                 .with(tracing_subscriber::fmt::layer().json().with_filter(filter))
                 .init();
             tracing::info!("OTEL disabled (OTEL_EXPORTER_OTLP_ENDPOINT unset)");
@@ -97,13 +179,10 @@ pub fn init() -> Option<SdkTracerProvider> {
             // Don't fail the server if Jaeger is unreachable at boot —
             // serve traffic with stdout-JSON only and let an alert pick
             // up the missing trace flow downstream.
-            // Apply RUST_LOG filter to fmt output, defaulting to the same
-            // baseline the pre-Phase-H.18 main.rs used: info + ort::logging=warn.
-            // Without this, the global subscriber falls back to TRACE and
-            // ort::logging floods stdout with per-allocation messages.
             let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,ort::logging=warn".parse().unwrap());
+                .unwrap_or_else(|_| "info,ort::logging=info".parse().unwrap());
             tracing_subscriber::registry()
+                .with(OrtLogLayer)
                 .with(tracing_subscriber::fmt::layer().json().with_filter(filter))
                 .init();
             tracing::error!(error = %err, endpoint = %endpoint, "OTLP exporter init failed — running without traces");
@@ -130,12 +209,13 @@ pub fn init() -> Option<SdkTracerProvider> {
     // ort::logging floods stdout with per-allocation messages
     // (incident 2026-05-02 H.18 deploy: log volume + perf hit).
     let otel_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "info,ort::logging=warn".parse().unwrap());
+        .unwrap_or_else(|_| "info,ort::logging=info".parse().unwrap());
     let fmt_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "info,ort::logging=warn".parse().unwrap());
+        .unwrap_or_else(|_| "info,ort::logging=info".parse().unwrap());
     let otel_layer = OpenTelemetryLayer::new(tracer).with_filter(otel_filter);
 
     tracing_subscriber::registry()
+        .with(OrtLogLayer)
         .with(otel_layer)
         .with(
             tracing_subscriber::fmt::layer()
