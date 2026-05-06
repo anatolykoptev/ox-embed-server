@@ -198,6 +198,24 @@ pub fn record_padding_waste(model: &str, padded: usize, raw: usize) {
     .record(ratio);
 }
 
+/// Record one `malloc_trim(0)` invocation by the Linux-only background
+/// task in `main.rs`.
+///
+/// glibc keeps freed pages in arena, doesn't return them to the OS;
+/// `malloc_trim(0)` forces release of all unused trailing pages. TEI runs
+/// this every 100 ms (`router/src/main.rs:222-229`) — observable here as
+/// `embed_malloc_trim_invocations_total`. The task is no-op on macOS/Windows.
+///
+/// `released` is the libc return value (`1` = some memory was released,
+/// `0` = nothing to release); when non-zero the released-events counter
+/// also ticks so dashboards can chart "actual work" vs raw cadence.
+pub fn record_malloc_trim(released: bool) {
+    metrics::counter!("embed_malloc_trim_invocations_total").increment(1);
+    if released {
+        metrics::counter!("embed_malloc_trim_released_events_total").increment(1);
+    }
+}
+
 /// Increment the seq-capped counter — fired when a batch is split
 /// because admitting another item would push `max(seq_len)` strictly
 /// above `BATCH_MAX_SEQ`. Distinct from the legacy `embed_carry_events_total`
