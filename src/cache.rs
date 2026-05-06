@@ -8,19 +8,26 @@
 //! Scope (intentional):
 //! - Process-local (not distributed).
 //! - Not persisted across restarts.
-//! - Size-bounded with TinyLFU admission + LRU-ish eviction via `moka`.
-//!   No TTL (embeddings are deterministic; size is the only bound).
+//! - Size-bounded with **LRU** eviction via `moka`. No TTL (embeddings
+//!   are deterministic; size is the only bound).
 //!
 //! Threading:
 //! - `moka::sync::Cache` is internally sharded and lock-free on the fast
 //!   path. No single global `Mutex` around the map, so concurrent probes
 //!   under load don't contend the way a `Mutex<LruCache>` would.
 //!
-//! Admission policy (TinyLFU):
-//! - One-shot transient inputs get filtered out, so a flood of unique
-//!   requests won't evict high-frequency repeats. This yields better
-//!   hit rates than naive LRU on real-world workloads where a small
-//!   set of queries dominates.
+//! Eviction policy — LRU (was TinyLFU):
+//! - moka's default TinyLFU admission filter rejects one-shot inserts
+//!   without a frequency signal. The `jina-code-v2` workload is
+//!   ~unique-per-request code chunks, so admission rejected effectively
+//!   every insert: live `cache_size` stuck at the cold-start residents (4)
+//!   and hit rate stayed at 0% indefinitely while `multilingual-e5-large`
+//!   re-queried search strings hit ~92.9%.
+//! - Switching to LRU accepts every insert: jina entries now live until
+//!   normal LRU eviction, so re-queried code chunks (which do exist —
+//!   e.g. shared imports across files) actually hit. The cost is a slight
+//!   theoretical regression for e5 under adversarial scan-style traffic,
+//!   which we don't see in production.
 //!
 //! Disable semantic:
 //! - `EmbeddingCache::new(0)` constructs a cache with no backing store;
@@ -28,6 +35,7 @@
 //!   callers keep `Arc<EmbeddingCache>` in shared state regardless of
 //!   whether caching is enabled at runtime.
 
+use moka::policy::EvictionPolicy;
 use moka::sync::Cache;
 use sha2::{Digest, Sha256};
 
@@ -58,7 +66,15 @@ impl EmbeddingCache {
         let inner = if max_entries == 0 {
             None
         } else {
-            Some(Cache::builder().max_capacity(max_entries as u64).build())
+            // LRU rather than the moka default TinyLFU — TinyLFU's admission
+            // filter starves caches whose workload is unique-per-request
+            // (jina-code-v2 saw 0% hit rate in prod). See module docstring.
+            Some(
+                Cache::builder()
+                    .max_capacity(max_entries as u64)
+                    .eviction_policy(EvictionPolicy::lru())
+                    .build(),
+            )
         };
         Self { inner }
     }
@@ -73,8 +89,7 @@ impl EmbeddingCache {
     ///
     /// moka's `get` returns `Option<V>` (value is cloned out of the shard
     /// internally) rather than `Option<&V>`, so no explicit `.cloned()`.
-    /// It also updates frequency estimators for the TinyLFU admission
-    /// policy + recency tracker.
+    /// It also updates the LRU recency tracker.
     pub fn get(&self, model: &str, text: &str) -> Option<Vec<f32>> {
         let cache = self.inner.as_ref()?;
         let key = (model.to_string(), hash_text(text));
@@ -148,11 +163,10 @@ mod tests {
 
     #[test]
     fn bounded_capacity_evicts_under_pressure() {
-        // moka with TinyLFU doesn't guarantee pure-LRU eviction order —
-        // cold-entry admission can reject the newcomer rather than evict
-        // an existing resident, so "a" might survive and "c" be rejected,
-        // or vice versa. What we DO guarantee: the cache never exceeds
-        // its configured capacity after pending work drains.
+        // We use LRU eviction (see module docstring): inserts are always
+        // admitted, eviction follows recency. This test only asserts the
+        // size invariant — it does not pin which key survives so the test
+        // stays robust against future eviction-policy tuning.
         let c = EmbeddingCache::new(2);
         c.insert("m", "a", vec![1.0]);
         c.insert("m", "b", vec![2.0]);

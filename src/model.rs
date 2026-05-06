@@ -3,6 +3,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use ndarray::Array2;
+use ort::ep;
 use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::value::Tensor;
@@ -137,6 +138,14 @@ impl EmbedModel {
             // Avoids per-session BFCArena duplication and unbounded extension growth.
             .with_env_allocators()
             .map_err(|e| format!("enable env allocators: {e}"))?
+            // Belt-and-braces: disable the per-session CPU mem arena. Without
+            // this, ORT's CPU EP defaults to `EnableCpuMemArena=1` and may
+            // still spawn a session-local BFCArena alongside our shared one,
+            // doubling allocator state. `with_env_allocators` makes the
+            // session look up the env arena, but does NOT by itself stop the
+            // session-local arena from being created.
+            .with_execution_providers([ep::CPU::default().with_arena_allocator(false).build()])
+            .map_err(|e| format!("disable per-session cpu mem arena: {e}"))?
             .commit_from_file(&load_path)
             .map_err(|e| format!("load ONNX {}: {e}", load_path.display()))?;
         onnx_cache::observe_post_commit(&plan, t_commit.elapsed().as_millis());
