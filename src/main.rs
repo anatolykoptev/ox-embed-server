@@ -191,7 +191,11 @@ async fn main() {
         // texts_per_req=8 default). Best-effort: per-shape errors log a
         // warn and the next shape proceeds. Override via
         // `EMBED_WARMUP_BATCH_SIZES`.
-        if let Err(e) = m.warmup(&def.name, &cfg.embed_warmup_batch_sizes) {
+        if let Err(e) = m.warmup(
+            &def.name,
+            &cfg.embed_warmup_batch_sizes,
+            cfg.embed_warmup_seq_len,
+        ) {
             tracing::error!(model = %def.name, error = %e, "embed warmup failed (non-fatal)");
         }
         raw_models.insert(def.name.clone(), Arc::new(m));
@@ -260,7 +264,7 @@ async fn main() {
         // Override via `RERANK_WARMUP_BATCH_SIZES`. Best-effort:
         // warmup failure is logged but does not abort boot — the
         // server still serves correctly without it.
-        if let Err(e) = m.warmup(&cfg.rerank_warmup_batch_sizes) {
+        if let Err(e) = m.warmup(&cfg.rerank_warmup_batch_sizes, cfg.embed_warmup_seq_len) {
             tracing::error!(reranker = %def.name, error = %e, "reranker warmup failed (non-fatal)");
         }
         let model_arc = Arc::new(m);

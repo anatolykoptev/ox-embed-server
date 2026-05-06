@@ -176,6 +176,24 @@ pub struct Config {
     /// `SPLADE_WARMUP_BATCH_SIZES` if a future SPLADE batched API
     /// lands and shape pre-warming becomes useful.
     pub splade_warmup_batch_sizes: Vec<usize>,
+    /// Cap on the per-shape warmup `max_seq` dimension (in tokens).
+    ///
+    /// `None` (env unset OR set to literal `"max"`) → pad warmup tensors
+    /// to the model's `max_len` (legacy behaviour: pre-commits worst-
+    /// case scratch slabs at startup).
+    ///
+    /// `Some(n)` → pad warmup tensors to `min(n, max_len)`. With
+    /// `memory_pattern=true`, ORT plans on the first prod request to
+    /// re-bind kernels for any longer shape — one-time cost is
+    /// acceptable. Saves 200-400 MiB resident memory after startup.
+    /// Default 128 — a sane median between e5's 256 max and jina's 512
+    /// max that covers most prod traffic without committing worst-case
+    /// scratch up front.
+    ///
+    /// Applies to dense embedders and rerankers. SPLADE warmup is
+    /// already token-bounded (uses tokenizer output directly) and is
+    /// not affected.
+    pub embed_warmup_seq_len: Option<usize>,
 }
 
 impl Config {
@@ -323,6 +341,9 @@ impl Config {
         let splade_warmup_batch_sizes =
             parse_warmup_batch_sizes(env::var("SPLADE_WARMUP_BATCH_SIZES").ok().as_deref(), &[1]);
 
+        let embed_warmup_seq_len =
+            parse_embed_warmup_seq_len(env::var("EMBED_WARMUP_SEQ_LEN").ok().as_deref());
+
         Ok(Config {
             port,
             models,
@@ -347,6 +368,7 @@ impl Config {
             rerank_warmup_batch_sizes,
             embed_warmup_batch_sizes,
             splade_warmup_batch_sizes,
+            embed_warmup_seq_len,
         })
     }
 }
@@ -401,6 +423,52 @@ fn parse_batch_max_tokens(raw: Option<&str>) -> usize {
             Ok(n) => n,
             Err(_) => DEFAULT,
         },
+    }
+}
+
+/// Parse `EMBED_WARMUP_SEQ_LEN` env value.
+///
+/// - Unset, empty, or `"max"` (case-insensitive) → `None`: warmup pads
+///   tensors to the model's `max_len` (legacy behaviour).
+/// - Positive integer → `Some(n)`: warmup pads tensors to `min(n, max_len)`.
+/// - `0`, negatives, or unparseable → `Some(128)`: sane median default
+///   with a warn so operators notice typos in the env file.
+///
+/// The default of 128 covers most prod traffic between e5 (max_len=256)
+/// and jina (max_len=512) without committing worst-case scratch slabs
+/// at startup. Operators wanting the legacy max-len warmup set
+/// `EMBED_WARMUP_SEQ_LEN=max`.
+///
+/// Exposed for testing; env lookup stays in `from_env`.
+fn parse_embed_warmup_seq_len(raw: Option<&str>) -> Option<usize> {
+    const DEFAULT: usize = 128;
+    match raw {
+        None => Some(DEFAULT),
+        Some(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Some(DEFAULT);
+            }
+            if trimmed.eq_ignore_ascii_case("max") {
+                return None;
+            }
+            match trimmed.parse::<usize>() {
+                Ok(0) => {
+                    tracing::warn!(
+                        "EMBED_WARMUP_SEQ_LEN=0 is invalid; falling back to default {DEFAULT}"
+                    );
+                    Some(DEFAULT)
+                }
+                Ok(n) => Some(n),
+                Err(_) => {
+                    tracing::warn!(
+                        "EMBED_WARMUP_SEQ_LEN={trimmed:?} is not a valid usize; \
+                         falling back to default {DEFAULT}"
+                    );
+                    Some(DEFAULT)
+                }
+            }
+        }
     }
 }
 
@@ -683,6 +751,35 @@ mod tests {
         assert_eq!(parse_batch_max_tokens(Some("nope")), 16384);
         assert_eq!(parse_batch_max_tokens(Some("-1")), 16384);
         assert_eq!(parse_batch_max_tokens(Some("")), 16384);
+    }
+
+    #[test]
+    fn embed_warmup_seq_len_default_is_128_when_unset() {
+        assert_eq!(parse_embed_warmup_seq_len(None), Some(128));
+    }
+
+    #[test]
+    fn embed_warmup_seq_len_max_keyword_returns_none() {
+        // `"max"` is the documented opt-out: pad warmup to model max_len.
+        assert_eq!(parse_embed_warmup_seq_len(Some("max")), None);
+        assert_eq!(parse_embed_warmup_seq_len(Some("MAX")), None);
+        assert_eq!(parse_embed_warmup_seq_len(Some("  Max  ")), None);
+    }
+
+    #[test]
+    fn embed_warmup_seq_len_parses_positive_integers() {
+        assert_eq!(parse_embed_warmup_seq_len(Some("64")), Some(64));
+        assert_eq!(parse_embed_warmup_seq_len(Some("256")), Some(256));
+        assert_eq!(parse_embed_warmup_seq_len(Some("  192  ")), Some(192));
+    }
+
+    #[test]
+    fn embed_warmup_seq_len_falls_back_on_invalid() {
+        // 0, negatives, garbage, empty string → default 128.
+        assert_eq!(parse_embed_warmup_seq_len(Some("0")), Some(128));
+        assert_eq!(parse_embed_warmup_seq_len(Some("-5")), Some(128));
+        assert_eq!(parse_embed_warmup_seq_len(Some("nope")), Some(128));
+        assert_eq!(parse_embed_warmup_seq_len(Some("")), Some(128));
     }
 
     #[test]

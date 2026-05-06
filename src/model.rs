@@ -279,7 +279,12 @@ impl EmbedModel {
     /// Best-effort: per-shape failure logs a warn and we continue with
     /// the next shape. The server still serves correctly without
     /// warmup; this is purely a tail-latency optimisation.
-    pub fn warmup(&self, name: &str, shapes: &[usize]) -> Result<(), String> {
+    pub fn warmup(
+        &self,
+        name: &str,
+        shapes: &[usize],
+        warmup_seq_len: Option<usize>,
+    ) -> Result<(), String> {
         if shapes.is_empty() {
             tracing::warn!(
                 model = %name,
@@ -288,7 +293,7 @@ impl EmbedModel {
             return Ok(());
         }
         for &batch in shapes {
-            if let Err(e) = self.warmup_at_shape(name, batch) {
+            if let Err(e) = self.warmup_at_shape(name, batch, warmup_seq_len) {
                 tracing::warn!(
                     model = %name,
                     batch,
@@ -303,7 +308,19 @@ impl EmbedModel {
     /// One pass at exactly `batch` items. Synthesises `batch` short
     /// dummy texts (content irrelevant — only the resulting tensor
     /// shape `[batch, max_seq]` matters for ORT pre-binding).
-    fn warmup_at_shape(&self, name: &str, batch: usize) -> Result<(), String> {
+    ///
+    /// `warmup_seq_len` controls the second tensor dim:
+    /// - `None` → pad to `self.max_len` (worst-case prod shape; legacy).
+    /// - `Some(n)` → pad to `n.min(self.max_len)`. With memory_pattern
+    ///   enabled, ORT re-plans on the first prod request that needs a
+    ///   longer shape — we just bind kernels here without committing
+    ///   worst-case scratch.
+    fn warmup_at_shape(
+        &self,
+        name: &str,
+        batch: usize,
+        warmup_seq_len: Option<usize>,
+    ) -> Result<(), String> {
         // `batch` copies of a tiny placeholder. We deliberately keep
         // the text very short so tokenization is cheap; the ONNX
         // forward pass dominates wall time anyway.
@@ -312,12 +329,17 @@ impl EmbedModel {
         if token_ids.iter().all(|v| v.is_empty()) {
             return Err("warmup tokens produced empty sequence".to_string());
         }
-        // Pad to `self.max_len` so the warmup forward pass exercises the
-        // worst-case prod shape `[batch, max_len]`. Tokenizing "warmup"
-        // alone produces ~3 tokens, leaving ORT cold for typical 50-512-
-        // token e5/jina prod traffic. `build_tensors_from_ids` zero-pads
-        // beyond the real token count with `pad_id` + `attention_mask=0`.
-        let max_seq = self.max_len;
+        // Choose the warmup seq_len. `None` preserves legacy behaviour
+        // (pad to `self.max_len`, exercising the worst-case prod shape).
+        // `Some(n)` clamps to `min(n, max_len)` — with memory_pattern=true
+        // ORT re-plans on the first long prod request, so binding kernels
+        // at a shorter shape avoids committing worst-case scratch slabs at
+        // startup. `build_tensors_from_ids` still zero-pads beyond the
+        // real token count.
+        let max_seq = match warmup_seq_len {
+            None => self.max_len,
+            Some(n) => n.min(self.max_len).max(1),
+        };
         let (ids, mask_i64, tti) =
             pool::build_tensors_from_ids(&token_ids, batch, max_seq, self.pad_id);
         let ids_arr = Array2::from_shape_vec([batch, max_seq], ids)

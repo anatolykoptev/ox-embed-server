@@ -386,7 +386,11 @@ impl RerankerModel {
     /// the next shape proceeds. Total startup cost is bounded by
     /// `shapes.len() * sessions.len()` — `parse_warmup_batch_sizes`
     /// dedupes the input so duplicate shapes don't double-count.
-    pub fn warmup(&self, shapes: &[usize]) -> Result<(), String> {
+    pub fn warmup(
+        &self,
+        shapes: &[usize],
+        warmup_seq_len: Option<usize>,
+    ) -> Result<(), String> {
         if shapes.is_empty() {
             // Defensive — `parse_warmup_batch_sizes` falls back to
             // defaults on empty input, so this branch never trips in
@@ -400,7 +404,7 @@ impl RerankerModel {
             return Ok(());
         }
         for &batch in shapes {
-            if let Err(e) = self.warmup_at_shape(batch) {
+            if let Err(e) = self.warmup_at_shape(batch, warmup_seq_len) {
                 // Per-shape failure is non-fatal: log and try the next
                 // shape. The static-shape fast-path will loudly reject
                 // batch>1 with `[N, ?]` — that's expected for any shape
@@ -420,7 +424,11 @@ impl RerankerModel {
     /// session in the dynamic pool. Helper extracted from `warmup` so
     /// per-shape error handling stays clean (one fallible scope per
     /// shape, no manual cleanup of partial state).
-    fn warmup_at_shape(&self, batch: usize) -> Result<(), String> {
+    fn warmup_at_shape(
+        &self,
+        batch: usize,
+        warmup_seq_len: Option<usize>,
+    ) -> Result<(), String> {
         // `batch` of the same query-doc pair — content doesn't matter,
         // only the resulting `[batch, max_seq]` tensor shape does.
         // Tiny strings keep tokenization cheap; we cap to `max_len`
@@ -441,18 +449,18 @@ impl RerankerModel {
                 ids[..len].to_vec()
             })
             .collect();
-        // Pad to `self.max_len` so warmup compiles ORT kernels and primes
-        // BFCArena for the **worst-case prod shape**. Warming at the
-        // natural ~8-token tokenizer output of the dummy text leaves
-        // production traffic - which routinely hits `[batch, max_len]`
-        // when docs are long - entirely cold; the first real request
-        // then re-pays kernel-binding + arena-extend cost (observed
-        // post-H.21 deploy: first prod batch=5 = 2683ms vs steady 1672ms).
-        // `build_tensors_from_ids` fills positions beyond the real token
-        // count with `pad_id` and sets `attention_mask=0`, which is byte-
-        // for-byte identical to what `score_pairs` produces when prod
-        // tokens fill less than `max_len`.
-        let max_seq = self.max_len;
+        // Choose the warmup seq_len. `None` preserves the legacy
+        // worst-case prod shape (pad to `self.max_len`); `Some(n)`
+        // clamps to `min(n, max_len)`. With memory_pattern=true the
+        // first long prod request re-plans for the longer shape — one-
+        // time cost, in exchange for not committing worst-case scratch
+        // slabs at startup. `build_tensors_from_ids` fills positions
+        // beyond the real token count with `pad_id` and sets
+        // `attention_mask=0`, identical to `score_pairs` semantics.
+        let max_seq = match warmup_seq_len {
+            None => self.max_len,
+            Some(n) => n.min(self.max_len).max(1),
+        };
         let (ids, mask_i64, _tti) =
             pool::build_tensors_from_ids(&token_ids, batch, max_seq, self.pad_id);
 
