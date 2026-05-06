@@ -220,6 +220,7 @@ async fn main() {
                 move |token_ids| m.embed_tokens(&token_ids),
                 cfg.batch_max_tokens,
                 cfg.batch_max,
+                cfg.batch_max_seq,
                 /*padded_model*/ true,
                 cfg.batch_wait_ms,
                 cfg.max_queue_size,
@@ -289,6 +290,7 @@ async fn main() {
                 // Embed batchers still use cfg.batch_max — see the embed
                 // model loop above.
                 cfg.reranker_batch_max,
+                cfg.batch_max_seq,
                 def.padded_model,
                 cfg.batch_wait_ms,
                 cfg.max_queue_size,

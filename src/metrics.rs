@@ -198,6 +198,23 @@ pub fn record_padding_waste(model: &str, padded: usize, raw: usize) {
     .record(ratio);
 }
 
+/// Increment the seq-capped counter — fired when a batch is split
+/// because admitting another item would push `max(seq_len)` strictly
+/// above `BATCH_MAX_SEQ`. Distinct from the legacy `embed_carry_events_total`
+/// (which fires on ANY overflow reason): rising
+/// `embed_batch_seq_capped_total` specifically indicates long-doc
+/// outliers being isolated into their own batches — the desired
+/// behaviour. Operators expect non-zero values whenever real prod
+/// traffic mixes long and short documents.
+pub fn record_seq_capped(model: &str) {
+    metrics::counter!(
+        "embed_batch_seq_capped_total",
+        "model" => model.to_string(),
+        "reason" => "seq_overflow"
+    )
+    .increment(1);
+}
+
 /// Increment the carry-events counter (token-budget overflow deferred
 /// an item into the next batch). A rising rate here is a signal that
 /// clients send heterogeneous sizes — consider length-bucketing.

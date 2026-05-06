@@ -71,6 +71,7 @@ Single process serving three model classes concurrently:
 | `BATCHING_ENABLED`           | `true` | |
 | `BATCH_MAX`                  | `32` | Coalesced batch cap |
 | `BATCH_MAX_TOKENS`           | `16384` | Token-budget cap (TEI-style, real limiter) |
+| `BATCH_MAX_SEQ`              | `256` | Per-batch `max(seq_len)` cap. Long-doc outliers split into B=1 batches so shorts don't pad up. Counter `embed_batch_seq_capped_total{reason="seq_overflow"}`. |
 | `BATCH_WAIT_MS`              | `30` | Coalescing window |
 | `MAX_QUEUE_SIZE`             | `256` | Queue cap → 503 |
 | `CACHE_MAX_ENTRIES`          | `10000` | moka embedding cache |

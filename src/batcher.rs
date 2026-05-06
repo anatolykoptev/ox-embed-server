@@ -93,6 +93,13 @@ struct BatcherConfig {
     /// Soft cap on items (texts) per batch. Kept for fairness — otherwise
     /// a single giant multi-text request could monopolise a dispatch.
     max_batch_items: usize,
+    /// Cap on the longest token sequence in a batch. When admitting an
+    /// item would push `max(current_max_seq, item.seq_len)` strictly
+    /// above this value AND the batch already has items, the item is
+    /// deferred (carried) to the next batch. Empty batches always
+    /// admit their first item regardless of seq_len so a single long-
+    /// doc request never starves. See `BatchAccum::seq_capped_by`.
+    max_batch_seq: usize,
     /// True for BERT-style encoders where every sequence in a batch is
     /// padded to `max(seq_len)`: total compute scales with the padded
     /// product, so the budget must account for that. False for models
@@ -119,11 +126,13 @@ impl DynamicBatcher {
     /// The first item of a fresh batch is ALWAYS admitted, even if on its
     /// own it would exceed the budget (otherwise a single long request
     /// could never make progress).
+    #[allow(clippy::too_many_arguments)]
     pub fn with_tokens<F>(
         name: &str,
         embed_fn: F,
         max_batch_tokens: usize,
         max_batch_items: usize,
+        max_batch_seq: usize,
         padded_model: bool,
         wait_ms: u64,
         max_queue: usize,
@@ -136,6 +145,7 @@ impl DynamicBatcher {
         let cfg = BatcherConfig {
             max_batch_tokens,
             max_batch_items,
+            max_batch_seq,
             padded_model,
             wait: Duration::from_millis(wait_ms),
         };
@@ -275,6 +285,11 @@ impl BatchAccum {
     /// Gate is strict `<`: the padded product `new_max * new_items` must
     /// be strictly less than `max_batch_tokens`. A value exactly equal to
     /// the budget is treated as overflow and deferred.
+    ///
+    /// The seq cap (`cfg.max_batch_seq`) is enforced separately via
+    /// `seq_capped_by` at the call site so the worker can record the
+    /// distinct overflow reason in metrics. `fits` here covers only the
+    /// items-cap and token-budget gates.
     fn fits(&self, item: &Item, cfg: &BatcherConfig) -> bool {
         let new_items = self.items + item.n_texts();
         // Honour item-count fairness cap.
@@ -288,6 +303,17 @@ impl BatchAccum {
             self.total_tokens + item.total_tokens()
         };
         total_if_added < cfg.max_batch_tokens
+    }
+
+    /// True iff admitting `item` would push `max(current_max_len,
+    /// item.max_seq_len())` strictly above `cfg.max_batch_seq`.
+    ///
+    /// Checked only when the batch already has items — the empty-batch
+    /// path admits the first item unconditionally so a single long-doc
+    /// request never starves. Co-equal with `fits`'s token-budget gate;
+    /// either failing carries the item to the next batch.
+    fn seq_capped_by(&self, item: &Item, cfg: &BatcherConfig) -> bool {
+        max(self.max_len, item.max_seq_len()) > cfg.max_batch_seq
     }
 }
 
@@ -324,6 +350,11 @@ async fn run_worker(
             if !cfg.padded_model && accum.total_tokens >= cfg.max_batch_tokens {
                 break;
             }
+            // No early-break for `accum.max_len >= cfg.max_batch_seq`:
+            // any further item with seq_len ≤ accum.max_len still fits
+            // (the per-admission seq gate is strict `>` on the post-add
+            // max). Stopping here would lose coalescing opportunities
+            // for short items behind a long one.
             let rem = deadline
                 .checked_duration_since(Instant::now())
                 .unwrap_or(Duration::ZERO);
@@ -335,15 +366,37 @@ async fn run_worker(
                         crate::metrics::record_cancelled(&name);
                         continue;
                     }
-                    if accum.fits(&item, &cfg) {
-                        accum.push(&item);
-                        batch.push(item);
-                    } else {
+                    // Two independent overflow gates:
+                    //  1. `seq_capped_by`: longest sequence in the
+                    //     candidate-augmented batch would exceed
+                    //     `BATCH_MAX_SEQ`. Splits long-doc outliers
+                    //     into their own (possibly B=1) batch so they
+                    //     don't force shorter neighbours to pad up.
+                    //  2. `fits`: items / token-budget caps.
+                    // The seq gate fires only when the batch already
+                    // has items; an empty batch (`accum.items == 0`)
+                    // bypasses it so single-long-doc requests can
+                    // always make progress on their own.
+                    let seq_overflow = accum.items > 0 && accum.seq_capped_by(&item, &cfg);
+                    if seq_overflow {
+                        // Preserve the legacy `embed_carry_events_total`
+                        // counter (operators alert on it) AND emit the
+                        // new reason-tagged counter so dashboards can
+                        // distinguish seq-overflow from token-budget
+                        // overflow.
+                        crate::metrics::record_carry(&name);
+                        crate::metrics::record_seq_capped(&name);
+                        carry = Some(item);
+                        break;
+                    }
+                    if !accum.fits(&item, &cfg) {
                         // Overflow: defer to the next batch (don't drop).
                         crate::metrics::record_carry(&name);
                         carry = Some(item);
                         break;
                     }
+                    accum.push(&item);
+                    batch.push(item);
                 }
                 _ => break,
             }
@@ -481,6 +534,7 @@ mod tests {
             embed_fn,
             /*max_batch_tokens*/ usize::MAX,
             /*max_batch_items*/ max_items,
+            /*max_batch_seq*/ usize::MAX,
             /*padded_model*/ false,
             wait_ms,
             max_queue,
@@ -555,6 +609,7 @@ mod tests {
             },
             1000,
             10,
+            /*max_batch_seq*/ usize::MAX,
             true,
             50,
             16,
@@ -887,6 +942,7 @@ mod tests {
             },
             /*max_batch_tokens*/ 1000,
             /*max_batch_items*/ 100,
+            /*max_batch_seq*/ usize::MAX,
             /*padded_model*/ true,
             /*wait_ms*/ 50,
             /*max_queue*/ 16,
@@ -944,6 +1000,7 @@ mod tests {
             },
             /*max_batch_tokens*/ 1000,
             /*max_batch_items*/ 100,
+            /*max_batch_seq*/ usize::MAX,
             /*padded_model*/ false,
             /*wait_ms*/ 80,
             /*max_queue*/ 32,
@@ -997,6 +1054,7 @@ mod tests {
             },
             /*max_batch_tokens*/ 1000,
             /*max_batch_items*/ 100,
+            /*max_batch_seq*/ usize::MAX,
             /*padded_model*/ true,
             /*wait_ms*/ 20,
             /*max_queue*/ 4,
@@ -1015,6 +1073,7 @@ mod tests {
         let cfg = BatcherConfig {
             max_batch_tokens: 1000,
             max_batch_items: 100,
+            max_batch_seq: usize::MAX,
             padded_model: true,
             wait: Duration::from_millis(1),
         };
@@ -1045,6 +1104,7 @@ mod tests {
         let cfg = BatcherConfig {
             max_batch_tokens: 1000,
             max_batch_items: 100,
+            max_batch_seq: usize::MAX,
             padded_model: false,
             wait: Duration::from_millis(1),
         };
@@ -1078,6 +1138,7 @@ mod tests {
         let cfg = BatcherConfig {
             max_batch_tokens: usize::MAX,
             max_batch_items: 2,
+            max_batch_seq: usize::MAX,
             padded_model: false,
             wait: Duration::from_millis(1),
         };
@@ -1115,6 +1176,7 @@ mod tests {
             |ids: Vec<Vec<u32>>| Ok(ids.iter().map(|_| vec![0.0f32; 4]).collect()),
             /*max_batch_tokens*/ 1000,
             /*max_batch_items*/ 100,
+            /*max_batch_seq*/ usize::MAX,
             /*padded_model*/ true,
             /*wait_ms*/ 50,
             /*max_queue*/ 16,
@@ -1345,5 +1407,205 @@ mod tests {
             .and_then(|l| l.rsplit_once(' '))
             .and_then(|(_, v)| v.trim().parse::<u64>().ok())
             .unwrap_or(0)
+    }
+
+    // -----------------------------------------------------------------
+    // Per-batch max_seq cap (BATCH_MAX_SEQ).
+    //
+    // Architectural waste fix: one 500-token doc batched with 7×50-token
+    // docs forces all 8 to pad to 500 → tensor `[8, 500]` ≈ 10× honest
+    // token volume. With `max_batch_seq=256`, the long-doc admission
+    // gate splits the outlier into its own (B=1) batch.
+    // -----------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn long_doc_isolated_when_seq_exceeds_cap() {
+        // Seed: one 500-tok item arrives first (max_seq=500). Then
+        // many shorts arrive — under the legacy padding-to-longest
+        // behaviour they would all pad to 500. With `max_batch_seq=256`
+        // they must NOT join the seed: shorts whose admission would
+        // keep current_max_seq=500 above the cap are deferred.
+        let log: Arc<Mutex<Vec<Vec<usize>>>> = Arc::new(Mutex::new(vec![]));
+        let l = log.clone();
+        let b = Arc::new(DynamicBatcher::with_tokens(
+            "t_seq_long_first",
+            move |ids: Vec<Vec<u32>>| {
+                l.lock()
+                    .unwrap()
+                    .push(ids.iter().map(|i| i.len()).collect());
+                Ok(ids.iter().map(|_| vec![0.0f32; 4]).collect())
+            },
+            /*max_batch_tokens*/ usize::MAX,
+            /*max_batch_items*/ 100,
+            /*max_batch_seq*/ 256,
+            /*padded_model*/ true,
+            /*wait_ms*/ 50,
+            /*max_queue*/ 32,
+        ));
+        let b_first = b.clone();
+        let first = tokio::spawn(async move { b_first.embed_tokens(vec![vec![0u32; 500]]).await });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let mut rest = vec![];
+        for _ in 0..7 {
+            let bc = b.clone();
+            rest.push(tokio::spawn(async move {
+                bc.embed_tokens(vec![vec![0u32; 50]]).await
+            }));
+        }
+        let _ = first.await;
+        for h in rest {
+            let _ = h.await;
+        }
+        let batches = log.lock().unwrap();
+        // Long doc isolated: every batch is either ALL shorts or
+        // exactly the lone 500-token outlier. No batch should mix.
+        let has_isolated_long = batches.iter().any(|b| b == &vec![500usize]);
+        assert!(
+            has_isolated_long,
+            "expected a B=1 batch holding only the 500-tok item, got {batches:?}"
+        );
+        for b in batches.iter() {
+            let has_long = b.iter().any(|&n| n > 256);
+            let has_short = b.iter().any(|&n| n <= 256);
+            assert!(
+                !(has_long && has_short),
+                "long and short docs must not share a batch: {b:?}"
+            );
+        }
+        drop(batches);
+        Arc::try_unwrap(b)
+            .ok()
+            .expect("still has clones")
+            .shutdown(Duration::from_millis(200))
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn short_docs_pack_normally_when_under_cap() {
+        // All items are 50 tokens, well under the 256 cap. The seq
+        // gate must not interfere: shorts coalesce into a single batch
+        // (subject to the timer, not the seq cap).
+        let log: Arc<Mutex<Vec<Vec<usize>>>> = Arc::new(Mutex::new(vec![]));
+        let l = log.clone();
+        let b = Arc::new(DynamicBatcher::with_tokens(
+            "t_seq_all_short",
+            move |ids: Vec<Vec<u32>>| {
+                l.lock()
+                    .unwrap()
+                    .push(ids.iter().map(|i| i.len()).collect());
+                Ok(ids.iter().map(|_| vec![0.0f32; 4]).collect())
+            },
+            /*max_batch_tokens*/ usize::MAX,
+            /*max_batch_items*/ 100,
+            /*max_batch_seq*/ 256,
+            /*padded_model*/ true,
+            /*wait_ms*/ 80,
+            /*max_queue*/ 32,
+        ));
+        let mut handles = vec![];
+        for _ in 0..8 {
+            let bc = b.clone();
+            handles.push(tokio::spawn(async move {
+                bc.embed_tokens(vec![vec![0u32; 50]]).await
+            }));
+        }
+        for h in handles {
+            let _ = h.await;
+        }
+        let batches = log.lock().unwrap();
+        let total_items: usize = batches.iter().map(|b| b.len()).sum();
+        assert_eq!(total_items, 8, "all 8 short items must dispatch");
+        // Every dispatched batch holds only ≤256-token items.
+        for b in batches.iter() {
+            for &n in b {
+                assert!(n <= 256, "short-only batch leaked a {n}-tok item");
+            }
+        }
+        drop(batches);
+        Arc::try_unwrap(b)
+            .ok()
+            .expect("still has clones")
+            .shutdown(Duration::from_millis(200))
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn seq_capped_metric_increments_on_split() {
+        let handle = test_prometheus_handle();
+        let name = "t_seq_capped_metric";
+        let b = Arc::new(DynamicBatcher::with_tokens(
+            name,
+            |ids: Vec<Vec<u32>>| Ok(ids.iter().map(|_| vec![0.0f32; 4]).collect()),
+            /*max_batch_tokens*/ usize::MAX,
+            /*max_batch_items*/ 100,
+            /*max_batch_seq*/ 100,
+            /*padded_model*/ true,
+            /*wait_ms*/ 50,
+            /*max_queue*/ 16,
+        ));
+        // First a 50-tok item seeds the batch, then a 500-tok item
+        // arrives: max(50, 500) = 500 > 100 → seq gate fires.
+        let b1 = b.clone();
+        let first = tokio::spawn(async move { b1.embed_tokens(vec![vec![0u32; 50]]).await });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let b2 = b.clone();
+        let second = tokio::spawn(async move { b2.embed_tokens(vec![vec![0u32; 500]]).await });
+        let _ = first.await;
+        let _ = second.await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let text = handle.render();
+        let needle = format!(
+            "embed_batch_seq_capped_total{{model=\"{name}\",reason=\"seq_overflow\"}}"
+        );
+        assert!(
+            text.contains(&needle),
+            "expected `{needle}` in /metrics render:\n{text}"
+        );
+        Arc::try_unwrap(b)
+            .ok()
+            .expect("still has clones")
+            .shutdown(Duration::from_millis(200))
+            .await;
+    }
+
+    #[test]
+    fn batch_accum_seq_capped_by_strict_greater_than() {
+        let cfg = BatcherConfig {
+            max_batch_tokens: usize::MAX,
+            max_batch_items: 100,
+            max_batch_seq: 256,
+            padded_model: true,
+            wait: Duration::from_millis(1),
+        };
+        // Seed: 50-tok item → accum.max_len = 50.
+        let seed = Item {
+            token_ids: vec![vec![0u32; 50]],
+            reply: oneshot::channel().0,
+            enqueued_at: Instant::now(),
+        };
+        let mut accum = BatchAccum::default();
+        accum.push(&seed);
+
+        // Candidate equal to cap: max(50, 256) = 256, NOT strictly > 256 → admits.
+        let cand_eq = Item {
+            token_ids: vec![vec![0u32; 256]],
+            reply: oneshot::channel().0,
+            enqueued_at: Instant::now(),
+        };
+        assert!(
+            !accum.seq_capped_by(&cand_eq, &cfg),
+            "candidate at cap (==) must not trigger seq gate (strict `>`)"
+        );
+
+        // Candidate over cap: max(50, 257) = 257 > 256 → fires.
+        let cand_over = Item {
+            token_ids: vec![vec![0u32; 257]],
+            reply: oneshot::channel().0,
+            enqueued_at: Instant::now(),
+        };
+        assert!(
+            accum.seq_capped_by(&cand_over, &cfg),
+            "candidate above cap (>) must trigger seq gate"
+        );
     }
 }
