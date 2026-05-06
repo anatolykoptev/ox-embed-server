@@ -60,6 +60,18 @@ pub struct Config {
     pub rerankers: Vec<RerankerModelDef>,
     pub default_model: String,
     pub intra_threads: usize,
+    /// Number of ONNX `Session` instances loaded per embedding model.
+    /// Each session can run inference independently, so concurrent
+    /// `/v1/embeddings` calls hitting the same model can run in parallel
+    /// up to `embed_pool_size` at a time. `1` (the default) preserves
+    /// the legacy single-Mutex<Session> behaviour byte-for-byte.
+    ///
+    /// IMPORTANT: ort 2.0-rc has no shared-weights mode — each pool
+    /// member pays its own ~400 MiB (e5-large) / ~250 MiB (jina-code-v2)
+    /// weight buffer. When raising above 1, lower
+    /// `EMBED_INTRA_THREADS` so `pool_size * intra_threads` stays at or
+    /// below the available CPU cores. See CLAUDE.md "Environment" table.
+    pub embed_pool_size: usize,
     /// Number of ONNX `Session` instances loaded per reranker model.
     /// Each session can run inference independently, so requests scoring
     /// pairs against the same reranker can run in parallel up to
@@ -245,10 +257,25 @@ impl Config {
             ));
         }
 
+        // Default lowered 4 → 2 (2026-05-06): kernel-level perf audit
+        // measured 5× ORT thread oversubscription on a 4-core ARM
+        // Neoverse-N1 host with 14 intra_op threads in flight (4×e5
+        // sessions × 4 threads + reranker pool overhead). DynamicQuantize-
+        // MatMul + MatMulIntegerToFloat are 73.8 % of inference time
+        // (NEON asimddp INT8 GEMM at the hardware ceiling — IPC=2.46,
+        // cache_miss=1.3 %), so the bottleneck is contention, not
+        // kernels. Two threads/inference + EMBED_SESSION_POOL_SIZE=2
+        // yields 4 concurrent slots × 2 threads = 8 ORT threads on 4
+        // cores = 2× oversub instead of 5×, ~2× throughput under load
+        // at the cost of ~10–20 % solo-inference latency. Operators on
+        // dedicated-CPU hosts can override back to 4.
         let intra_threads = env::var("EMBED_INTRA_THREADS")
-            .unwrap_or_else(|_| "4".into())
+            .unwrap_or_else(|_| "2".into())
             .parse::<usize>()
             .map_err(|e| format!("invalid EMBED_INTRA_THREADS: {e}"))?;
+
+        let embed_pool_size =
+            parse_embed_pool_size(env::var("EMBED_SESSION_POOL_SIZE").ok().as_deref());
 
         let reranker_pool_size =
             parse_reranker_pool_size(env::var("RERANKER_SESSION_POOL_SIZE").ok().as_deref());
@@ -371,6 +398,7 @@ impl Config {
             rerankers,
             default_model,
             intra_threads,
+            embed_pool_size,
             reranker_pool_size,
             reranker_intra_threads,
             splades,
@@ -516,6 +544,30 @@ fn parse_embed_warmup_seq_len(raw: Option<&str>) -> Option<usize> {
                 }
             }
         }
+    }
+}
+
+/// Parse `EMBED_SESSION_POOL_SIZE`. Same contract as
+/// `parse_reranker_pool_size`: default 1 (single-session, byte-for-byte
+/// equivalent to the pre-pool path), `0` rejected with a warn (would
+/// `% 0` panic at request time), garbage falls back silently. ort 2.0-rc
+/// has no shared-weights mode, so each pool member duplicates the
+/// ~400 MiB weight buffer — operators opt in only when they have the
+/// memory headroom AND want concurrency. Exposed for testing.
+fn parse_embed_pool_size(raw: Option<&str>) -> usize {
+    const DEFAULT: usize = 1;
+    match raw {
+        None => DEFAULT,
+        Some(s) => match s.trim().parse::<usize>() {
+            Ok(0) => {
+                tracing::warn!(
+                    "EMBED_SESSION_POOL_SIZE=0 is invalid; falling back to default {DEFAULT}"
+                );
+                DEFAULT
+            }
+            Ok(n) => n,
+            Err(_) => DEFAULT,
+        },
     }
 }
 
@@ -940,6 +992,40 @@ mod tests {
         // Invalid padded boolean.
         let err = parse_rerankers("bad:/a:512:maybe").unwrap_err();
         assert!(err.contains("padded"), "unexpected err: {err}");
+    }
+
+    // -----------------------------------------------------------------
+    // EMBED_SESSION_POOL_SIZE parser. Same contract as
+    // RERANKER_SESSION_POOL_SIZE — default 1, `0` rejected, garbage
+    // falls back to default.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn embed_pool_size_default_is_1_when_unset() {
+        assert_eq!(parse_embed_pool_size(None), 1);
+    }
+
+    #[test]
+    fn embed_pool_size_parses_valid_positive_integer() {
+        assert_eq!(parse_embed_pool_size(Some("1")), 1);
+        assert_eq!(parse_embed_pool_size(Some("2")), 2);
+        assert_eq!(parse_embed_pool_size(Some("4")), 4);
+        // Trim whitespace, same as reranker parser.
+        assert_eq!(parse_embed_pool_size(Some("  3  ")), 3);
+    }
+
+    #[test]
+    fn embed_pool_size_rejects_zero() {
+        // `0` would `% 0` panic in `embed_tokens`.
+        assert_eq!(parse_embed_pool_size(Some("0")), 1);
+        assert_eq!(parse_embed_pool_size(Some("  0  ")), 1);
+    }
+
+    #[test]
+    fn embed_pool_size_falls_back_on_garbage() {
+        assert_eq!(parse_embed_pool_size(Some("nope")), 1);
+        assert_eq!(parse_embed_pool_size(Some("")), 1);
+        assert_eq!(parse_embed_pool_size(Some("-1")), 1);
     }
 
     // -----------------------------------------------------------------

@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use ndarray::Array2;
@@ -73,9 +74,22 @@ fn parse_opt_level() -> GraphOptimizationLevel {
     }
 }
 
-/// Wraps an ONNX session + tokenizer for a single embedding model.
+/// Wraps a pool of ONNX sessions + a single tokenizer for one embedding
+/// model.
+///
+/// `sessions` mirrors the reranker pool (`model_reranker/load.rs`):
+/// `pool_size==1` is byte-for-byte equivalent to the legacy
+/// `Mutex<Session>` path (single-element vector, `next` always %1 == 0).
+/// `pool_size>1` lets concurrent `embed_tokens` calls run inference in
+/// parallel under independent Mutexes — round-robin via `next` keeps the
+/// load even without coordination.
+///
+/// IMPORTANT: ort 2.0-rc has no shared-weights mode, so each pool member
+/// holds its own ~400 MiB weight buffer. The pool size is intentionally
+/// off by default (operator opt-in via `EMBED_SESSION_POOL_SIZE`).
 pub struct EmbedModel {
-    session: Mutex<Session>,
+    sessions: Vec<Mutex<Session>>,
+    next: AtomicUsize,
     tokenizer: Tokenizer,
     pub dim: usize,
     max_len: usize,
@@ -90,7 +104,22 @@ impl EmbedModel {
     /// `auto_truncate`: if true (TEI-compat default), the tokenizer silently
     /// truncates inputs longer than `def.max_len`. If false, truncation is
     /// left disabled on the tokenizer.
-    pub fn load(def: &ModelDef, intra_threads: usize, auto_truncate: bool) -> Result<Self, String> {
+    ///
+    /// `pool_size` controls how many independent ONNX sessions are
+    /// created. `1` (the historical default) preserves the legacy
+    /// single-session path exactly. Values >1 enable concurrent
+    /// inference, at N× the per-session weight memory cost — see the
+    /// struct doc comment.
+    pub fn load(
+        def: &ModelDef,
+        intra_threads: usize,
+        auto_truncate: bool,
+        pool_size: usize,
+    ) -> Result<Self, String> {
+        // Defensive clamp — caller contract says >=1, but a stray 0 from
+        // misconfigured plumbing would `% 0` panic in `embed_tokens`.
+        let pool_size = pool_size.max(1);
+
         let dir = Path::new(&def.dir);
 
         let onnx_path = dir.join("model_quantized.onnx");
@@ -104,53 +133,15 @@ impl EmbedModel {
         }
 
         let opt_level = parse_opt_level();
-        let cache = CacheDir::from_env();
-        let plan = LoadPlan::decide(cache.as_ref(), &onnx_path);
         tracing::info!(
             path = %onnx_path.display(),
             ?opt_level,
-            cache_state = ?std::mem::discriminant(&plan),
-            "creating ONNX session"
+            pool_size,
+            intra_threads,
+            "creating ONNX session(s)"
         );
-        // memory_pattern=true: ORT plans scratch reuse within the shared
-        // env-level arena (registered in `arena.rs`). Combined with
-        // `DisableCpuMemArena` (PR #34), the session has only the shared
-        // arena to draw from — pattern planning amortizes per-shape
-        // scratch allocations across requests, dramatically cutting
-        // fragmentation under variable-shape traffic.
-        //
-        // Why this is now safe (vs. the workaround-disable in PR #19/#31):
-        // earlier code path created BOTH a per-session BFCArena AND the
-        // shared arena, so memory_pattern=true duplicated commits — every
-        // distinct (batch, seq_len) shape permanently consumed space in
-        // each. PR #34's V2 arena registration + `DisableCpuMemArena`
-        // collapsed that to a single arena, so pattern planning now
-        // produces reuse instead of duplication.
-        let builder = Session::builder().map_err(|e| format!("session builder: {e}"))?;
-        let builder = onnx_cache::apply_plan(builder, &plan, opt_level)?;
-        let load_path = plan.load_source(&onnx_path).to_path_buf();
-        let t_commit = std::time::Instant::now();
-        let session = builder
-            .with_intra_threads(intra_threads)
-            .map_err(|e| format!("set threads: {e}"))?
-            // memory_pattern=true: see comment block above.
-            .with_memory_pattern(true)
-            .map_err(|e| format!("enable memory pattern: {e}"))?
-            // Use the shared env-level arena registered in arena.rs (kSameAsRequested + bounded max_mem).
-            // Avoids per-session BFCArena duplication and unbounded extension growth.
-            .with_env_allocators()
-            .map_err(|e| format!("enable env allocators: {e}"))?
-            // Belt-and-braces: disable the per-session CPU mem arena. Without
-            // this, ORT's CPU EP defaults to `EnableCpuMemArena=1` and may
-            // still spawn a session-local BFCArena alongside our shared one,
-            // doubling allocator state. `with_env_allocators` makes the
-            // session look up the env arena, but does NOT by itself stop the
-            // session-local arena from being created.
-            .with_execution_providers([ep::CPU::default().with_arena_allocator(false).build()])
-            .map_err(|e| format!("disable per-session cpu mem arena: {e}"))?
-            .commit_from_file(&load_path)
-            .map_err(|e| format!("load ONNX {}: {e}", load_path.display()))?;
-        onnx_cache::observe_post_commit(&plan, t_commit.elapsed().as_millis());
+
+        let sessions = build_session_pool(&onnx_path, opt_level, intra_threads, pool_size)?;
 
         tracing::info!(path = %tok_path.display(), "loading tokenizer");
         let mut tokenizer =
@@ -165,17 +156,28 @@ impl EmbedModel {
             pad_id = def.pad_id,
             has_tti = def.has_token_type_ids,
             auto_truncate,
+            pool_size,
             "loaded model"
         );
 
         Ok(Self {
-            session: Mutex::new(session),
+            sessions,
+            next: AtomicUsize::new(0),
             tokenizer,
             dim: def.dim,
             max_len: def.max_len,
             pad_id: def.pad_id,
             has_token_type_ids: def.has_token_type_ids,
         })
+    }
+
+    /// Number of sessions in the inference pool. Used by tests to assert
+    /// `pool_size` plumbing and by future ops tooling. Held even when the
+    /// production hot path doesn't read it — mirrors the reranker
+    /// `session_count` accessor for symmetry.
+    #[allow(dead_code)]
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
     }
 
     /// Tokenize a batch of texts into their `input_ids`. Truncation is
@@ -213,13 +215,24 @@ impl EmbedModel {
             return Ok(vec![]);
         }
 
-        // Pad to the longest sequence in the batch, capped at model max.
-        let max_seq = token_ids
+        // Pad to the longest sequence in the batch, capped at model max,
+        // then round UP to the next power of two (also capped at
+        // `self.max_len`). NEON INT8 GEMM tile sizes on ARM Neoverse-N1
+        // are 4×4 / 8×8 — power-of-two seq dims hit cleaner tiling and
+        // typically save a partial-tile epilogue on the last block.
+        // Correctness is preserved: `pool::build_tensors_from_ids` zero-
+        // fills the mask over padded positions, and
+        // `pool::mean_pool_normalize` averages only positions where
+        // mask > 0, so the extra padded tokens contribute neither to the
+        // mean nor to the L2 norm. Kept on its own commit so it can be
+        // reverted in isolation if a future model produces drift.
+        let real_max_seq = token_ids
             .iter()
             .map(|v| v.len())
             .max()
             .unwrap_or(0)
             .min(self.max_len);
+        let max_seq = round_up_seq_len(real_max_seq, self.max_len);
 
         let batch = token_ids.len();
         let (ids, mask_i64, tti) =
@@ -233,7 +246,15 @@ impl EmbedModel {
         let ids_tensor = Tensor::from_array(ids_arr).map_err(|e| format!("ids tensor: {e}"))?;
         let mask_tensor = Tensor::from_array(mask_arr).map_err(|e| format!("mask tensor: {e}"))?;
 
-        let mut session = self.session.lock().map_err(|e| format!("lock: {e}"))?;
+        // Round-robin pick from the pool. With pool_size==1 this always
+        // resolves to index 0 — identical lock pattern to the legacy
+        // single-Mutex<Session> code. With pool_size>1, concurrent callers
+        // (in the steady state) land on different sessions and run
+        // inference in parallel under separate locks.
+        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.sessions.len();
+        let mut session = self.sessions[idx]
+            .lock()
+            .map_err(|e| format!("lock session #{idx}: {e}"))?;
 
         let outputs = if self.has_token_type_ids {
             let tti_arr = Array2::from_shape_vec([batch, max_seq], tti)
@@ -342,61 +363,192 @@ impl EmbedModel {
         };
         let (ids, mask_i64, tti) =
             pool::build_tensors_from_ids(&token_ids, batch, max_seq, self.pad_id);
-        let ids_arr = Array2::from_shape_vec([batch, max_seq], ids)
-            .map_err(|e| format!("warmup ids shape (batch={batch}): {e}"))?;
-        let mask_arr = Array2::from_shape_vec([batch, max_seq], mask_i64)
-            .map_err(|e| format!("warmup mask shape (batch={batch}): {e}"))?;
-        let ids_tensor =
-            Tensor::from_array(ids_arr).map_err(|e| format!("warmup ids tensor: {e}"))?;
-        let mask_tensor =
-            Tensor::from_array(mask_arr).map_err(|e| format!("warmup mask tensor: {e}"))?;
 
-        let start = Instant::now();
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|e| format!("warmup lock (batch={batch}): {e}"))?;
+        // Warm EVERY session in the pool — without this, only the first
+        // session served by round-robin would be hot; the second would
+        // pay the cold-start cost on its first concurrent request.
+        for (i, sess_mu) in self.sessions.iter().enumerate() {
+            let ids_arr = Array2::from_shape_vec([batch, max_seq], ids.clone())
+                .map_err(|e| format!("warmup ids shape (batch={batch}): {e}"))?;
+            let mask_arr = Array2::from_shape_vec([batch, max_seq], mask_i64.clone())
+                .map_err(|e| format!("warmup mask shape (batch={batch}): {e}"))?;
+            let ids_tensor =
+                Tensor::from_array(ids_arr).map_err(|e| format!("warmup ids tensor: {e}"))?;
+            let mask_tensor =
+                Tensor::from_array(mask_arr).map_err(|e| format!("warmup mask tensor: {e}"))?;
 
-        let run_result = if self.has_token_type_ids {
-            let tti_arr = Array2::from_shape_vec([batch, max_seq], tti)
-                .map_err(|e| format!("warmup tti shape (batch={batch}): {e}"))?;
-            let tti_tensor =
-                Tensor::from_array(tti_arr).map_err(|e| format!("warmup tti tensor: {e}"))?;
-            session.run(ort::inputs! {
-                "input_ids" => ids_tensor,
-                "attention_mask" => mask_tensor,
-                "token_type_ids" => tti_tensor,
-            })
-        } else {
-            session.run(ort::inputs! {
-                "input_ids" => ids_tensor,
-                "attention_mask" => mask_tensor,
-            })
-        };
+            let start = Instant::now();
+            let mut session = sess_mu
+                .lock()
+                .map_err(|e| format!("warmup lock session #{i} (batch={batch}): {e}"))?;
 
-        match run_result {
-            Ok(_) => tracing::info!(
-                model = %name,
-                // EmbedModel currently holds a single Mutex<Session>
-                // (no pool support yet — see struct comment). Stamp
-                // session=0 so the log shape is identical across the
-                // three model kinds; future EmbedModel pooling can
-                // expand this to a `for (i, s) in pool.iter()` loop
-                // without changing the log schema.
-                session = 0,
-                batch,
-                elapsed_ms = start.elapsed().as_millis() as u64,
-                "embed session warmed"
-            ),
-            Err(e) => tracing::error!(
-                model = %name,
-                session = 0,
-                batch,
-                error = %e,
-                "embed session warmup failed (continuing)"
-            ),
+            let run_result = if self.has_token_type_ids {
+                let tti_arr = Array2::from_shape_vec([batch, max_seq], tti.clone())
+                    .map_err(|e| format!("warmup tti shape (batch={batch}): {e}"))?;
+                let tti_tensor = Tensor::from_array(tti_arr)
+                    .map_err(|e| format!("warmup tti tensor: {e}"))?;
+                session.run(ort::inputs! {
+                    "input_ids" => ids_tensor,
+                    "attention_mask" => mask_tensor,
+                    "token_type_ids" => tti_tensor,
+                })
+            } else {
+                session.run(ort::inputs! {
+                    "input_ids" => ids_tensor,
+                    "attention_mask" => mask_tensor,
+                })
+            };
+
+            match run_result {
+                Ok(_) => tracing::info!(
+                    model = %name,
+                    session = i,
+                    batch,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "embed session warmed"
+                ),
+                Err(e) => tracing::error!(
+                    model = %name,
+                    session = i,
+                    batch,
+                    error = %e,
+                    "embed session warmup failed (continuing)"
+                ),
+            }
         }
         Ok(())
+    }
+}
+
+/// Round `n` up to the next power of two, capped at `cap` (and at least
+/// 1). Used by `embed_tokens` to align the per-batch `max_seq` to NEON
+/// INT8 GEMM tile sizes (4×4 / 8×8 on ARM Neoverse-N1) while never
+/// exceeding the model's static `max_len`. `n == 0` → 1, `n == cap` →
+/// `cap` (no rounding above the cap), `n` already a power of two →
+/// itself.
+fn round_up_seq_len(n: usize, cap: usize) -> usize {
+    if n <= 1 {
+        // Empty/singleton input → 1-token tensor. `max_len` is always
+        // >= 1 for any real model (config parser would reject 0), so
+        // we don't bother re-clamping at the cap here.
+        return 1;
+    }
+    // `next_power_of_two` is a no-op when `n` is already a power of two.
+    // Saturating math protects against the (theoretical) overflow on
+    // very large `cap` — in practice `cap == self.max_len ≤ 512`.
+    n.next_power_of_two().min(cap)
+}
+
+/// Build N independent ONNX sessions over the same model file. Mirrors
+/// the reranker `build_session_pool` in `model_reranker/load.rs` —
+/// there is no shared-weights mode in ort 2.0-rc, so each session pays
+/// its own ~400 MiB (multilingual-e5-large) / ~250 MiB (jina-code-v2)
+/// weight buffer cost in exchange for true parallelism under
+/// independent Mutexes.
+///
+/// memory_pattern + env-allocator + per-session-CPU-arena-disabled
+/// configuration is identical to the pre-pool single-session path —
+/// see the in-place comments at the call site below for rationale.
+fn build_session_pool(
+    onnx_path: &Path,
+    opt_level: GraphOptimizationLevel,
+    intra_threads: usize,
+    pool_size: usize,
+) -> Result<Vec<Mutex<Session>>, String> {
+    // Resolve the cache dir once per pool. The decision (hit / miss) is
+    // re-evaluated *per session* inside the loop: session 0 sees a miss
+    // and writes the optimized graph; sessions 1..N see a hit on their
+    // own re-check and skip the Level3 pass entirely.
+    let cache = CacheDir::from_env();
+    let mut sessions: Vec<Mutex<Session>> = Vec::with_capacity(pool_size);
+    for i in 0..pool_size {
+        let plan = LoadPlan::decide(cache.as_ref(), onnx_path);
+        let load_path = plan.load_source(onnx_path).to_path_buf();
+        let t_commit = std::time::Instant::now();
+        // memory_pattern=true: ORT plans scratch reuse within the shared
+        // env-level arena (registered in `arena.rs`). Combined with
+        // `DisableCpuMemArena` (PR #34), the session has only the shared
+        // arena to draw from — pattern planning amortizes per-shape
+        // scratch allocations across requests.
+        let builder = Session::builder().map_err(|e| format!("session builder #{i}: {e}"))?;
+        let builder = onnx_cache::apply_plan(builder, &plan, opt_level)
+            .map_err(|e| format!("apply cache plan #{i}: {e}"))?;
+        let session = builder
+            .with_intra_threads(intra_threads)
+            .map_err(|e| format!("set threads #{i}: {e}"))?
+            .with_memory_pattern(true)
+            .map_err(|e| format!("enable memory pattern #{i}: {e}"))?
+            // Use the shared env-level arena registered in arena.rs.
+            .with_env_allocators()
+            .map_err(|e| format!("enable env allocators #{i}: {e}"))?
+            // Belt-and-braces: disable the per-session CPU mem arena.
+            // Without this, ORT's CPU EP defaults to EnableCpuMemArena=1
+            // and may still spawn a session-local BFCArena alongside our
+            // shared one, doubling allocator state.
+            .with_execution_providers([ep::CPU::default().with_arena_allocator(false).build()])
+            .map_err(|e| format!("disable per-session cpu mem arena #{i}: {e}"))?
+            .commit_from_file(&load_path)
+            .map_err(|e| format!("load ONNX #{i} {}: {e}", load_path.display()))?;
+        onnx_cache::observe_post_commit(&plan, t_commit.elapsed().as_millis());
+        sessions.push(Mutex::new(session));
+    }
+    tracing::info!(count = sessions.len(), "embed ONNX session(s) created");
+    Ok(sessions)
+}
+
+#[cfg(test)]
+mod seq_pad_tests {
+    use super::round_up_seq_len;
+
+    #[test]
+    fn zero_rounds_to_one() {
+        // Empty input — degenerate, but an empty batch should not
+        // produce a 0-dim tensor. Cap=256 is a normal e5-large limit.
+        assert_eq!(round_up_seq_len(0, 256), 1);
+    }
+
+    #[test]
+    fn one_stays_one() {
+        // Power of two already; no rounding work.
+        assert_eq!(round_up_seq_len(1, 256), 1);
+    }
+
+    #[test]
+    fn rounds_up_to_next_power_of_two() {
+        // Sub-power values lift to the next tile boundary.
+        assert_eq!(round_up_seq_len(3, 256), 4);
+        assert_eq!(round_up_seq_len(5, 256), 8);
+        assert_eq!(round_up_seq_len(9, 256), 16);
+        assert_eq!(round_up_seq_len(17, 256), 32);
+        assert_eq!(round_up_seq_len(65, 256), 128);
+    }
+
+    #[test]
+    fn already_power_of_two_passes_through() {
+        for n in [2usize, 4, 8, 16, 32, 64, 128, 256] {
+            assert_eq!(
+                round_up_seq_len(n, 256),
+                n,
+                "{n} is already a power of two, must not round up"
+            );
+        }
+    }
+
+    #[test]
+    fn capped_at_model_max_len() {
+        // 200 → 256 if cap allows, else clamp at cap.
+        assert_eq!(round_up_seq_len(200, 256), 256);
+        // The static-shape cap is 256 — never exceed the model's
+        // declared max_len even if the next power of two would.
+        assert_eq!(round_up_seq_len(200, 200), 200);
+        assert_eq!(round_up_seq_len(257, 256), 256);
+        // Non-power-of-two cap (e.g. jina-code-v2 max_len=512 is fine,
+        // but cap=300 would clamp).
+        assert_eq!(round_up_seq_len(150, 300), 256);
+        // 250.next_power_of_two() == 256, well under cap=300.
+        assert_eq!(round_up_seq_len(250, 300), 256);
+        // 257.next_power_of_two() == 512, capped to 300.
+        assert_eq!(round_up_seq_len(257, 300), 300);
     }
 }
 
