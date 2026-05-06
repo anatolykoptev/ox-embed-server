@@ -157,6 +157,39 @@ async fn main() {
     }
     tracing::info!("ort runtime initialized");
 
+    // glibc `malloc_trim(0)` background task — port of the TEI pattern at
+    // `huggingface/text-embeddings-inference router/src/main.rs:222-229`.
+    //
+    // glibc's malloc keeps freed pages inside its mmap arenas instead of
+    // returning them to the OS. For ML inference workloads with large
+    // allocation spikes (per-batch ORT scratch, tokenizer buffers), this
+    // causes resident-set drift — process RSS climbs even when working
+    // set shrinks. `malloc_trim(0)` forces glibc to release all unused
+    // trailing pages back to the kernel. Complements (does not replace)
+    // the shared CPU arena registered above.
+    //
+    // 100 ms cadence matches TEI: non-blocking, low-overhead, and with
+    // `malloc_trim` itself being a fast no-op when there's nothing to
+    // release. Linux-only — `malloc_trim` is a glibc-specific extension,
+    // absent on macOS/Windows.
+    #[cfg(target_os = "linux")]
+    {
+        tokio::spawn(async {
+            let mut tick = tokio::time::interval(Duration::from_millis(100));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                // SAFETY: `malloc_trim` is documented thread-safe by glibc
+                // and takes no pointers; the only argument is a pad size in
+                // bytes (0 = release all unused trailing pages). Returns 1
+                // when memory was released, 0 otherwise.
+                let released = unsafe { libc::malloc_trim(0) } != 0;
+                metrics::record_malloc_trim(released);
+            }
+        });
+        tracing::info!("glibc malloc_trim(0) background task started (100ms cadence)");
+    }
+
     // Install Prometheus recorder BEFORE any gauge!()/counter!()/histogram!()
     // call. arena::register_shared_cpu_arena() below calls set_arena_gauges()
     // — without recorder installed first, those gauge writes are silently

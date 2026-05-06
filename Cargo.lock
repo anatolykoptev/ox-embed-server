@@ -409,6 +409,7 @@ version = "0.6.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
+ "libc",
  "metrics",
  "metrics-exporter-prometheus",
  "moka",

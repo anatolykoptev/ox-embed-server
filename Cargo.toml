@@ -31,6 +31,13 @@ opentelemetry-otlp = { version = "0.30", default-features = false, features = ["
 opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"] }
 tracing-opentelemetry = "0.31"
 
+# Linux-only: glibc `malloc_trim(0)` background task in `main.rs` returns
+# unused trailing arena pages to the OS on a 100 ms cadence (TEI pattern,
+# `router/src/main.rs:222-229`). Compiled out on macOS/Windows via cfg
+# guards in main.rs — the dependency itself only links on Linux.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [profile.release]
 opt-level = 3
 lto = "thin"
