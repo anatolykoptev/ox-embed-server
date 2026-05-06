@@ -71,6 +71,7 @@ Single process serving three model classes concurrently:
 | `BATCHING_ENABLED`           | `true` | |
 | `BATCH_MAX`                  | `32` | Coalesced batch cap |
 | `BATCH_MAX_TOKENS`           | `16384` | Token-budget cap (TEI-style, real limiter) |
+| `BATCH_MAX_SEQ`              | `256` | Per-batch `max(seq_len)` cap. Long-doc outliers split into B=1 batches so shorts don't pad up. Counter `embed_batch_seq_capped_total{reason="seq_overflow"}`. |
 | `BATCH_WAIT_MS`              | `30` | Coalescing window |
 | `MAX_QUEUE_SIZE`             | `256` | Queue cap → 503 |
 | `CACHE_MAX_ENTRIES`          | `10000` | moka embedding cache |
@@ -82,6 +83,7 @@ Single process serving three model classes concurrently:
 | `EMBED_ARENA_INITIAL_CHUNK_BYTES` | TBD (default 1048576 = 1 MiB) | First BFCArena allocation block size |
 | `EMBED_ARENA_MAX_DEAD_BYTES` | TBD (default 33554432 = 32 MiB) | Dead-bytes threshold for chunk reuse (aggressive vs ORT default 128 MiB) |
 | `EMBED_ARENA_EXTEND_STRATEGY` | TBD (default 1 = kSameAsRequested) | 0=kNextPowerOfTwo, 1=kSameAsRequested |
+| `EMBED_WARMUP_SEQ_LEN` | (default `128`) | Cap on warmup tensor `max_seq` for dense embedders + rerankers. `max` = pad to model `max_len` (legacy). With `memory_pattern=true`, ORT re-plans on first long prod request — saves 200-400 MiB resident vs worst-case warmup. |
 
 ## Deploy
 

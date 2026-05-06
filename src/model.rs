@@ -112,14 +112,20 @@ impl EmbedModel {
             cache_state = ?std::mem::discriminant(&plan),
             "creating ONNX session"
         );
-        // Disable memory pattern: ORT pre-allocates per static input shape.
-        // Our DynamicBatcher produces variable batch sizes (1..BATCH_MAX) and
-        // variable seq_len (truncated per token budget). With pattern enabled,
-        // each new (batch, seq_len) shape causes a fresh BFCArena extension
-        // that's never released — a 31-min run grew from 3GB to 8GB and
-        // cancelled queues across all models. Disabled, allocations are
-        // sized per-request; couple-ms latency hit per batch is dwarfed by
-        // the queue stalls we get under memory pressure.
+        // memory_pattern=true: ORT plans scratch reuse within the shared
+        // env-level arena (registered in `arena.rs`). Combined with
+        // `DisableCpuMemArena` (PR #34), the session has only the shared
+        // arena to draw from — pattern planning amortizes per-shape
+        // scratch allocations across requests, dramatically cutting
+        // fragmentation under variable-shape traffic.
+        //
+        // Why this is now safe (vs. the workaround-disable in PR #19/#31):
+        // earlier code path created BOTH a per-session BFCArena AND the
+        // shared arena, so memory_pattern=true duplicated commits — every
+        // distinct (batch, seq_len) shape permanently consumed space in
+        // each. PR #34's V2 arena registration + `DisableCpuMemArena`
+        // collapsed that to a single arena, so pattern planning now
+        // produces reuse instead of duplication.
         let builder = Session::builder().map_err(|e| format!("session builder: {e}"))?;
         let builder = onnx_cache::apply_plan(builder, &plan, opt_level)?;
         let load_path = plan.load_source(&onnx_path).to_path_buf();
@@ -127,13 +133,9 @@ impl EmbedModel {
         let session = builder
             .with_intra_threads(intra_threads)
             .map_err(|e| format!("set threads: {e}"))?
-            // memory_pattern=false: dynamic allocation per-inference, freed after each batch.
-            // Do NOT use memory_pattern=true + with_env_allocators() on a shared arena:
-            // every distinct (batch, seq_len) shape permanently commits arena space, so
-            // variable-shape traffic monotonically fills the 3 GiB cap → OOM (observed
-            // 2026-05-03, ~3h after cold start, 18/29 jina requests failing).
-            .with_memory_pattern(false)
-            .map_err(|e| format!("disable memory pattern: {e}"))?
+            // memory_pattern=true: see comment block above.
+            .with_memory_pattern(true)
+            .map_err(|e| format!("enable memory pattern: {e}"))?
             // Use the shared env-level arena registered in arena.rs (kSameAsRequested + bounded max_mem).
             // Avoids per-session BFCArena duplication and unbounded extension growth.
             .with_env_allocators()
@@ -277,7 +279,12 @@ impl EmbedModel {
     /// Best-effort: per-shape failure logs a warn and we continue with
     /// the next shape. The server still serves correctly without
     /// warmup; this is purely a tail-latency optimisation.
-    pub fn warmup(&self, name: &str, shapes: &[usize]) -> Result<(), String> {
+    pub fn warmup(
+        &self,
+        name: &str,
+        shapes: &[usize],
+        warmup_seq_len: Option<usize>,
+    ) -> Result<(), String> {
         if shapes.is_empty() {
             tracing::warn!(
                 model = %name,
@@ -286,7 +293,7 @@ impl EmbedModel {
             return Ok(());
         }
         for &batch in shapes {
-            if let Err(e) = self.warmup_at_shape(name, batch) {
+            if let Err(e) = self.warmup_at_shape(name, batch, warmup_seq_len) {
                 tracing::warn!(
                     model = %name,
                     batch,
@@ -301,7 +308,19 @@ impl EmbedModel {
     /// One pass at exactly `batch` items. Synthesises `batch` short
     /// dummy texts (content irrelevant — only the resulting tensor
     /// shape `[batch, max_seq]` matters for ORT pre-binding).
-    fn warmup_at_shape(&self, name: &str, batch: usize) -> Result<(), String> {
+    ///
+    /// `warmup_seq_len` controls the second tensor dim:
+    /// - `None` → pad to `self.max_len` (worst-case prod shape; legacy).
+    /// - `Some(n)` → pad to `n.min(self.max_len)`. With memory_pattern
+    ///   enabled, ORT re-plans on the first prod request that needs a
+    ///   longer shape — we just bind kernels here without committing
+    ///   worst-case scratch.
+    fn warmup_at_shape(
+        &self,
+        name: &str,
+        batch: usize,
+        warmup_seq_len: Option<usize>,
+    ) -> Result<(), String> {
         // `batch` copies of a tiny placeholder. We deliberately keep
         // the text very short so tokenization is cheap; the ONNX
         // forward pass dominates wall time anyway.
@@ -310,12 +329,17 @@ impl EmbedModel {
         if token_ids.iter().all(|v| v.is_empty()) {
             return Err("warmup tokens produced empty sequence".to_string());
         }
-        // Pad to `self.max_len` so the warmup forward pass exercises the
-        // worst-case prod shape `[batch, max_len]`. Tokenizing "warmup"
-        // alone produces ~3 tokens, leaving ORT cold for typical 50-512-
-        // token e5/jina prod traffic. `build_tensors_from_ids` zero-pads
-        // beyond the real token count with `pad_id` + `attention_mask=0`.
-        let max_seq = self.max_len;
+        // Choose the warmup seq_len. `None` preserves legacy behaviour
+        // (pad to `self.max_len`, exercising the worst-case prod shape).
+        // `Some(n)` clamps to `min(n, max_len)` — with memory_pattern=true
+        // ORT re-plans on the first long prod request, so binding kernels
+        // at a shorter shape avoids committing worst-case scratch slabs at
+        // startup. `build_tensors_from_ids` still zero-pads beyond the
+        // real token count.
+        let max_seq = match warmup_seq_len {
+            None => self.max_len,
+            Some(n) => n.min(self.max_len).max(1),
+        };
         let (ids, mask_i64, tti) =
             pool::build_tensors_from_ids(&token_ids, batch, max_seq, self.pad_id);
         let ids_arr = Array2::from_shape_vec([batch, max_seq], ids)

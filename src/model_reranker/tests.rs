@@ -159,17 +159,22 @@ fn warmup_runs_for_all_requested_shapes() {
     };
     // Single-shape call — parity with the legacy single-warmup path
     // (which used to be `warmup()` with no args, hard-coded batch=2).
-    m.warmup(&[1]).expect("warmup at batch=1");
+    m.warmup(&[1], None).expect("warmup at batch=1");
     // Multi-shape call — the load-bearing new behaviour. Both shapes
     // should compile their kernels; the function returns Ok even if
     // one shape internally fails (best-effort logging contract).
-    m.warmup(&[1, 5]).expect("warmup at batches [1, 5]");
+    m.warmup(&[1, 5], None).expect("warmup at batches [1, 5]");
     // Empty shape list is a no-op (logged as a warning) — must not
     // error or panic. Defensive coverage: `parse_warmup_batch_sizes`
     // already falls back to defaults on empty input, so production
     // can't reach here, but direct callers (future code paths,
     // tests) shouldn't have to know that.
-    m.warmup(&[]).expect("warmup with empty shapes");
+    m.warmup(&[], None).expect("warmup with empty shapes");
+    // Bounded seq_len path — `Some(64)` clamps the warmup tensor's
+    // second dim regardless of model max_len. Must still produce a
+    // working session; assert no panic / error.
+    m.warmup(&[1], Some(64))
+        .expect("warmup at batch=1 with bounded seq_len");
     // Post-warmup, inference still works at both shapes — assert the
     // warmup didn't somehow pollute session state. Uses the same
     // semantic spread `score_pairs_relevant_outscores_unrelated`
