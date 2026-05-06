@@ -44,13 +44,34 @@ use ort_sys::{OrtAllocatorType, OrtArenaCfg, OrtEnv, OrtMemType, OrtMemoryInfo};
 
 /// Default arena max memory: 6 GiB.
 ///
-/// Rationale: compose limit is 8 GiB; subtract ~2 GiB e5-large weights +
-/// ~2 GiB jina-code-v2 weights + ~0.5 GiB process overhead = ~3.5 GiB
-/// available. 6 GiB gives the arena room to hold large jina attention/
-/// FusedMatMul scratch tensors (1.0–1.3 GiB single allocations) without
-/// exhausting container memory. A BFCArena OOM on a single allocation
-/// (HTTP 500 to the caller) is strictly better than a cgroup OOM-kill
-/// (whole container restarts, all in-flight requests fail).
+/// # WARNING — compose memory limit MUST be ≥12 GiB with this default
+///
+/// 6 GiB default is *headroom-overcommit*, not a safe ceiling relative to
+/// an 8 GiB compose limit. Resident-memory breakdown:
+///
+///   - ~2.0 GiB  multilingual-e5-large weights
+///   - ~2.0 GiB  jina-code-v2 weights
+///   - ~0.5 GiB  SPLADE + reranker + process overhead
+///   - 6.0 GiB   arena ceiling (this constant)
+///
+/// Total worst-case: ~10.5 GiB
+///
+/// At 8 GiB compose this default **WILL cgroup-OOM-kill** the container
+/// under sustained large-batch jina-code-v2 load.
+///
+/// **Operator action before rolling out this default:**
+/// Bump `compose/memdb.yml` embed-server `deploy.resources.limits.memory`
+/// to `12288M` (12 GiB = 4.5 GiB resident + 6 GiB arena + ~1.5 GiB safety).
+///
+/// **Alternative for 8 GiB hosts:**
+/// Set `EMBED_ARENA_MAX_MEM_BYTES=3758096384` (3.5 GiB) — keeps arena +
+/// resident under the 8 GiB ceiling, but reverts the fix for jina-code-v2
+/// 92% error rate on large batches (FU-24). Reduce batch size accordingly.
+///
+/// A BFCArena OOM on a single allocation (HTTP 500 to caller) is strictly
+/// better than a cgroup OOM-kill (whole container restarts, all in-flight
+/// requests fail). The default favours the former over the latter; the
+/// compose limit controls which actually occurs.
 const DEFAULT_MAX_MEM_BYTES: usize = 6 * 1024 * 1024 * 1024;
 
 /// Default initial chunk size: 1 MiB.
@@ -95,6 +116,23 @@ pub fn init_arena_config() -> ArenaCfg {
     if max_mem_bytes < initial_chunk_bytes {
         panic!(
             "EMBED_ARENA_MAX_MEM_BYTES ({max_mem_bytes}) must be >= EMBED_ARENA_INITIAL_CHUNK_BYTES ({initial_chunk_bytes})"
+        );
+    }
+    // CreateArenaCfg C signature takes c_int (i32) for initial_chunk_size_bytes
+    // and max_dead_bytes_per_chunk. Silently wrapping on values > i32::MAX
+    // would pass a negative number to ORT — catch it early.
+    if initial_chunk_bytes > i32::MAX as usize {
+        panic!(
+            "EMBED_ARENA_INITIAL_CHUNK_BYTES ({}) exceeds i32::MAX ({}); ORT C API takes c_int",
+            initial_chunk_bytes,
+            i32::MAX
+        );
+    }
+    if max_dead_bytes > i32::MAX as usize {
+        panic!(
+            "EMBED_ARENA_MAX_DEAD_BYTES ({}) exceeds i32::MAX ({}); ORT C API takes c_int",
+            max_dead_bytes,
+            i32::MAX
         );
     }
 
@@ -231,6 +269,7 @@ pub fn register_shared_cpu_arena() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     /// Clear arena env vars for the duration of a test and restore on drop.
     struct EnvGuard {
@@ -274,6 +313,7 @@ mod tests {
     ];
 
     #[test]
+    #[serial]
     fn defaults_when_no_env_vars() {
         let guard = EnvGuard::new(ALL_VARS);
         let cfg = init_arena_config();
@@ -286,6 +326,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn env_overrides_all_fields() {
         let guard = EnvGuard::new(ALL_VARS);
         guard.set("EMBED_ARENA_MAX_MEM_BYTES", "8589934592"); // 8 GiB
@@ -303,6 +344,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn partial_override_leaves_others_at_default() {
         let guard = EnvGuard::new(ALL_VARS);
         guard.set("EMBED_ARENA_MAX_MEM_BYTES", "4294967296"); // 4 GiB
@@ -316,6 +358,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn extend_strategy_0_and_1_are_valid() {
         for strategy in [0i32, 1i32] {
             let guard = EnvGuard::new(ALL_VARS);
@@ -327,6 +370,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     #[should_panic(expected = "EMBED_ARENA_EXTEND_STRATEGY must be 0")]
     fn extend_strategy_2_panics() {
         let guard = EnvGuard::new(ALL_VARS);
@@ -336,6 +380,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     #[should_panic(expected = "EMBED_ARENA_EXTEND_STRATEGY must be 0")]
     fn extend_strategy_negative_panics() {
         let guard = EnvGuard::new(ALL_VARS);
@@ -345,6 +390,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     #[should_panic(expected = "must be >= EMBED_ARENA_INITIAL_CHUNK_BYTES")]
     fn max_mem_less_than_initial_chunk_panics() {
         let guard = EnvGuard::new(ALL_VARS);
@@ -355,6 +401,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn max_mem_equal_to_initial_chunk_is_valid() {
         let guard = EnvGuard::new(ALL_VARS);
         guard.set("EMBED_ARENA_MAX_MEM_BYTES", "1048576");
@@ -362,5 +409,30 @@ mod tests {
         let cfg = init_arena_config();
         drop(guard);
         assert_eq!(cfg.max_mem_bytes, cfg.initial_chunk_bytes);
+    }
+
+    #[test]
+    #[serial]
+    #[should_panic(expected = "exceeds i32::MAX")]
+    fn initial_chunk_above_i32_max_panics() {
+        let guard = EnvGuard::new(ALL_VARS);
+        // i32::MAX + 1 = 2147483648; set max_mem large enough to pass the
+        // MAX_MEM >= INITIAL_CHUNK guard, so only the i32 check fires.
+        let over = (i32::MAX as usize + 1).to_string();
+        guard.set("EMBED_ARENA_INITIAL_CHUNK_BYTES", &over);
+        guard.set("EMBED_ARENA_MAX_MEM_BYTES", &(i32::MAX as usize + 2).to_string());
+        let _cfg = init_arena_config();
+        drop(guard);
+    }
+
+    #[test]
+    #[serial]
+    #[should_panic(expected = "exceeds i32::MAX")]
+    fn max_dead_above_i32_max_panics() {
+        let guard = EnvGuard::new(ALL_VARS);
+        let over = (i32::MAX as usize + 1).to_string();
+        guard.set("EMBED_ARENA_MAX_DEAD_BYTES", &over);
+        let _cfg = init_arena_config();
+        drop(guard);
     }
 }
