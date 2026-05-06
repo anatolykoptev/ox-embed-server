@@ -64,7 +64,8 @@ Single process serving three model classes concurrently:
 | `EMBED_PORT`                 | `8082`     | |
 | `EMBED_MODELS`               | `multilingual-e5-large:/models:1024:256:1:false,jina-code-v2:/models-jina:768:512:0:false` | Format: `name:dir:dim:max_len:pad_id:has_tti[:model_file]` |
 | `EMBED_DEFAULT_MODEL`        | `multilingual-e5-large` | |
-| `EMBED_INTRA_THREADS`        | `4` | ONNX threads per inference |
+| `EMBED_INTRA_THREADS`        | `2` (default; was `4` until 2026-05-06) | ONNX threads per inference. Lowered after kernel-level audit found 5× thread oversubscription on 4-core ARM Neoverse-N1 — DynamicQuantizeMatMul + MatMulIntegerToFloat run at NEON INT8 GEMM hardware ceiling (IPC=2.46, cache-miss 1.3 %), so contention dominates. Combined with `EMBED_SESSION_POOL_SIZE=2` → 4 concurrent inference slots × 2 threads = 8 ORT threads on 4 cores = 2× oversub (was 5× with intra=4 + no pool). Solo inference ~10–20 % slower; throughput ~2× under concurrent load. Operators on dedicated-CPU hosts can override back to `4`. |
+| `EMBED_SESSION_POOL_SIZE`    | `1` (default; recommended prod `2`) | ONNX `Session` instances per embedding model. `1` preserves legacy single-Mutex<Session> path byte-for-byte. ort 2.0-rc has no shared-weights mode → each pool member duplicates the ~400 MiB (e5-large) / ~250 MiB (jina-code-v2) weight buffer. Round-robin via `AtomicUsize`. When raising, lower `EMBED_INTRA_THREADS` so `pool_size * intra_threads ≤ cores`. |
 | `RERANKER_MODELS`            | `gte-multi-rerank:/models-gte-rerank:256:true` | Format: `name:dir:max_len:padded` |
 | `RERANKER_INTRA_THREADS`     | `2` | |
 | `RERANKER_SESSION_POOL_SIZE` | `2` | |

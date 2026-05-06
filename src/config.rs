@@ -257,8 +257,20 @@ impl Config {
             ));
         }
 
+        // Default lowered 4 → 2 (2026-05-06): kernel-level perf audit
+        // measured 5× ORT thread oversubscription on a 4-core ARM
+        // Neoverse-N1 host with 14 intra_op threads in flight (4×e5
+        // sessions × 4 threads + reranker pool overhead). DynamicQuantize-
+        // MatMul + MatMulIntegerToFloat are 73.8 % of inference time
+        // (NEON asimddp INT8 GEMM at the hardware ceiling — IPC=2.46,
+        // cache_miss=1.3 %), so the bottleneck is contention, not
+        // kernels. Two threads/inference + EMBED_SESSION_POOL_SIZE=2
+        // yields 4 concurrent slots × 2 threads = 8 ORT threads on 4
+        // cores = 2× oversub instead of 5×, ~2× throughput under load
+        // at the cost of ~10–20 % solo-inference latency. Operators on
+        // dedicated-CPU hosts can override back to 4.
         let intra_threads = env::var("EMBED_INTRA_THREADS")
-            .unwrap_or_else(|_| "4".into())
+            .unwrap_or_else(|_| "2".into())
             .parse::<usize>()
             .map_err(|e| format!("invalid EMBED_INTRA_THREADS: {e}"))?;
 
