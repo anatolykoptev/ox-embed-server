@@ -867,10 +867,7 @@ mod tests {
         // `unwrap_or_default()` → Sigmoid. Verify the apply_normalize
         // fallback transforms a known logit to its sigmoid value.
         let mut scores = vec![0.0_f32];
-        apply_normalize(
-            &mut scores,
-            NormalizeMode::default(),
-        );
+        apply_normalize(&mut scores, NormalizeMode::default());
         assert!(
             (scores[0] - 0.5).abs() < 1e-6,
             "default must be sigmoid (sigmoid(0)=0.5), got {}",

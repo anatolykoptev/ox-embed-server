@@ -107,8 +107,10 @@ pub struct ArenaCfg {
 ///   - `EXTEND_STRATEGY` not in `{0, 1}`
 pub fn init_arena_config() -> ArenaCfg {
     let max_mem_bytes = parse_usize_env("EMBED_ARENA_MAX_MEM_BYTES", DEFAULT_MAX_MEM_BYTES);
-    let initial_chunk_bytes =
-        parse_usize_env("EMBED_ARENA_INITIAL_CHUNK_BYTES", DEFAULT_INITIAL_CHUNK_BYTES);
+    let initial_chunk_bytes = parse_usize_env(
+        "EMBED_ARENA_INITIAL_CHUNK_BYTES",
+        DEFAULT_INITIAL_CHUNK_BYTES,
+    );
     let max_dead_bytes = parse_usize_env("EMBED_ARENA_MAX_DEAD_BYTES", DEFAULT_MAX_DEAD_BYTES);
     let extend_strategy = parse_i32_env("EMBED_ARENA_EXTEND_STRATEGY", DEFAULT_EXTEND_STRATEGY);
 
@@ -442,7 +444,10 @@ mod tests {
         let guard = EnvGuard::new(ALL_VARS);
         let over = (i32::MAX as usize + 1).to_string();
         guard.set("EMBED_ARENA_INITIAL_CHUNK_BYTES", &over);
-        guard.set("EMBED_ARENA_MAX_MEM_BYTES", &(i32::MAX as usize + 2).to_string());
+        guard.set(
+            "EMBED_ARENA_MAX_MEM_BYTES",
+            &(i32::MAX as usize + 2).to_string(),
+        );
         guard.set("EMBED_ARENA_MAX_DEAD_BYTES", &over);
         let cfg = init_arena_config();
         drop(guard);

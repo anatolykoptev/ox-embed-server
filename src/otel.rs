@@ -122,7 +122,9 @@ fn parse_bfc_extend(msg: &str) -> Option<u32> {
     // Find "bin_num:" and parse the integer that follows.
     let bin_start = msg.find("bin_num:")?;
     let after = &msg[bin_start + "bin_num:".len()..];
-    let end = after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len());
+    let end = after
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(after.len());
     after[..end].parse::<u32>().ok()
 }
 
@@ -295,4 +297,53 @@ pub async fn trace_request(
     let resp = next.run(req).instrument(span.clone()).await;
     span.record("http.status_code", resp.status().as_u16());
     resp
+}
+
+// ── unit tests for ORT log parsing ───────────────────────────────────────────
+
+#[cfg(test)]
+mod ort_log_tests {
+    use super::parse_bfc_extend;
+
+    #[test]
+    fn parses_standard_bfc_extend_message() {
+        let msg = "Extending BFCArena for Cpu. bin_num:20 num_bytes:1258291200";
+        assert_eq!(parse_bfc_extend(msg), Some(20));
+    }
+
+    #[test]
+    fn parses_bin_num_zero() {
+        let msg = "Extending BFCArena for Cpu. bin_num:0 num_bytes:1048576";
+        assert_eq!(parse_bfc_extend(msg), Some(0));
+    }
+
+    #[test]
+    fn parses_large_bin_num() {
+        let msg = "Extending BFCArena for Cpu. bin_num:255 num_bytes:9999";
+        assert_eq!(parse_bfc_extend(msg), Some(255));
+    }
+
+    #[test]
+    fn returns_none_for_unrelated_message() {
+        let msg = "ONNX inference completed in 123ms";
+        assert_eq!(parse_bfc_extend(msg), None);
+    }
+
+    #[test]
+    fn returns_none_when_bin_num_missing() {
+        let msg = "Extending BFCArena for Cpu. num_bytes:1048576";
+        assert_eq!(parse_bfc_extend(msg), None);
+    }
+
+    #[test]
+    fn returns_none_for_empty_string() {
+        assert_eq!(parse_bfc_extend(""), None);
+    }
+
+    #[test]
+    fn bin_num_not_followed_by_digits_is_none() {
+        // "bin_num:" with no digits after it — parse should return None.
+        let msg = "Extending BFCArena for Cpu. bin_num: num_bytes:1048576";
+        assert_eq!(parse_bfc_extend(msg), None);
+    }
 }

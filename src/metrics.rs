@@ -46,8 +46,9 @@ pub fn init(version: &str) -> PrometheusHandle {
 
     // Attention scratch: B×H×S²×4 bytes. Scaled to bytes (MiB/GiB bins).
     // 1 GiB bin is the smoking-gun boundary for the 1.258 GiB OOM tensor.
-    let attention_scratch_matcher =
-        metrics_exporter_prometheus::Matcher::Full("embed_inference_attention_scratch_bytes".to_string());
+    let attention_scratch_matcher = metrics_exporter_prometheus::Matcher::Full(
+        "embed_inference_attention_scratch_bytes".to_string(),
+    );
 
     // Peak allocated bytes per inference (procfs RSS delta).
     let peak_bytes_matcher =
@@ -111,14 +112,7 @@ pub fn init(version: &str) -> PrometheusHandle {
         .expect("set batch token budget buckets")
         .set_buckets_for_metric(
             attention_scratch_matcher,
-            &[
-                MIB,
-                16.0 * MIB,
-                64.0 * MIB,
-                256.0 * MIB,
-                GIB,
-                4.0 * GIB,
-            ],
+            &[MIB, 16.0 * MIB, 64.0 * MIB, 256.0 * MIB, GIB, 4.0 * GIB],
         )
         .expect("set attention scratch buckets")
         .set_buckets_for_metric(
@@ -691,5 +685,75 @@ impl Drop for RerankInFlightGuard {
             "model" => self.model.clone()
         )
         .decrement(1.0);
+    }
+}
+
+// ── unit tests for bucket-label logic ────────────────────────────────────────
+
+#[cfg(test)]
+mod bucket_label_tests {
+    /// Replicate the batch_size and seq_len bucketing logic from
+    /// `record_batch_dimensions` to verify boundary conditions without
+    /// requiring a live Prometheus recorder.
+    fn bs_bucket(n: usize) -> &'static str {
+        match n {
+            1 => "1",
+            2 => "2",
+            3..=4 => "4",
+            5..=8 => "8",
+            9..=16 => "16",
+            _ => "32+",
+        }
+    }
+
+    fn sl_bucket(n: usize) -> &'static str {
+        match n {
+            0..=64 => "64",
+            65..=128 => "128",
+            129..=256 => "256",
+            257..=384 => "384",
+            _ => "512+",
+        }
+    }
+
+    #[test]
+    fn batch_size_boundaries() {
+        assert_eq!(bs_bucket(1), "1");
+        assert_eq!(bs_bucket(2), "2");
+        assert_eq!(bs_bucket(3), "4");
+        assert_eq!(bs_bucket(4), "4");
+        assert_eq!(bs_bucket(5), "8");
+        assert_eq!(bs_bucket(8), "8");
+        assert_eq!(bs_bucket(9), "16");
+        assert_eq!(bs_bucket(16), "16");
+        assert_eq!(bs_bucket(17), "32+");
+        assert_eq!(bs_bucket(32), "32+");
+        assert_eq!(bs_bucket(100), "32+");
+    }
+
+    #[test]
+    fn seq_len_boundaries() {
+        assert_eq!(sl_bucket(0), "64");
+        assert_eq!(sl_bucket(64), "64");
+        assert_eq!(sl_bucket(65), "128");
+        assert_eq!(sl_bucket(128), "128");
+        assert_eq!(sl_bucket(129), "256");
+        assert_eq!(sl_bucket(256), "256");
+        assert_eq!(sl_bucket(257), "384");
+        assert_eq!(sl_bucket(384), "384");
+        assert_eq!(sl_bucket(385), "512+");
+        assert_eq!(sl_bucket(512), "512+");
+        assert_eq!(sl_bucket(1024), "512+");
+    }
+
+    #[test]
+    fn attention_scratch_formula() {
+        // jina-code-v2: B=1, H=12, S=512 → 1×12×512²×4 = 12_582_912 bytes (12 MiB)
+        let bytes = (1_f64) * (12_f64) * (512_f64).powi(2) * 4.0;
+        assert_eq!(bytes as u64, 12_582_912);
+
+        // B=8, H=12, S=512 → 100_663_296 bytes (96 MiB)
+        let bytes_b8 = (8_f64) * (12_f64) * (512_f64).powi(2) * 4.0;
+        assert_eq!(bytes_b8 as u64, 100_663_296);
     }
 }

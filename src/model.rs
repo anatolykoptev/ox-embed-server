@@ -3,7 +3,6 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-
 use ndarray::Array2;
 use ort::ep;
 use ort::session::Session;
@@ -435,8 +434,8 @@ impl EmbedModel {
             let run_result = if self.has_token_type_ids {
                 let tti_arr = Array2::from_shape_vec([batch, max_seq], tti.clone())
                     .map_err(|e| format!("warmup tti shape (batch={batch}): {e}"))?;
-                let tti_tensor = Tensor::from_array(tti_arr)
-                    .map_err(|e| format!("warmup tti tensor: {e}"))?;
+                let tti_tensor =
+                    Tensor::from_array(tti_arr).map_err(|e| format!("warmup tti tensor: {e}"))?;
                 session.run(ort::inputs! {
                     "input_ids" => ids_tensor,
                     "attention_mask" => mask_tensor,
@@ -652,6 +651,56 @@ fn classify_ort_error(msg: &str) -> (&'static str, u32) {
         ("arena_oom", 0)
     } else {
         ("other", 0)
+    }
+}
+
+// ── unit tests for new forensic helpers ──────────────────────────────────────
+
+#[cfg(test)]
+mod forensic_tests {
+    use super::*;
+
+    // ── classify_ort_error ────────────────────────────────────────────────
+
+    #[test]
+    fn classify_arena_oom_message() {
+        let msg =
+            "Available memory of 1073741824 bytes is smaller than requested bytes of 1258291200";
+        let (reason, bin_num) = classify_ort_error(msg);
+        assert_eq!(reason, "arena_oom");
+        assert_eq!(bin_num, 0);
+    }
+
+    #[test]
+    fn classify_other_error_message() {
+        let msg = "ONNX graph is invalid: input tensor not found";
+        let (reason, bin_num) = classify_ort_error(msg);
+        assert_eq!(reason, "other");
+        assert_eq!(bin_num, 0);
+    }
+
+    #[test]
+    fn classify_partial_match_is_other() {
+        // Contains "Available memory" but not "smaller than requested"
+        let msg = "Available memory of 1 GiB";
+        let (reason, _) = classify_ort_error(msg);
+        assert_eq!(reason, "other");
+    }
+
+    // ── read_rss_bytes ────────────────────────────────────────────────────
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn read_rss_returns_nonzero_on_linux() {
+        let rss = read_rss_bytes();
+        // The process always has resident pages; anything ≥ 4096 is sane.
+        assert!(rss >= 4096, "rss={rss} expected > 0");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn read_rss_returns_zero_on_non_linux() {
+        assert_eq!(read_rss_bytes(), 0);
     }
 }
 

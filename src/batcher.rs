@@ -1559,9 +1559,8 @@ mod tests {
         let _ = second.await;
         tokio::time::sleep(Duration::from_millis(200)).await;
         let text = handle.render();
-        let needle = format!(
-            "embed_batch_seq_capped_total{{model=\"{name}\",reason=\"seq_overflow\"}}"
-        );
+        let needle =
+            format!("embed_batch_seq_capped_total{{model=\"{name}\",reason=\"seq_overflow\"}}");
         assert!(
             text.contains(&needle),
             "expected `{needle}` in /metrics render:\n{text}"
