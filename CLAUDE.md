@@ -78,6 +78,10 @@ Single process serving three model classes concurrently:
 | `ORT_DYLIB_PATH`             | `/usr/lib/libonnxruntime.so` | required by `ort` with `load-dynamic` |
 | `ORT_OPT_LEVEL`              | `3` | |
 | `EMBED_VERSION`              | `dev` | stamped into `embed_build_info` |
+| `EMBED_ARENA_MAX_MEM_BYTES`  | TBD (default 6442450944 = 6 GiB) | BFCArena hard ceiling; 3→6 GiB bump fixes jina-code-v2 92% error rate (FU-24) |
+| `EMBED_ARENA_INITIAL_CHUNK_BYTES` | TBD (default 1048576 = 1 MiB) | First BFCArena allocation block size |
+| `EMBED_ARENA_MAX_DEAD_BYTES` | TBD (default 33554432 = 32 MiB) | Dead-bytes threshold for chunk reuse (aggressive vs ORT default 128 MiB) |
+| `EMBED_ARENA_EXTEND_STRATEGY` | TBD (default 1 = kSameAsRequested) | 0=kNextPowerOfTwo, 1=kSameAsRequested |
 
 ## Deploy
 

@@ -285,6 +285,34 @@ pub fn record_token_cache_hit(model: &str, n: u64) {
     .increment(n);
 }
 
+/// Publish arena configuration as Prometheus gauges. Called once at startup
+/// from `arena::register_shared_cpu_arena` so operators can verify effective
+/// config from `/metrics` without reading logs.
+///
+/// `embed_arena_extend_strategy` uses a bounded-cardinality label
+/// (`strategy="kSameAsRequested"` or `strategy="kNextPowerOfTwo"`) instead of
+/// a raw integer — this keeps the series human-readable in Grafana without
+/// growing unbounded cardinality.
+pub fn set_arena_gauges(
+    max_mem_bytes: usize,
+    initial_chunk_bytes: usize,
+    max_dead_bytes: usize,
+    extend_strategy: i32,
+) {
+    metrics::gauge!("embed_arena_max_mem_bytes").set(max_mem_bytes as f64);
+    metrics::gauge!("embed_arena_initial_chunk_bytes").set(initial_chunk_bytes as f64);
+    metrics::gauge!("embed_arena_max_dead_bytes").set(max_dead_bytes as f64);
+    let strategy_label = match extend_strategy {
+        1 => "kSameAsRequested",
+        _ => "kNextPowerOfTwo",
+    };
+    metrics::gauge!(
+        "embed_arena_extend_strategy",
+        "strategy" => strategy_label
+    )
+    .set(extend_strategy as f64);
+}
+
 /// Increment the token-cache miss counter by `n`.
 ///
 /// See `record_token_cache_hit` for the batch-increment semantic and
