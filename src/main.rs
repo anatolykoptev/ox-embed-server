@@ -157,6 +157,13 @@ async fn main() {
     }
     tracing::info!("ort runtime initialized");
 
+    // Install Prometheus recorder BEFORE any gauge!()/counter!()/histogram!()
+    // call. arena::register_shared_cpu_arena() below calls set_arena_gauges()
+    // — without recorder installed first, those gauge writes are silently
+    // dropped (FU-28).
+    let version = std::env::var("EMBED_VERSION").unwrap_or_else(|_| "dev".into());
+    let prom_handle = std::sync::Arc::new(metrics::init(&version));
+
     // Register a shared CPU arena allocator with kSameAsRequested extend
     // strategy — see arena.rs. Critical for memory stability under variable
     // batch sizes; without it, default kNextPowerOfTwo arena per session
@@ -171,9 +178,6 @@ async fn main() {
         eprintln!("config error: {e}");
         std::process::exit(1);
     });
-
-    let version = std::env::var("EMBED_VERSION").unwrap_or_else(|_| "dev".into());
-    let prom_handle = std::sync::Arc::new(metrics::init(&version));
 
     let mut raw_models: HashMap<String, Arc<EmbedModel>> = HashMap::new();
     for def in &cfg.models {
