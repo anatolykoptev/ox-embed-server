@@ -313,6 +313,18 @@ pub fn set_arena_gauges(
     .set(extend_strategy as f64);
 }
 
+/// Increment the counter tracking how many times arena allocator
+/// registration was skipped because the env already had one registered.
+///
+/// Expected steady-state value is 0 in a healthy single-process service —
+/// a non-zero value means a second `register_shared_cpu_arena` call hit
+/// the warn-path, in which case the live allocator was built from the
+/// FIRST call's config and `embed_arena_*` gauges describe THAT config,
+/// not whatever the latest call requested.
+pub fn record_arena_register_skipped() {
+    metrics::counter!("embed_arena_register_skipped_total").increment(1);
+}
+
 /// Increment the token-cache miss counter by `n`.
 ///
 /// See `record_token_cache_hit` for the batch-increment semantic and

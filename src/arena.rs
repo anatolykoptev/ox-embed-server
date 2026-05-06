@@ -30,12 +30,13 @@
 //! |--------------------------------|-------------------|---------|
 //! | `EMBED_ARENA_MAX_MEM_BYTES`    | 6 442 450 944 (6 GiB) | Hard ceiling on arena growth |
 //! | `EMBED_ARENA_INITIAL_CHUNK_BYTES` | 1 048 576 (1 MiB) | First allocation block |
-//! | `EMBED_ARENA_MAX_DEAD_BYTES`   | 33 554 432 (32 MiB) | Dead-bytes threshold for chunk reuse |
+//! | `EMBED_ARENA_MAX_DEAD_BYTES`   | 67 108 864 (64 MiB) | Dead-bytes threshold for chunk reuse |
 //! | `EMBED_ARENA_EXTEND_STRATEGY`  | 1 (`kSameAsRequested`) | 0=kNextPowerOfTwo, 1=kSameAsRequested |
 //!
 //! The service refuses to start (`panic!`) if `MAX_MEM < INITIAL_CHUNK` or
 //! `EXTEND_STRATEGY` is not 0 or 1.
 
+use std::ffi::{CString, c_char};
 use std::ptr;
 
 use ort::AsPointer;
@@ -77,11 +78,14 @@ const DEFAULT_MAX_MEM_BYTES: usize = 6 * 1024 * 1024 * 1024;
 /// Default initial chunk size: 1 MiB.
 const DEFAULT_INITIAL_CHUNK_BYTES: usize = 1024 * 1024;
 
-/// Default max dead bytes per chunk: 32 MiB.
+/// Default max dead bytes per chunk: 64 MiB.
 ///
 /// Aggressive vs ORT's default 128 MiB — forces BFCArena to consolidate dead
-/// memory into free chunks sooner under variable batch shapes.
-const DEFAULT_MAX_DEAD_BYTES: usize = 32 * 1024 * 1024;
+/// memory into free chunks sooner under variable batch shapes. We landed on
+/// 64 MiB rather than 32 MiB because BERT scratch tensors run ~8 MiB+ each;
+/// too small a threshold causes extend cycles to thrash. Live config is
+/// observable via `embed_arena_max_dead_bytes` gauge.
+const DEFAULT_MAX_DEAD_BYTES: usize = 64 * 1024 * 1024;
 
 /// Default extend strategy: 1 = `kSameAsRequested`.
 const DEFAULT_EXTEND_STRATEGY: i32 = 1;
@@ -118,23 +122,12 @@ pub fn init_arena_config() -> ArenaCfg {
             "EMBED_ARENA_MAX_MEM_BYTES ({max_mem_bytes}) must be >= EMBED_ARENA_INITIAL_CHUNK_BYTES ({initial_chunk_bytes})"
         );
     }
-    // CreateArenaCfg C signature takes c_int (i32) for initial_chunk_size_bytes
-    // and max_dead_bytes_per_chunk. Silently wrapping on values > i32::MAX
-    // would pass a negative number to ORT — catch it early.
-    if initial_chunk_bytes > i32::MAX as usize {
-        panic!(
-            "EMBED_ARENA_INITIAL_CHUNK_BYTES ({}) exceeds i32::MAX ({}); ORT C API takes c_int",
-            initial_chunk_bytes,
-            i32::MAX
-        );
-    }
-    if max_dead_bytes > i32::MAX as usize {
-        panic!(
-            "EMBED_ARENA_MAX_DEAD_BYTES ({}) exceeds i32::MAX ({}); ORT C API takes c_int",
-            max_dead_bytes,
-            i32::MAX
-        );
-    }
+    // CreateArenaCfgV2 takes size_t for every value (no i32 truncation),
+    // so we no longer reject usize > i32::MAX. The legacy V1 API silently
+    // overwrote `max_dead_bytes_per_chunk` to -1L (ORT default 128 MiB) at
+    // onnxruntime_c_api.cc:2606-2607 immediately after assignment — we
+    // migrated off it. Tests still validate sane ordering against
+    // `MAX_MEM >= INITIAL_CHUNK`.
 
     ArenaCfg {
         max_mem_bytes,
@@ -184,22 +177,19 @@ pub fn register_shared_cpu_arena() -> Result<(), String> {
         "arena config resolved"
     );
 
-    // Publish gauges so operators can verify effective config from /metrics.
-    crate::metrics::set_arena_gauges(
-        cfg.max_mem_bytes,
-        cfg.initial_chunk_bytes,
-        cfg.max_dead_bytes,
-        cfg.extend_strategy,
-    );
-
     let api = ort::api();
 
-    // 1. Memory info: arena allocator on CPU output memory.
+    // 1. Memory info: arena allocator on the CPU EP's *default* memory type.
+    //
+    // Was OrtMemTypeCPUOutput historically; both reach the per-device CPU
+    // allocator via the device-keyed lookup in session_state.cc
+    // (`UpdateAllocatorsWithEnvAllocators`), but `OrtMemTypeDefault` is the
+    // semantically correct key for the CPU EP's working buffers.
     let mut mem_info: *mut OrtMemoryInfo = ptr::null_mut();
     let status = unsafe {
         (api.CreateCpuMemoryInfo)(
             OrtAllocatorType::OrtArenaAllocator,
-            OrtMemType::OrtMemTypeCPUOutput,
+            OrtMemType::OrtMemTypeDefault,
             &mut mem_info,
         )
     };
@@ -207,34 +197,48 @@ pub fn register_shared_cpu_arena() -> Result<(), String> {
         return Err("CreateCpuMemoryInfo returned non-null status".into());
     }
 
-    // 2. Arena cfg — env-gated since FU-24 (2026-05-05).
+    // 2. Arena cfg via the V2 (key/value) API.
     //
-    // History: previous config used `max_mem=0` (unlimited) then 3 GiB hard-
-    // coded. Neither was sufficient:
-    //   - 0: kSameAsRequested removes per-extend rounding but does NOT cap
-    //     total arena ownership. Every new (batch, seq_len) shape triggers a
-    //     permanent extend. Arena reached 12.3 GiB on an 8 GiB cgroup →
-    //     kernel reclaim thrash.
-    //   - 3 GiB: jina-code-v2 attention/FusedMatMul scratch tensors request
-    //     1.0–1.3 GiB single blocks under prod batch shapes (BATCH_MAX=32,
-    //     BATCH_MAX_TOKENS=16384, max_len=512). Three such requests saturate
-    //     the 3 GiB cap → 92% error rate observed in prod 2026-05-05.
+    // V1 has an upstream bug at onnxruntime_c_api.cc:2606-2607 that silently
+    // overwrites `max_dead_bytes_per_chunk` to -1L (ORT default 128 MiB)
+    // immediately after assignment. Live evidence: arena log printed
+    // max_dead=128 MiB despite 32 MiB being requested, and after ~50 min
+    // uptime jina-code-v2 hit 36 fragmentation errors. V2 takes size_t for
+    // every value (no i32 truncation either) and does not have the overwrite.
     //
-    // Default is now 6 GiB (safe given 8 GiB compose limit and ~4 GiB model
-    // weights + overhead), overridable via EMBED_ARENA_MAX_MEM_BYTES.
+    // Keys come from ORT's BFCArena: `core/framework/allocator.cc` —
+    // ArenaCfgFromConfigOptions reads exactly these names.
+    //
+    // History on max_mem: 0 → 3 GiB → 6 GiB. Unbounded reached 12.3 GiB on
+    // an 8 GiB cgroup. 3 GiB starved jina-code-v2 attention scratch (~1 GiB
+    // per request × 3 concurrent → 92% error rate observed 2026-05-05).
+    let key_max_mem = CString::new("max_mem").expect("static cstr");
+    let key_strategy = CString::new("arena_extend_strategy").expect("static cstr");
+    let key_initial = CString::new("initial_chunk_size_bytes").expect("static cstr");
+    let key_max_dead = CString::new("max_dead_bytes_per_chunk").expect("static cstr");
+
+    let keys: [*const c_char; 4] = [
+        key_max_mem.as_ptr(),
+        key_strategy.as_ptr(),
+        key_initial.as_ptr(),
+        key_max_dead.as_ptr(),
+    ];
+    // Strategy is 0/1; cast to usize is well-defined since we validated it
+    // in `init_arena_config` and ORT itself stores it as size_t in V2.
+    let values: [usize; 4] = [
+        cfg.max_mem_bytes,
+        cfg.extend_strategy as usize,
+        cfg.initial_chunk_bytes,
+        cfg.max_dead_bytes,
+    ];
+
     let mut arena_cfg: *mut OrtArenaCfg = ptr::null_mut();
     let status = unsafe {
-        (api.CreateArenaCfg)(
-            cfg.max_mem_bytes,
-            cfg.extend_strategy,
-            cfg.initial_chunk_bytes as i32,
-            cfg.max_dead_bytes as i32,
-            &mut arena_cfg,
-        )
+        (api.CreateArenaCfgV2)(keys.as_ptr(), values.as_ptr(), keys.len(), &mut arena_cfg)
     };
     if !status.0.is_null() {
         unsafe { (api.ReleaseMemoryInfo)(mem_info) };
-        return Err("CreateArenaCfg returned non-null status".into());
+        return Err("CreateArenaCfgV2 returned non-null status".into());
     }
 
     // 3. Register on the global environment. Environment::current() returns
@@ -255,11 +259,28 @@ pub fn register_shared_cpu_arena() -> Result<(), String> {
 
     if !status.0.is_null() {
         // Most common path: allocator already registered (e.g. on process
-        // re-init). Treat as success — env already has what we need.
+        // re-init). Treat as success — env already has what we need from
+        // the FIRST registration, but DO NOT publish gauges: they would
+        // describe THIS call's config while the live allocator was built
+        // from the first config. Bump a counter so the warn-path is
+        // observable in /metrics, then return success.
         tracing::warn!(
-            "CreateAndRegisterAllocator returned non-null status (likely already registered)"
+            "CreateAndRegisterAllocator returned non-null status (likely already registered); skipping gauge publish"
         );
+        crate::metrics::record_arena_register_skipped();
+        return Ok(());
     }
+
+    // 4. Publish gauges only AFTER a successful registration so the gauges
+    //    truly describe the live allocator. Idempotency-safe: a second
+    //    successful register would imply a brand-new env (impossible with
+    //    a singleton OrtEnv), so this branch runs at most once per process.
+    crate::metrics::set_arena_gauges(
+        cfg.max_mem_bytes,
+        cfg.initial_chunk_bytes,
+        cfg.max_dead_bytes,
+        cfg.extend_strategy,
+    );
 
     Ok(())
 }
@@ -321,7 +342,7 @@ mod tests {
 
         assert_eq!(cfg.max_mem_bytes, 6 * 1024 * 1024 * 1024, "default 6 GiB");
         assert_eq!(cfg.initial_chunk_bytes, 1024 * 1024, "default 1 MiB");
-        assert_eq!(cfg.max_dead_bytes, 32 * 1024 * 1024, "default 32 MiB");
+        assert_eq!(cfg.max_dead_bytes, 64 * 1024 * 1024, "default 64 MiB");
         assert_eq!(cfg.extend_strategy, 1, "default kSameAsRequested");
     }
 
@@ -353,7 +374,7 @@ mod tests {
 
         assert_eq!(cfg.max_mem_bytes, 4 * 1024 * 1024 * 1024);
         assert_eq!(cfg.initial_chunk_bytes, 1024 * 1024); // default
-        assert_eq!(cfg.max_dead_bytes, 32 * 1024 * 1024); // default
+        assert_eq!(cfg.max_dead_bytes, 64 * 1024 * 1024); // default
         assert_eq!(cfg.extend_strategy, 1); // default
     }
 
@@ -413,26 +434,19 @@ mod tests {
 
     #[test]
     #[serial]
-    #[should_panic(expected = "exceeds i32::MAX")]
-    fn initial_chunk_above_i32_max_panics() {
+    fn values_above_i32_max_are_now_accepted() {
+        // CreateArenaCfgV2 takes size_t for every value, so values that
+        // would have overflowed the legacy V1 c_int signature are now
+        // valid configuration. Documented as a regression-test guard
+        // against future revivals of the old i32 panic.
         let guard = EnvGuard::new(ALL_VARS);
-        // i32::MAX + 1 = 2147483648; set max_mem large enough to pass the
-        // MAX_MEM >= INITIAL_CHUNK guard, so only the i32 check fires.
         let over = (i32::MAX as usize + 1).to_string();
         guard.set("EMBED_ARENA_INITIAL_CHUNK_BYTES", &over);
         guard.set("EMBED_ARENA_MAX_MEM_BYTES", &(i32::MAX as usize + 2).to_string());
-        let _cfg = init_arena_config();
-        drop(guard);
-    }
-
-    #[test]
-    #[serial]
-    #[should_panic(expected = "exceeds i32::MAX")]
-    fn max_dead_above_i32_max_panics() {
-        let guard = EnvGuard::new(ALL_VARS);
-        let over = (i32::MAX as usize + 1).to_string();
         guard.set("EMBED_ARENA_MAX_DEAD_BYTES", &over);
-        let _cfg = init_arena_config();
+        let cfg = init_arena_config();
         drop(guard);
+        assert_eq!(cfg.initial_chunk_bytes, i32::MAX as usize + 1);
+        assert_eq!(cfg.max_dead_bytes, i32::MAX as usize + 1);
     }
 }
