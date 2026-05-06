@@ -82,7 +82,7 @@ Single process serving three model classes concurrently:
 | `EMBED_VERSION`              | `dev` | stamped into `embed_build_info` |
 | `EMBED_ARENA_MAX_MEM_BYTES`  | TBD (default 6442450944 = 6 GiB) | BFCArena hard ceiling; 3→6 GiB bump fixes jina-code-v2 92% error rate (FU-24) |
 | `EMBED_ARENA_INITIAL_CHUNK_BYTES` | TBD (default 1048576 = 1 MiB) | First BFCArena allocation block size |
-| `EMBED_ARENA_MAX_DEAD_BYTES` | TBD (default 33554432 = 32 MiB) | Dead-bytes threshold for chunk reuse (aggressive vs ORT default 128 MiB) |
+| `EMBED_ARENA_MAX_DEAD_BYTES` | TBD (default 67108864 = 64 MiB) | Dead-bytes threshold for chunk reuse (aggressive vs ORT default 128 MiB; 32 MiB was too small — BERT scratch ~8 MiB/tensor caused extend thrash) |
 | `EMBED_ARENA_EXTEND_STRATEGY` | TBD (default 1 = kSameAsRequested) | 0=kNextPowerOfTwo, 1=kSameAsRequested |
 | `EMBED_WARMUP_SEQ_LEN` | (default `128`) | Cap on warmup tensor `max_seq` for dense embedders + rerankers. `max` = pad to model `max_len` (legacy). With `memory_pattern=true`, ORT re-plans on first long prod request — saves 200-400 MiB resident vs worst-case warmup. |
 
