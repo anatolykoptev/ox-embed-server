@@ -136,17 +136,19 @@ impl SpladeModel {
             let plan = LoadPlan::decide(cache.as_ref(), &onnx_path);
             let load_path = plan.load_source(&onnx_path).to_path_buf();
             let t_commit = std::time::Instant::now();
-            // See model.rs: memory pattern + dynamic batches = unbounded
-            // arena growth. SPLADE pool follows the same pattern.
+            // memory_pattern=true: see model.rs for the rationale —
+            // PR #34's shared-only arena (V2 registration + DisableCpuMemArena)
+            // makes pattern planning produce scratch reuse instead of
+            // per-session duplication. SPLADE pool follows the same pattern.
             let builder = Session::builder().map_err(|e| format!("session builder #{i}: {e}"))?;
             let builder = onnx_cache::apply_plan(builder, &plan, opt_level)
                 .map_err(|e| format!("apply cache plan #{i}: {e}"))?;
             let session = builder
                 .with_intra_threads(intra_threads)
                 .map_err(|e| format!("set threads #{i}: {e}"))?
-                // memory_pattern=false: same rationale as model.rs.
-                .with_memory_pattern(false)
-                .map_err(|e| format!("disable memory pattern #{i}: {e}"))?
+                // memory_pattern=true: same rationale as model.rs.
+                .with_memory_pattern(true)
+                .map_err(|e| format!("enable memory pattern #{i}: {e}"))?
                 .with_env_allocators()
                 .map_err(|e| format!("enable env allocators #{i}: {e}"))?
                 // Disable per-session CPU mem arena (see model.rs for detail).

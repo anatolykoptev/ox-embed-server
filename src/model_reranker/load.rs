@@ -392,9 +392,11 @@ fn build_session_pool(
         let plan = LoadPlan::decide(cache.as_ref(), onnx_path);
         let load_path = plan.load_source(onnx_path).to_path_buf();
         let t_commit = std::time::Instant::now();
-        // See model.rs for the rationale: memory pattern + dynamic batches
-        // = unbounded BFCArena growth. Reranker pool members are even more
-        // sensitive because they also see variable doc counts.
+        // memory_pattern=true: see model.rs — PR #34's shared-only arena
+        // (V2 registration + DisableCpuMemArena) means pattern planning
+        // now produces scratch reuse rather than per-session duplication.
+        // Reranker pool members benefit most because they see the highest
+        // shape variability (B × pairs × seq_len).
         let builder = Session::builder().map_err(|e| format!("session builder #{i}: {e}"))?;
         let builder = onnx_cache::apply_plan(builder, &plan, opt_level)
             .map_err(|e| format!("apply cache plan #{i}: {e}"))?;
@@ -407,11 +409,9 @@ fn build_session_pool(
             // only way to stop the spin on a shared multi-tenant CPU.
             .with_intra_op_spinning(allow_spinning)
             .map_err(|e| format!("set intra spinning #{i}: {e}"))?
-            // memory_pattern=false: same rationale as model.rs — dynamic
-            // allocation prevents permanent per-shape arena commits that
-            // monotonically fill the shared 3 GiB cap under variable batches.
-            .with_memory_pattern(false)
-            .map_err(|e| format!("disable memory pattern #{i}: {e}"))?
+            // memory_pattern=true: same rationale as model.rs.
+            .with_memory_pattern(true)
+            .map_err(|e| format!("enable memory pattern #{i}: {e}"))?
             .with_env_allocators()
             .map_err(|e| format!("enable env allocators #{i}: {e}"))?
             // Disable per-session CPU mem arena (see model.rs for detail).
