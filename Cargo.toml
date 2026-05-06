@@ -60,3 +60,7 @@ reqwest = { version = "0.12", features = ["blocking", "json"] }
 # real ONNX bytes (placeholder empty files only). Keep dev-only so it
 # doesn't bloat the production container.
 tempfile = "3"
+# serial_test — enforce sequential execution for tests that call
+# std::env::set_var. std::env::set_var is unsafe since Rust 1.82 (glibc
+# setenv is non-reentrant); concurrent calls from parallel test threads = UB.
+serial_test = "3"

@@ -869,7 +869,7 @@ mod tests {
         let mut scores = vec![0.0_f32];
         apply_normalize(
             &mut scores,
-            Option::<NormalizeMode>::None.unwrap_or_default(),
+            NormalizeMode::default(),
         );
         assert!(
             (scores[0] - 0.5).abs() < 1e-6,
