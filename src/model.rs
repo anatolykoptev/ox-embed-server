@@ -88,6 +88,8 @@ fn parse_opt_level() -> GraphOptimizationLevel {
 /// holds its own ~400 MiB weight buffer. The pool size is intentionally
 /// off by default (operator opt-in via `EMBED_SESSION_POOL_SIZE`).
 pub struct EmbedModel {
+    /// Model name for metric labels (e.g. "jina-code-v2").
+    name: String,
     sessions: Vec<Mutex<Session>>,
     next: AtomicUsize,
     tokenizer: Tokenizer,
@@ -95,6 +97,14 @@ pub struct EmbedModel {
     max_len: usize,
     pad_id: u32,
     has_token_type_ids: bool,
+    /// Number of attention heads — used to estimate self-attention scratch
+    /// bytes: `B × num_heads × S² × 4`.  Hardcoded per model family since
+    /// ort 2.0-rc does not expose metadata from the ONNX graph ergonomically.
+    ///
+    /// jina-code-v2:        12 heads (RoBERTa-base backbone)
+    /// multilingual-e5-large: 16 heads (XLM-RoBERTa-large backbone)
+    /// Unknown models:      12 (conservative fallback)
+    num_heads: usize,
 }
 
 impl EmbedModel {
@@ -119,6 +129,15 @@ impl EmbedModel {
         // Defensive clamp — caller contract says >=1, but a stray 0 from
         // misconfigured plumbing would `% 0` panic in `embed_tokens`.
         let pool_size = pool_size.max(1);
+        // Infer num_heads from the model name. Known families:
+        //   multilingual-e5-large → XLM-RoBERTa-large → 16 heads
+        //   jina-code-v2          → RoBERTa-base       → 12 heads
+        //   (all others)          → 12 heads (conservative default)
+        let num_heads = if def.name.contains("e5-large") {
+            16
+        } else {
+            12
+        };
 
         let dir = Path::new(&def.dir);
 
@@ -161,6 +180,7 @@ impl EmbedModel {
         );
 
         Ok(Self {
+            name: def.name.clone(),
             sessions,
             next: AtomicUsize::new(0),
             tokenizer,
@@ -168,6 +188,7 @@ impl EmbedModel {
             max_len: def.max_len,
             pad_id: def.pad_id,
             has_token_type_ids: def.has_token_type_ids,
+            num_heads,
         })
     }
 
@@ -235,6 +256,16 @@ impl EmbedModel {
         let max_seq = round_up_seq_len(real_max_seq, self.max_len);
 
         let batch = token_ids.len();
+
+        // ── forensic metrics: pre-inference observation ───────────────────
+        // Record (B, S) distribution and token-budget before the forward
+        // pass so they are available even when inference fails.
+        crate::metrics::record_batch_dimensions(&self.name, batch, max_seq);
+        crate::metrics::record_batch_token_budget(&self.name, batch, max_seq);
+        crate::metrics::record_attention_scratch(&self.name, batch, self.num_heads, max_seq);
+        // Snapshot RSS before inference for peak-bytes delta.
+        let rss_before = read_rss_bytes();
+
         let (ids, mask_i64, tti) =
             pool::build_tensors_from_ids(token_ids, batch, max_seq, self.pad_id);
 
@@ -256,7 +287,7 @@ impl EmbedModel {
             .lock()
             .map_err(|e| format!("lock session #{idx}: {e}"))?;
 
-        let outputs = if self.has_token_type_ids {
+        let run_result = if self.has_token_type_ids {
             let tti_arr = Array2::from_shape_vec([batch, max_seq], tti)
                 .map_err(|e| format!("tti shape: {e}"))?;
             let tti_tensor = Tensor::from_array(tti_arr).map_err(|e| format!("tti tensor: {e}"))?;
@@ -270,8 +301,20 @@ impl EmbedModel {
                 "input_ids" => ids_tensor,
                 "attention_mask" => mask_tensor,
             })
-        }
-        .map_err(|e| format!("inference: {e}"))?;
+        };
+
+        // ── forensic metrics: post-inference observation ──────────────────
+        let rss_after = read_rss_bytes();
+        let peak_delta = rss_after.saturating_sub(rss_before);
+        crate::metrics::record_inference_peak_bytes(&self.name, peak_delta);
+
+        let outputs = run_result.map_err(|e| {
+            // Classify the failure for the failures counter.
+            let msg = e.to_string();
+            let (reason, bin_num) = classify_ort_error(&msg);
+            crate::metrics::record_inference_failure(&self.name, reason, bin_num);
+            format!("inference: {e}")
+        })?;
 
         // Output shape: [batch, seq_len, dim]
         let raw = outputs[0]
@@ -282,6 +325,12 @@ impl EmbedModel {
             .map_err(|e| format!("mask_f shape: {e}"))?;
 
         pool::mean_pool_normalize(&raw, &mask_arr_f, batch, max_seq, self.dim)
+    }
+
+    /// Return the model name (for test assertions and metric label reuse).
+    #[allow(dead_code)]
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// Run a dummy inference at each requested batch shape to force ORT
@@ -385,8 +434,8 @@ impl EmbedModel {
             let run_result = if self.has_token_type_ids {
                 let tti_arr = Array2::from_shape_vec([batch, max_seq], tti.clone())
                     .map_err(|e| format!("warmup tti shape (batch={batch}): {e}"))?;
-                let tti_tensor = Tensor::from_array(tti_arr)
-                    .map_err(|e| format!("warmup tti tensor: {e}"))?;
+                let tti_tensor =
+                    Tensor::from_array(tti_arr).map_err(|e| format!("warmup tti tensor: {e}"))?;
                 session.run(ort::inputs! {
                     "input_ids" => ids_tensor,
                     "attention_mask" => mask_tensor,
@@ -549,6 +598,109 @@ mod seq_pad_tests {
         assert_eq!(round_up_seq_len(250, 300), 256);
         // 257.next_power_of_two() == 512, capped to 300.
         assert_eq!(round_up_seq_len(257, 300), 300);
+    }
+}
+
+/// Read process RSS (resident set size) in bytes from `/proc/self/statm`.
+///
+/// Returns `0` on any error (file absent on non-Linux, parse failure, etc.)
+/// so callers never panic.  Used only for a best-effort peak-bytes delta
+/// around `session.run()`.
+///
+/// `/proc/self/statm` format (space-separated integers, all in pages):
+///   `size  resident  shared  text  lib  data  dt`
+/// We want field 1 (resident).  `page_size()` converts to bytes.
+fn read_rss_bytes() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(content) = std::fs::read_to_string("/proc/self/statm") else {
+            return 0;
+        };
+        let mut parts = content.split_ascii_whitespace();
+        let _size = parts.next();
+        let Some(rss_pages_str) = parts.next() else {
+            return 0;
+        };
+        let Ok(rss_pages) = rss_pages_str.parse::<u64>() else {
+            return 0;
+        };
+        // SAFETY: `sysconf(_SC_PAGESIZE)` is thread-safe (POSIX), always
+        // returns a power-of-two ≥ 4096 on Linux. libc is a Linux-only dep.
+        let page_size = unsafe { ::libc::sysconf(::libc::_SC_PAGESIZE) };
+        if page_size <= 0 {
+            return rss_pages * 4096;
+        }
+        rss_pages * page_size as u64
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
+}
+
+/// Classify an ORT error message into a `(reason, bin_num)` pair for
+/// `embed_inference_failures_total`.
+///
+/// Recognised pattern (from BFCArena C++ source):
+///   "Available memory of X bytes is smaller than requested bytes of Y"
+/// Returns `("arena_oom", 0)` for that pattern.
+///
+/// Returns `("other", 0)` for everything else.
+fn classify_ort_error(msg: &str) -> (&'static str, u32) {
+    if msg.contains("Available memory of") && msg.contains("smaller than requested") {
+        ("arena_oom", 0)
+    } else {
+        ("other", 0)
+    }
+}
+
+// ── unit tests for new forensic helpers ──────────────────────────────────────
+
+#[cfg(test)]
+mod forensic_tests {
+    use super::*;
+
+    // ── classify_ort_error ────────────────────────────────────────────────
+
+    #[test]
+    fn classify_arena_oom_message() {
+        let msg =
+            "Available memory of 1073741824 bytes is smaller than requested bytes of 1258291200";
+        let (reason, bin_num) = classify_ort_error(msg);
+        assert_eq!(reason, "arena_oom");
+        assert_eq!(bin_num, 0);
+    }
+
+    #[test]
+    fn classify_other_error_message() {
+        let msg = "ONNX graph is invalid: input tensor not found";
+        let (reason, bin_num) = classify_ort_error(msg);
+        assert_eq!(reason, "other");
+        assert_eq!(bin_num, 0);
+    }
+
+    #[test]
+    fn classify_partial_match_is_other() {
+        // Contains "Available memory" but not "smaller than requested"
+        let msg = "Available memory of 1 GiB";
+        let (reason, _) = classify_ort_error(msg);
+        assert_eq!(reason, "other");
+    }
+
+    // ── read_rss_bytes ────────────────────────────────────────────────────
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn read_rss_returns_nonzero_on_linux() {
+        let rss = read_rss_bytes();
+        // The process always has resident pages; anything ≥ 4096 is sane.
+        assert!(rss >= 4096, "rss={rss} expected > 0");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn read_rss_returns_zero_on_non_linux() {
+        assert_eq!(read_rss_bytes(), 0);
     }
 }
 

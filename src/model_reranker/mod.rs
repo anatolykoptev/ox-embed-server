@@ -386,11 +386,7 @@ impl RerankerModel {
     /// the next shape proceeds. Total startup cost is bounded by
     /// `shapes.len() * sessions.len()` — `parse_warmup_batch_sizes`
     /// dedupes the input so duplicate shapes don't double-count.
-    pub fn warmup(
-        &self,
-        shapes: &[usize],
-        warmup_seq_len: Option<usize>,
-    ) -> Result<(), String> {
+    pub fn warmup(&self, shapes: &[usize], warmup_seq_len: Option<usize>) -> Result<(), String> {
         if shapes.is_empty() {
             // Defensive — `parse_warmup_batch_sizes` falls back to
             // defaults on empty input, so this branch never trips in
@@ -424,11 +420,7 @@ impl RerankerModel {
     /// session in the dynamic pool. Helper extracted from `warmup` so
     /// per-shape error handling stays clean (one fallible scope per
     /// shape, no manual cleanup of partial state).
-    fn warmup_at_shape(
-        &self,
-        batch: usize,
-        warmup_seq_len: Option<usize>,
-    ) -> Result<(), String> {
+    fn warmup_at_shape(&self, batch: usize, warmup_seq_len: Option<usize>) -> Result<(), String> {
         // `batch` of the same query-doc pair — content doesn't matter,
         // only the resulting `[batch, max_seq]` tensor shape does.
         // Tiny strings keep tokenization cheap; we cap to `max_len`

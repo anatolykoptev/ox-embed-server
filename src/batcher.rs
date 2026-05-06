@@ -427,6 +427,11 @@ async fn run_worker(
         };
         crate::metrics::record_batch_tokens(&name, padded_tokens);
         crate::metrics::record_padding_waste(&name, padded_tokens, raw_tokens);
+        // Deep forensic: (B, S) distribution counter at batcher level.
+        // Also emitted from model::embed_tokens, but recording here means
+        // we capture the shape even when the batch is later cancelled before
+        // dispatch reaches the model.
+        crate::metrics::record_batch_dimensions(&name, accum.items, accum.max_len);
         // Per-item enqueue→batch wall time. Recorded once per live Item
         // that made it into this dispatched batch. Cancelled items
         // (filtered above) are deliberately excluded — their "wait" is
@@ -1554,9 +1559,8 @@ mod tests {
         let _ = second.await;
         tokio::time::sleep(Duration::from_millis(200)).await;
         let text = handle.render();
-        let needle = format!(
-            "embed_batch_seq_capped_total{{model=\"{name}\",reason=\"seq_overflow\"}}"
-        );
+        let needle =
+            format!("embed_batch_seq_capped_total{{model=\"{name}\",reason=\"seq_overflow\"}}");
         assert!(
             text.contains(&needle),
             "expected `{needle}` in /metrics render:\n{text}"

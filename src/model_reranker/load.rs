@@ -415,9 +415,7 @@ fn build_session_pool(
             .with_env_allocators()
             .map_err(|e| format!("enable env allocators #{i}: {e}"))?
             // Disable per-session CPU mem arena (see model.rs for detail).
-            .with_execution_providers([ort::ep::CPU::default()
-                .with_arena_allocator(false)
-                .build()])
+            .with_execution_providers([ort::ep::CPU::default().with_arena_allocator(false).build()])
             .map_err(|e| format!("disable per-session cpu mem arena #{i}: {e}"))?
             .commit_from_file(&load_path)
             .map_err(|e| format!("load ONNX #{i} {}: {e}", load_path.display()))?;

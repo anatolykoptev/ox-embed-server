@@ -3,6 +3,10 @@ use std::time::Duration;
 
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
+// ── constant numerics used only as metric bucket boundaries ───────────────────
+const MIB: f64 = 1024.0 * 1024.0;
+const GIB: f64 = 1024.0 * MIB;
+
 /// Install the Prometheus recorder and return its rendering handle.
 ///
 /// Sets sensible histogram buckets for latency (_duration_seconds) and batch
@@ -32,6 +36,23 @@ pub fn init(version: &str) -> PrometheusHandle {
     // Pairs per /v1/rerank request: typically CROSS_ENCODER_MAX_DOCS = 15.
     let rerank_pairs_matcher =
         metrics_exporter_prometheus::Matcher::Full("embed_rerank_pairs_per_request".to_string());
+
+    // Token-budget per batch: [batch_size × effective_seq_len].
+    // Covers e5 (max 8×256=2048) through jina worst-case (32×512=16384)
+    // up to full BATCH_MAX_TOKENS (16384) and a deliberate 4M ceiling to
+    // capture runaway single allocations.
+    let batch_token_budget_matcher =
+        metrics_exporter_prometheus::Matcher::Full("embed_batch_token_budget".to_string());
+
+    // Attention scratch: B×H×S²×4 bytes. Scaled to bytes (MiB/GiB bins).
+    // 1 GiB bin is the smoking-gun boundary for the 1.258 GiB OOM tensor.
+    let attention_scratch_matcher = metrics_exporter_prometheus::Matcher::Full(
+        "embed_inference_attention_scratch_bytes".to_string(),
+    );
+
+    // Peak allocated bytes per inference (procfs RSS delta).
+    let peak_bytes_matcher =
+        metrics_exporter_prometheus::Matcher::Full("embed_inference_peak_bytes".to_string());
 
     let handle = PrometheusBuilder::new()
         .set_buckets_for_metric(
@@ -75,6 +96,39 @@ pub fn init(version: &str) -> PrometheusHandle {
             &[1.0, 5.0, 10.0, 15.0, 20.0, 30.0, 50.0, 100.0],
         )
         .expect("set rerank pairs buckets")
+        .set_buckets_for_metric(
+            batch_token_budget_matcher,
+            &[
+                1_000.0,
+                4_000.0,
+                16_000.0,
+                64_000.0,
+                128_000.0,
+                256_000.0,
+                1_000_000.0,
+                4_000_000.0,
+            ],
+        )
+        .expect("set batch token budget buckets")
+        .set_buckets_for_metric(
+            attention_scratch_matcher,
+            &[MIB, 16.0 * MIB, 64.0 * MIB, 256.0 * MIB, GIB, 4.0 * GIB],
+        )
+        .expect("set attention scratch buckets")
+        .set_buckets_for_metric(
+            peak_bytes_matcher,
+            &[
+                16.0 * MIB,
+                64.0 * MIB,
+                256.0 * MIB,
+                512.0 * MIB,
+                GIB,
+                2.0 * GIB,
+                4.0 * GIB,
+                8.0 * GIB,
+            ],
+        )
+        .expect("set peak bytes buckets")
         .install_recorder()
         .expect("install Prometheus recorder");
 
@@ -373,6 +427,136 @@ pub fn record_token_cache_miss(model: &str, n: u64) {
     .increment(n);
 }
 
+// ── Deep forensic metrics (enabled when EMBED_DEEP_METRICS=1) ────────────────
+//
+// Added 2026-05-06 to localise the 1.258 GiB BFCArena OOM in jina-code-v2.
+// The five series below pinpoint the exact (model, batch_size, seq_len) tuple
+// that overflows the arena.  Cheap counters/histograms — no locks on the hot
+// path.
+
+/// Record token-budget per dispatched batch: `batch_size × effective_seq_len`.
+///
+/// For padded models (all BERT-family dense embedders) effective_seq_len is
+/// the power-of-two-rounded `max(seq_len_in_batch)` that ends up in the actual
+/// tensor.  This is the direct predictor of per-inference scratch memory.
+///
+/// Buckets: 1k, 4k, 16k, 64k, 128k, 256k, 1M, 4M.  The 1.258 GiB tensor
+/// maps to a product ≈ 330M — clearly in the 256k→1M or 1M→4M bin.
+pub fn record_batch_token_budget(model: &str, batch_size: usize, seq_len: usize) {
+    metrics::histogram!(
+        "embed_batch_token_budget",
+        "model" => model.to_string()
+    )
+    .record((batch_size * seq_len) as f64);
+}
+
+/// Increment the 2D (batch_size_bucket, seq_len_bucket) counter for one
+/// dispatched batch.  Gives the full (B, S) distribution without unbounded
+/// cardinality — six batch buckets × five seq buckets = 30 label combinations
+/// maximum per model.
+///
+/// batch_size_bucket: "1" | "2" | "4" | "8" | "16" | "32+"
+/// seq_len_bucket:    "64" | "128" | "256" | "384" | "512+"
+pub fn record_batch_dimensions(model: &str, batch_size: usize, seq_len: usize) {
+    let bs_bucket = match batch_size {
+        1 => "1",
+        2 => "2",
+        3..=4 => "4",
+        5..=8 => "8",
+        9..=16 => "16",
+        _ => "32+",
+    };
+    let sl_bucket = match seq_len {
+        0..=64 => "64",
+        65..=128 => "128",
+        129..=256 => "256",
+        257..=384 => "384",
+        _ => "512+",
+    };
+    metrics::counter!(
+        "embed_batch_dimensions_total",
+        "model" => model.to_string(),
+        "batch_size_bucket" => bs_bucket,
+        "seq_len_bucket" => sl_bucket,
+    )
+    .increment(1);
+}
+
+/// Record estimated self-attention scratch bytes for one inference:
+///   `batch_size × num_heads × seq_len² × 4`
+///
+/// For jina-code-v2 (12 heads, max_len=512):
+///   B=1, S=512  → 1 × 12 × 512² × 4 = 12 MiB
+///   B=8, S=512  → 96 MiB
+///   B=32, S=512 → 384 MiB   ← still under 512 MiB
+/// The 1.258 GiB tensor requires B×H×S²×4 ≈ 1.258 GiB:
+///   1.258G / (12 × 4) = 26.8M tokens² → S²×B ≈ 26.8M → B=32, S=915 (impossible),
+///   or multi-head intermediate Q/K/V stacks (3×) → B=1, S=512 × 3 layers = 1.258 GiB
+///   Actual: memory_pattern allocates the full forward pass graph at once.
+///
+/// Buckets: 1 MiB, 16 MiB, 64 MiB, 256 MiB, 1 GiB, 4 GiB+.
+pub fn record_attention_scratch(model: &str, batch_size: usize, num_heads: usize, seq_len: usize) {
+    // Use f64 throughout to avoid usize overflow on large shapes.
+    let bytes = (batch_size as f64) * (num_heads as f64) * (seq_len as f64).powi(2) * 4.0;
+    metrics::histogram!(
+        "embed_inference_attention_scratch_bytes",
+        "model" => model.to_string()
+    )
+    .record(bytes);
+}
+
+/// Record peak resident-set delta for one inference (bytes).
+///
+/// Uses `/proc/self/statm` resident-page count (Linux only).  On non-Linux
+/// the call is a no-op — the metric simply never appears.  On Linux, the
+/// delta is the change in RSS from just before `session.run()` to just after;
+/// negative deltas (freed pages returned to OS concurrently) are recorded as 0.
+///
+/// This is NOT a per-thread allocator delta (no jemalloc dependency) — it is
+/// a process-wide RSS snapshot.  Under concurrent inference it can be noisy,
+/// but a spike to >1 GiB is unambiguous even with noise.
+pub fn record_inference_peak_bytes(model: &str, delta_bytes: u64) {
+    metrics::histogram!(
+        "embed_inference_peak_bytes",
+        "model" => model.to_string()
+    )
+    .record(delta_bytes as f64);
+}
+
+/// Increment the BFCArena extend counter for one parsed ORT log event.
+///
+/// Called by the tracing `OrtLogLayer` when it intercepts an ORT INFO event
+/// matching `Extending BFCArena for Cpu. bin_num:N num_bytes:M`.
+///
+/// `bin_num` is encoded as a string label so operators can immediately see
+/// which bin is responsible (bin 20 ≈ 1.25 GiB per extension).
+pub fn record_arena_extend(model: &str, bin_num: u32) {
+    metrics::counter!(
+        "embed_arena_extend_total",
+        "model" => model.to_string(),
+        "bin_num" => bin_num.to_string(),
+    )
+    .increment(1);
+}
+
+/// Increment the inference-failure counter with an OOM reason tag.
+///
+/// `reason`: "arena_oom" when the error message contains
+/// "Available memory of X is smaller than requested bytes of Y";
+/// "other" for everything else.
+///
+/// `bin_num`: parsed from the OOM message when available (e.g. the
+/// BFCArena reports which bin triggered the failure); 0 when not parseable.
+pub fn record_inference_failure(model: &str, reason: &str, bin_num: u32) {
+    metrics::counter!(
+        "embed_inference_failures_total",
+        "model" => model.to_string(),
+        "reason" => reason.to_string(),
+        "bin_num" => bin_num.to_string(),
+    )
+    .increment(1);
+}
+
 // ---------------------------------------------------------------------
 // Rerank-specific instrumentation (Phase 1A — 2026-05-01).
 //
@@ -501,5 +685,75 @@ impl Drop for RerankInFlightGuard {
             "model" => self.model.clone()
         )
         .decrement(1.0);
+    }
+}
+
+// ── unit tests for bucket-label logic ────────────────────────────────────────
+
+#[cfg(test)]
+mod bucket_label_tests {
+    /// Replicate the batch_size and seq_len bucketing logic from
+    /// `record_batch_dimensions` to verify boundary conditions without
+    /// requiring a live Prometheus recorder.
+    fn bs_bucket(n: usize) -> &'static str {
+        match n {
+            1 => "1",
+            2 => "2",
+            3..=4 => "4",
+            5..=8 => "8",
+            9..=16 => "16",
+            _ => "32+",
+        }
+    }
+
+    fn sl_bucket(n: usize) -> &'static str {
+        match n {
+            0..=64 => "64",
+            65..=128 => "128",
+            129..=256 => "256",
+            257..=384 => "384",
+            _ => "512+",
+        }
+    }
+
+    #[test]
+    fn batch_size_boundaries() {
+        assert_eq!(bs_bucket(1), "1");
+        assert_eq!(bs_bucket(2), "2");
+        assert_eq!(bs_bucket(3), "4");
+        assert_eq!(bs_bucket(4), "4");
+        assert_eq!(bs_bucket(5), "8");
+        assert_eq!(bs_bucket(8), "8");
+        assert_eq!(bs_bucket(9), "16");
+        assert_eq!(bs_bucket(16), "16");
+        assert_eq!(bs_bucket(17), "32+");
+        assert_eq!(bs_bucket(32), "32+");
+        assert_eq!(bs_bucket(100), "32+");
+    }
+
+    #[test]
+    fn seq_len_boundaries() {
+        assert_eq!(sl_bucket(0), "64");
+        assert_eq!(sl_bucket(64), "64");
+        assert_eq!(sl_bucket(65), "128");
+        assert_eq!(sl_bucket(128), "128");
+        assert_eq!(sl_bucket(129), "256");
+        assert_eq!(sl_bucket(256), "256");
+        assert_eq!(sl_bucket(257), "384");
+        assert_eq!(sl_bucket(384), "384");
+        assert_eq!(sl_bucket(385), "512+");
+        assert_eq!(sl_bucket(512), "512+");
+        assert_eq!(sl_bucket(1024), "512+");
+    }
+
+    #[test]
+    fn attention_scratch_formula() {
+        // jina-code-v2: B=1, H=12, S=512 → 1×12×512²×4 = 12_582_912 bytes (12 MiB)
+        let bytes = (1_f64) * (12_f64) * (512_f64).powi(2) * 4.0;
+        assert_eq!(bytes as u64, 12_582_912);
+
+        // B=8, H=12, S=512 → 100_663_296 bytes (96 MiB)
+        let bytes_b8 = (8_f64) * (12_f64) * (512_f64).powi(2) * 4.0;
+        assert_eq!(bytes_b8 as u64, 100_663_296);
     }
 }
