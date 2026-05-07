@@ -24,10 +24,10 @@ test:
 	@$(CI_STAGE) test cargo test --locked --all-targets --workspace
 
 build:
-	@$(CI_STAGE) build cargo build --release --locked
+	@$(CI_STAGE) build cargo build --release --locked --timings
 
 build-debug:
-	@$(CI_STAGE) build-debug cargo build --locked
+	@$(CI_STAGE) build-debug cargo build --locked --timings
 
 lint: fmt clippy
 
