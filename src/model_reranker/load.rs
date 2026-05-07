@@ -115,6 +115,13 @@ impl RerankerModel {
             "creating reranker ONNX session(s)"
         );
 
+        let key = name.to_uppercase().replace('-', "_");
+        let memory_pattern = crate::config::parse_memory_pattern(
+            std::env::var(format!("EMBED_MEMORY_PATTERN_{key}"))
+                .ok()
+                .as_deref(),
+        );
+        tracing::info!(model = %name, memory_pattern, "reranker session config");
         let sessions = build_session_pool(
             name,
             &onnx_path,
@@ -122,6 +129,7 @@ impl RerankerModel {
             intra_threads,
             pool_size,
             allow_spinning,
+            memory_pattern,
         )?;
         introspect_graph_inputs(name, &sessions)?;
 
@@ -149,8 +157,14 @@ impl RerankerModel {
         // place and the matching shape activates automatically. Per-shape
         // pool size hard-coded to 2 (mirrors the dynamic default and
         // matches the typical 4-core / 4-inflight config).
-        let static_session_pools =
-            load_static_session_pools(name, dir_p, opt_level, intra_threads, allow_spinning);
+        let static_session_pools = load_static_session_pools(
+            name,
+            dir_p,
+            opt_level,
+            intra_threads,
+            allow_spinning,
+            memory_pattern,
+        );
         let static_session_cursors = static_session_pools
             .keys()
             .map(|k| (*k, AtomicUsize::new(0)))
@@ -308,6 +322,7 @@ fn load_static_session_pools(
     opt_level: GraphOptimizationLevel,
     intra_threads: usize,
     allow_spinning: bool,
+    memory_pattern: bool,
 ) -> BTreeMap<usize, Vec<Mutex<Session>>> {
     let discovered = discover_static_shape_files(name, dir_p);
     if discovered.is_empty() {
@@ -340,6 +355,7 @@ fn load_static_session_pools(
             intra_threads,
             STATIC_POOL_SIZE_PER_SHAPE,
             allow_spinning,
+            memory_pattern,
         ) {
             Ok(p) => {
                 tracing::info!(
@@ -379,6 +395,7 @@ fn build_session_pool(
     intra_threads: usize,
     pool_size: usize,
     allow_spinning: bool,
+    memory_pattern: bool,
 ) -> Result<Vec<Mutex<Session>>, String> {
     // Resolve the cache dir once per pool. The decision (hit / miss) is
     // re-evaluated *per session* inside the loop: session 0 sees a miss
@@ -409,8 +426,9 @@ fn build_session_pool(
             // only way to stop the spin on a shared multi-tenant CPU.
             .with_intra_op_spinning(allow_spinning)
             .map_err(|e| format!("set intra spinning #{i}: {e}"))?
-            // memory_pattern=true: same rationale as model.rs.
-            .with_memory_pattern(true)
+            // memory_pattern: per-model knob (EMBED_MEMORY_PATTERN_<MODEL_UPPER>).
+            // Default true (back-compat). See config::ModelDef::memory_pattern for rationale.
+            .with_memory_pattern(memory_pattern)
             .map_err(|e| format!("enable memory pattern #{i}: {e}"))?
             .with_env_allocators()
             .map_err(|e| format!("enable env allocators #{i}: {e}"))?

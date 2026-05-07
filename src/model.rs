@@ -160,7 +160,13 @@ impl EmbedModel {
             "creating ONNX session(s)"
         );
 
-        let sessions = build_session_pool(&onnx_path, opt_level, intra_threads, pool_size)?;
+        let sessions = build_session_pool(
+            &onnx_path,
+            opt_level,
+            intra_threads,
+            pool_size,
+            def.memory_pattern,
+        )?;
 
         tracing::info!(path = %tok_path.display(), "loading tokenizer");
         let mut tokenizer =
@@ -503,6 +509,7 @@ fn build_session_pool(
     opt_level: GraphOptimizationLevel,
     intra_threads: usize,
     pool_size: usize,
+    memory_pattern: bool,
 ) -> Result<Vec<Mutex<Session>>, String> {
     // Resolve the cache dir once per pool. The decision (hit / miss) is
     // re-evaluated *per session* inside the loop: session 0 sees a miss
@@ -525,7 +532,7 @@ fn build_session_pool(
         let session = builder
             .with_intra_threads(intra_threads)
             .map_err(|e| format!("set threads #{i}: {e}"))?
-            .with_memory_pattern(true)
+            .with_memory_pattern(memory_pattern)
             .map_err(|e| format!("enable memory pattern #{i}: {e}"))?
             // Use the shared env-level arena registered in arena.rs.
             .with_env_allocators()
