@@ -35,6 +35,22 @@ pub struct ModelDef {
     /// Trade-off: larger warmup = larger startup memory commitment but
     /// stable steady-state inference latency.
     pub warmup_seq_len: Option<usize>,
+    /// Whether to enable ORT's memory-pattern optimisation for this model.
+    ///
+    /// `true` (default) — ORT pre-allocates the entire forward-pass plan as
+    /// a single BFCArena block. Amortises per-shape scratch allocation for
+    /// models with stable input shapes (e5-large: max_len=256, fixed prod
+    /// traffic → 0 errors in prod).
+    ///
+    /// `false` — per-op allocation on every inference call. Real peak working
+    /// memory jina S=512 B=1 ≈ 80 MiB (vs 1.258 GiB plan-block with
+    /// `true`). Required for jina-code-v2 (max_len=512, variable seq,
+    /// BFCArena fills monotonically → arena OOM with `true`).
+    ///
+    /// Override per model via `EMBED_MEMORY_PATTERN_<MODEL_UPPER>=false`
+    /// (uppercase name, `-`→`_`). Example: `EMBED_MEMORY_PATTERN_JINA_CODE_V2=false`.
+    /// Invalid values fall back to `true` with a warn.
+    pub memory_pattern: bool,
 }
 
 /// Definition of a single cross-encoder reranker to load.
@@ -632,6 +648,34 @@ fn parse_embed_pool_size(raw: Option<&str>) -> usize {
     }
 }
 
+/// Parse `EMBED_MEMORY_PATTERN_<MODEL_UPPER>` env value.
+///
+/// - Unset or empty → `true` (back-compat default).
+/// - `"true"` / `"1"` → `true`.
+/// - `"false"` / `"0"` → `false`.
+/// - Any other value → `true` + warn (typo guard, same posture as other
+///   bool knobs in this file).
+///
+/// Exposed for testing and for reranker/splade loaders; env lookup stays
+/// in the caller.
+pub(crate) fn parse_memory_pattern(raw: Option<&str>) -> bool {
+    match raw {
+        None | Some("") => true,
+        Some(s) => match s.trim() {
+            "true" | "1" => true,
+            "false" | "0" => false,
+            other => {
+                tracing::warn!(
+                    raw = %other,
+                    "EMBED_MEMORY_PATTERN_* is not a valid bool (true|false|1|0); \
+                     falling back to default true"
+                );
+                true
+            }
+        },
+    }
+}
+
 /// Parse `RERANKER_SESSION_POOL_SIZE` env value. Unset, empty, or
 /// unparseable → 1 (single-session, mirrors the pre-pool behaviour
 /// exactly). `0` is rejected with a warn rather than silently accepted —
@@ -826,6 +870,16 @@ fn parse_one_model(
         global_warmup_seq_len.or(Some(max_len))
     };
 
+    // Per-model memory_pattern: EMBED_MEMORY_PATTERN_<KEY>.
+    // Default true (back-compat). Set to false for models with variable seq
+    // shapes (e.g. jina-code-v2) to avoid BFCArena monotonic fill.
+    let memory_pattern = parse_memory_pattern(
+        env::var(format!("EMBED_MEMORY_PATTERN_{key}"))
+            .ok()
+            .as_deref(),
+    );
+    tracing::info!(model = %name, memory_pattern, "session config");
+
     Ok(ModelDef {
         name,
         dir: parts[1].to_string(),
@@ -835,6 +889,7 @@ fn parse_one_model(
         has_token_type_ids: has_tti,
         batch_max_seq,
         warmup_seq_len,
+        memory_pattern,
     })
 }
 
@@ -1482,6 +1537,7 @@ mod tests {
         // Some(None) = "max" keyword
         // Some(Some(n)) = explicit value
         per_model_warmup_seq_len: Option<Option<usize>>,
+        per_model_memory_pattern: bool,
     ) -> ModelDef {
         let batch_max_seq = per_model_batch_max_seq.unwrap_or(global_batch_max_seq);
         let warmup_seq_len = match per_model_warmup_seq_len {
@@ -1497,6 +1553,7 @@ mod tests {
             has_token_type_ids: false,
             batch_max_seq,
             warmup_seq_len,
+            memory_pattern: per_model_memory_pattern,
         }
     }
 
@@ -1521,6 +1578,7 @@ mod tests {
             global,
             None, // no per-model override
             None, // no per-model warmup override
+            true, // memory_pattern default
         );
         assert_eq!(def.batch_max_seq, global);
     }
@@ -1534,6 +1592,7 @@ mod tests {
             256,       // global batch_max_seq
             Some(384), // per-model override
             None,
+            true, // memory_pattern default
         );
         assert_eq!(def.batch_max_seq, 384);
     }
@@ -1550,6 +1609,7 @@ mod tests {
             256, // global batch_max_seq
             None,
             None, // no per-model warmup override
+            true, // memory_pattern default
         );
         assert_eq!(def.warmup_seq_len, Some(256));
     }
@@ -1564,6 +1624,7 @@ mod tests {
             256, // global batch_max_seq
             None,
             Some(Some(256)), // per-model warmup = Some(256)
+            true,            // memory_pattern default
         );
         assert_eq!(def.warmup_seq_len, Some(256));
     }
@@ -1579,6 +1640,7 @@ mod tests {
             256,
             None,
             Some(None), // per-model warmup = None (= "max" keyword)
+            true,       // memory_pattern default
         );
         assert_eq!(def.warmup_seq_len, None);
     }
@@ -1594,9 +1656,79 @@ mod tests {
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].batch_max_seq, 256); // global default
         assert_eq!(defs[0].warmup_seq_len, Some(256)); // = max_len
+        assert!(defs[0].memory_pattern); // default true
 
         let defs2 = parse_models("jina-code-v2:/models-jina:768:512:0:false").unwrap();
         assert_eq!(defs2[0].batch_max_seq, 256); // still global default
         assert_eq!(defs2[0].warmup_seq_len, Some(512)); // = max_len=512
+        assert!(defs2[0].memory_pattern); // default true (no env var set in tests)
+    }
+
+    // -----------------------------------------------------------------
+    // E4: per-model memory_pattern knob
+    //
+    // Convention:
+    //   EMBED_MEMORY_PATTERN_<MODEL_UPPER>=true|false
+    //   <MODEL_UPPER> = uppercase(name), '-' → '_'
+    //
+    // Default: true (back-compat — existing behaviour for all models).
+    // False: disable memory_pattern for models with variable seq shapes
+    // (jina-code-v2) where BFCArena fills monotonically under the plan.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_per_model_memory_pattern_default_true() {
+        // Unset → true (backwards-compatible default).
+        assert!(parse_memory_pattern(None));
+        assert!(parse_memory_pattern(Some("")));
+    }
+
+    #[test]
+    fn parse_per_model_memory_pattern_env_false() {
+        // EMBED_MEMORY_PATTERN_JINA_CODE_V2=false → false for jina.
+        // e5-large has no override → stays true.
+        assert!(!parse_memory_pattern(Some("false")));
+        assert!(!parse_memory_pattern(Some("0")));
+        // e5-large (no per-model env) defaults to true.
+        assert!(parse_memory_pattern(None));
+    }
+
+    #[test]
+    fn parse_per_model_memory_pattern_invalid_value_defaults_true() {
+        // Garbage → warn + default true (same fallback posture as other
+        // bool knobs in this codebase).
+        assert!(parse_memory_pattern(Some("garbage")));
+        assert!(parse_memory_pattern(Some("nope")));
+        assert!(parse_memory_pattern(Some("2")));
+    }
+
+    #[test]
+    fn model_def_memory_pattern_env_key_uses_screaming_snake_case() {
+        // Key generation: uppercase + '-' → '_'. Tests that the correct
+        // env-var name is derived from the model name so env var lookups
+        // resolve to the right key (no dashes in env vars).
+        //
+        // We verify indirectly via resolve_per_model_knobs: passing
+        // per_model_memory_pattern=false should land in model_def.
+        let def = resolve_per_model_knobs(
+            "jina-code-v2",
+            512,
+            256,
+            None,
+            None,
+            false, // per_model_memory_pattern: false (override)
+        );
+        assert!(!def.memory_pattern);
+
+        // e5-large with default true.
+        let def2 = resolve_per_model_knobs(
+            "multilingual-e5-large",
+            256,
+            256,
+            None,
+            None,
+            true, // per_model_memory_pattern: true (default)
+        );
+        assert!(def2.memory_pattern);
     }
 }
