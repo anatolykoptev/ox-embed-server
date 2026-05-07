@@ -38,10 +38,37 @@
 
 use std::ffi::{CString, c_char};
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ort::AsPointer;
 use ort::environment::Environment;
 use ort_sys::{OrtAllocatorType, OrtArenaCfg, OrtEnv, OrtMemType, OrtMemoryInfo};
+
+/// Set to `true` inside `register_shared_cpu_arena()` after a successful
+/// (or already-registered) registration. Guards against the silent-bug where
+/// sessions are created before the shared arena is registered — in that case
+/// each session allocates its own BFCArena and `EMBED_ARENA_*` knobs are
+/// silently ignored, leading to monotonic memory growth.
+///
+/// `pub(crate)` so integration test helpers can call
+/// `ARENA_REGISTERED.store(true, ...)` before loading real ONNX models in
+/// tests that bypass the normal `main.rs` init sequence.
+pub(crate) static ARENA_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// Assert that `register_shared_cpu_arena()` has been called before any
+/// `Session::builder()`. Call this at the top of every function that creates
+/// an ONNX session.
+///
+/// Panics with a fix hint if the arena has not been registered.
+pub fn assert_arena_registered_before_session() {
+    if !ARENA_REGISTERED.load(Ordering::Acquire) {
+        panic!(
+            "BUG: register_shared_cpu_arena() must be called before any \
+             Session::builder() — arena knobs (EMBED_ARENA_*) will be ignored. \
+             Check main.rs init order."
+        );
+    }
+}
 
 /// Default arena max memory: 6 GiB.
 ///
@@ -270,6 +297,7 @@ pub fn register_shared_cpu_arena() -> Result<(), String> {
             "CreateAndRegisterAllocator returned non-null status (likely already registered); skipping gauge publish"
         );
         crate::metrics::record_arena_register_skipped();
+        ARENA_REGISTERED.store(true, Ordering::Release);
         return Ok(());
     }
 
@@ -284,6 +312,8 @@ pub fn register_shared_cpu_arena() -> Result<(), String> {
         cfg.extend_strategy,
     );
 
+    ARENA_REGISTERED.store(true, Ordering::Release);
+
     Ok(())
 }
 
@@ -293,6 +323,26 @@ pub fn register_shared_cpu_arena() -> Result<(), String> {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    // ── new guard tests ───────────────────────────────────────────────────────
+
+    #[test]
+    #[serial]
+    #[should_panic(expected = "register_shared_cpu_arena")]
+    fn assert_panics_when_arena_not_registered() {
+        ARENA_REGISTERED.store(false, std::sync::atomic::Ordering::Release);
+        assert_arena_registered_before_session();
+    }
+
+    #[test]
+    #[serial]
+    fn assert_passes_after_register() {
+        ARENA_REGISTERED.store(true, std::sync::atomic::Ordering::Release);
+        // must not panic
+        assert_arena_registered_before_session();
+        // restore to false so subsequent serial tests don't see stale state
+        ARENA_REGISTERED.store(false, std::sync::atomic::Ordering::Release);
+    }
 
     /// Clear arena env vars for the duration of a test and restore on drop.
     struct EnvGuard {
