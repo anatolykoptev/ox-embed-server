@@ -86,6 +86,21 @@ Single process serving three model classes concurrently:
 | `EMBED_ARENA_EXTEND_STRATEGY` | TBD (default 1 = kSameAsRequested) | 0=kNextPowerOfTwo, 1=kSameAsRequested |
 | `EMBED_WARMUP_SEQ_LEN` | (default `128`) | Cap on warmup tensor `max_seq` for dense embedders + rerankers. `max` = pad to model `max_len` (legacy). With `memory_pattern=true`, ORT re-plans on first long prod request — saves 200-400 MiB resident vs worst-case warmup. |
 
+## Local CI
+
+GitHub Actions runs only release-please. Cargo gates are local — run `make ci` before pushing.
+
+| Target | What it runs | Warm time |
+|--------|-------------|-----------|
+| `make fmt` | `cargo fmt --all -- --check` | ~1s |
+| `make clippy` | `cargo clippy --locked --all-targets --workspace -- -D warnings` | ~5s |
+| `make lint` | fmt + clippy | ~5s |
+| `make test` | `cargo test --locked --all-targets --workspace` | ~30s |
+| `make build` | `cargo build --release --locked` | ~90s |
+| `make ci` | lint + test + build (full gate) | ~2 min |
+
+`--locked` is mandatory on all targets — catches `Cargo.lock` drift that `cargo check` misses (real incident 2026-05-02).
+
 ## Deploy
 
 ```bash

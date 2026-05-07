@@ -36,6 +36,11 @@ pub fn init(version: &str) -> PrometheusHandle {
     // Pairs per /v1/rerank request: typically CROSS_ENCODER_MAX_DOCS = 15.
     let rerank_pairs_matcher =
         metrics_exporter_prometheus::Matcher::Full("embed_rerank_pairs_per_request".to_string());
+    // Effective max seq len per dispatched batch (post-round_up). Powers of
+    // two from 1 to 512 + 512 cap. This matches the static ONNX tensor shapes
+    // used by e5-large (max_len=256) and jina-code-v2 (max_len=512).
+    let max_eff_seq_matcher =
+        metrics_exporter_prometheus::Matcher::Full("embed_batch_max_effective_seq".to_string());
 
     // Token-budget per batch: [batch_size × effective_seq_len].
     // Covers e5 (max 8×256=2048) through jina worst-case (32×512=16384)
@@ -129,6 +134,11 @@ pub fn init(version: &str) -> PrometheusHandle {
             ],
         )
         .expect("set peak bytes buckets")
+        .set_buckets_for_metric(
+            max_eff_seq_matcher,
+            &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0],
+        )
+        .expect("set max effective seq buckets")
         .install_recorder()
         .expect("install Prometheus recorder");
 
@@ -285,6 +295,48 @@ pub fn record_seq_capped(model: &str) {
         "reason" => "seq_overflow"
     )
     .increment(1);
+}
+
+/// Increment the solo-seq-overflow counter — fired when the FIRST item
+/// of an EMPTY batch exceeds `max_batch_seq`.
+///
+/// The empty-batch path always admits the item (long-doc starvation
+/// guard: a single request must always make forward progress regardless
+/// of seq_len). This counter is pure observability — it does NOT change
+/// whether the item is admitted.
+///
+/// Rising `embed_batch_seq_capped_total{reason="solo_seq_overflow"}` means
+/// concurrent requests at seq_len > `BATCH_MAX_SEQ_{MODEL}` are arriving.
+/// With `pool_size=2` each such request allocates its own attention-scratch
+/// tensor from the shared arena — monitor alongside
+/// `embed_inference_attention_scratch_bytes` to detect arena pressure.
+pub fn record_solo_seq_overflow(model: &str) {
+    metrics::counter!(
+        "embed_batch_seq_capped_total",
+        "model" => model.to_string(),
+        "reason" => "solo_seq_overflow"
+    )
+    .increment(1);
+}
+
+/// Record the effective max sequence length for a dispatched batch.
+///
+/// `effective_seq` is the post-`round_up_seq_len` value — the actual
+/// tensor dimension that attention scratch was allocated for. This is
+/// what determines memory pressure in the BFCArena:
+///   attention_scratch ≈ 4 × batch_size × heads × effective_seq²
+///
+/// Histogram buckets mirror the static tensor shapes: powers of two
+/// from 1 to `max_len` plus the model `max_len` cap. Operators watching
+/// this series can verify that warmup at `Some(max_len)` anchors the
+/// distribution at the rightmost bucket rather than causing a replan
+/// spike on the first long prod request.
+pub fn record_batch_max_effective_seq(model: &str, effective_seq: usize) {
+    metrics::histogram!(
+        "embed_batch_max_effective_seq",
+        "model" => model.to_string()
+    )
+    .record(effective_seq as f64);
 }
 
 /// Increment the carry-events counter (token-budget overflow deferred
