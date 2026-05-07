@@ -324,6 +324,7 @@ fn load_static_session_pools(
     allow_spinning: bool,
     memory_pattern: bool,
 ) -> BTreeMap<usize, Vec<Mutex<Session>>> {
+    crate::arena::assert_arena_registered_before_session();
     let discovered = discover_static_shape_files(name, dir_p);
     if discovered.is_empty() {
         tracing::debug!(
@@ -397,6 +398,7 @@ fn build_session_pool(
     allow_spinning: bool,
     memory_pattern: bool,
 ) -> Result<Vec<Mutex<Session>>, String> {
+    crate::arena::assert_arena_registered_before_session();
     // Resolve the cache dir once per pool. The decision (hit / miss) is
     // re-evaluated *per session* inside the loop: session 0 sees a miss
     // and writes the optimized graph; sessions 1..N see a hit on their

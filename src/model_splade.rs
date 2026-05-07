@@ -105,6 +105,7 @@ impl SpladeModel {
         intra_threads: usize,
         pool_size: usize,
     ) -> Result<Self, String> {
+        crate::arena::assert_arena_registered_before_session();
         // Defensive clamp — `0` would `% 0` panic in `encode_sparse`.
         let pool_size = pool_size.max(1);
 
@@ -507,6 +508,10 @@ mod tests {
             );
             return None;
         }
+        // Simulate the init sequence: tests call load() directly without going
+        // through main.rs, so we set the arena flag manually to satisfy the
+        // assert in SpladeModel::load.
+        crate::arena::ARENA_REGISTERED.store(true, std::sync::atomic::Ordering::Release);
         Some(
             SpladeModel::load("splade-v3-distilbert", &dir, 512, 1, pool_size)
                 .expect("load splade"),

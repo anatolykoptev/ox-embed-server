@@ -34,6 +34,10 @@ fn load_reranker_or_skip_with_pool(pool_size: usize) -> Option<RerankerModel> {
         );
         return None;
     }
+    // Simulate the init sequence: tests call load() directly without going
+    // through main.rs, so we set the arena flag manually to satisfy the
+    // assert in build_session_pool.
+    crate::arena::ARENA_REGISTERED.store(true, std::sync::atomic::Ordering::Release);
     Some(
         RerankerModel::load("gte-multi-rerank", &dir, 512, true, 1, pool_size)
             .expect("load reranker"),

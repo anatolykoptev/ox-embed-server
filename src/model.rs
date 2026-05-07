@@ -511,6 +511,7 @@ fn build_session_pool(
     pool_size: usize,
     memory_pattern: bool,
 ) -> Result<Vec<Mutex<Session>>, String> {
+    crate::arena::assert_arena_registered_before_session();
     // Resolve the cache dir once per pool. The decision (hit / miss) is
     // re-evaluated *per session* inside the loop: session 0 sees a miss
     // and writes the optimized graph; sessions 1..N see a hit on their
