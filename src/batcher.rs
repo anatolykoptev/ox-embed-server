@@ -5,6 +5,20 @@
 //! The batcher accepts pre-tokenized input_ids and caps batches by the
 //! padded total tokens `max(seq_len_in_batch) * n_items`, not by item count.
 use std::cmp::max;
+
+/// Round up `n` to the next power of two, capped at `cap`.
+///
+/// Mirrors `round_up_seq_len` in `model.rs`. Duplicated here (vs. making it
+/// pub in model.rs) to avoid importing the ONNX session dependency from
+/// batcher tests. Both copies are ≤5 lines; the architecture "3rd copy →
+/// extract" rule hasn't triggered. If a third call site emerges, move to a
+/// `seq_util` module.
+fn round_up_seq_len(n: usize, cap: usize) -> usize {
+    if n <= 1 {
+        return 1;
+    }
+    n.next_power_of_two().min(cap)
+}
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -109,6 +123,14 @@ struct BatcherConfig {
     /// How long to wait after the first item before dispatching, giving
     /// concurrent requests a chance to coalesce into the same batch.
     wait: Duration,
+    /// Static model context-window length. Used to compute
+    /// `effective_seq_len = round_up_seq_len(accum.max_len, model_max_len)`
+    /// for the `embed_batch_max_effective_seq` histogram.
+    ///
+    /// Equals `ModelDef.max_len`. `usize::MAX` is the safe default for
+    /// tests that don't care about this metric — `round_up_seq_len` treats
+    /// it as "no cap" and just does `next_power_of_two`.
+    model_max_len: usize,
 }
 
 impl DynamicBatcher {
@@ -140,6 +162,39 @@ impl DynamicBatcher {
     where
         F: Fn(Vec<Vec<u32>>) -> Result<Vec<Vec<f32>>, String> + Send + Sync + 'static,
     {
+        Self::with_tokens_and_max_len(
+            name,
+            embed_fn,
+            max_batch_tokens,
+            max_batch_items,
+            max_batch_seq,
+            padded_model,
+            wait_ms,
+            max_queue,
+            usize::MAX, // model_max_len: no cap (tests that don't care)
+        )
+    }
+
+    /// Like `with_tokens` but also takes the model's static `max_len`
+    /// for computing the `embed_batch_max_effective_seq` histogram.
+    /// Production callers use this form so the histogram reflects the
+    /// actual tensor dimension; tests that don't care about this metric
+    /// can use `with_tokens` which passes `usize::MAX`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_tokens_and_max_len<F>(
+        name: &str,
+        embed_fn: F,
+        max_batch_tokens: usize,
+        max_batch_items: usize,
+        max_batch_seq: usize,
+        padded_model: bool,
+        wait_ms: u64,
+        max_queue: usize,
+        model_max_len: usize,
+    ) -> Self
+    where
+        F: Fn(Vec<Vec<u32>>) -> Result<Vec<Vec<f32>>, String> + Send + Sync + 'static,
+    {
         let (tx, rx) = mpsc::channel::<Item>(max_queue);
         let arc_name = Arc::new(name.to_string());
         let cfg = BatcherConfig {
@@ -148,6 +203,7 @@ impl DynamicBatcher {
             max_batch_seq,
             padded_model,
             wait: Duration::from_millis(wait_ms),
+            model_max_len,
         };
         let handle = tokio::spawn(run_worker(rx, Arc::new(embed_fn), arc_name.clone(), cfg));
         DynamicBatcher {
@@ -334,6 +390,13 @@ async fn run_worker(
         };
         let mut accum = BatchAccum::default();
         accum.push(&first);
+        // Observability only: first item admitted even if it exceeds
+        // max_batch_seq (starvation guard). Emit a distinct counter so
+        // operators can see solo long-doc batches in metrics without
+        // changing the admission decision.
+        if first.max_seq_len() > cfg.max_batch_seq {
+            crate::metrics::record_solo_seq_overflow(&name);
+        }
         let mut batch = vec![first];
         let deadline = Instant::now() + cfg.wait;
         loop {
@@ -432,6 +495,13 @@ async fn run_worker(
         // we capture the shape even when the batch is later cancelled before
         // dispatch reaches the model.
         crate::metrics::record_batch_dimensions(&name, accum.items, accum.max_len);
+        // Record effective max seq len — the post-round_up tensor dimension
+        // that attention scratch sizing depends on. This is what operators
+        // should watch alongside `embed_inference_attention_scratch_bytes`
+        // to diagnose arena pressure: a spike in effective_seq at high
+        // concurrency explains large scratch allocations.
+        let effective_seq = round_up_seq_len(accum.max_len, cfg.model_max_len);
+        crate::metrics::record_batch_max_effective_seq(&name, effective_seq);
         // Per-item enqueue→batch wall time. Recorded once per live Item
         // that made it into this dispatched batch. Cancelled items
         // (filtered above) are deliberately excluded — their "wait" is
@@ -1081,6 +1151,7 @@ mod tests {
             max_batch_seq: usize::MAX,
             padded_model: true,
             wait: Duration::from_millis(1),
+            model_max_len: usize::MAX,
         };
         // Seed batch with a single 500-token Item.
         let seed = Item {
@@ -1112,6 +1183,7 @@ mod tests {
             max_batch_seq: usize::MAX,
             padded_model: false,
             wait: Duration::from_millis(1),
+            model_max_len: usize::MAX,
         };
         let seed = Item {
             token_ids: vec![vec![0u32; 500]],
@@ -1146,6 +1218,7 @@ mod tests {
             max_batch_seq: usize::MAX,
             padded_model: false,
             wait: Duration::from_millis(1),
+            model_max_len: usize::MAX,
         };
         let two = Item {
             token_ids: vec![vec![1u32], vec![2u32]],
@@ -1580,6 +1653,7 @@ mod tests {
             max_batch_seq: 256,
             padded_model: true,
             wait: Duration::from_millis(1),
+            model_max_len: usize::MAX,
         };
         // Seed: 50-tok item → accum.max_len = 50.
         let seed = Item {
@@ -1611,5 +1685,114 @@ mod tests {
             accum.seq_capped_by(&cand_over, &cfg),
             "candidate above cap (>) must trigger seq gate"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // E1: solo_seq_overflow counter — emitted when the FIRST item of an
+    // empty batch exceeds max_batch_seq. Does NOT block the item (it
+    // must make progress); only adds observability so operators see
+    // solo long-doc batches in metrics.
+    // -----------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn solo_seq_overflow_counter_emitted_when_first_item_exceeds_cap() {
+        let handle = test_prometheus_handle();
+        let name = "t_solo_seq_overflow";
+        let b = Arc::new(DynamicBatcher::with_tokens(
+            name,
+            |ids: Vec<Vec<u32>>| Ok(ids.iter().map(|_| vec![0.0f32; 4]).collect()),
+            /*max_batch_tokens*/ usize::MAX,
+            /*max_batch_items*/ 100,
+            /*max_batch_seq*/ 100, // cap at 100 tokens
+            /*padded_model*/ true,
+            /*wait_ms*/ 50,
+            /*max_queue*/ 16,
+        ));
+        // Single item of 200 tokens: exceeds the cap of 100. Empty batch →
+        // admitted (starvation guard), but solo_seq_overflow must fire.
+        let _ = b.embed_tokens(vec![vec![0u32; 200]]).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let text = handle.render();
+        let needle = format!(
+            "embed_batch_seq_capped_total{{model=\"{name}\",reason=\"solo_seq_overflow\"}}"
+        );
+        assert!(
+            text.contains(&needle),
+            "expected `{needle}` in /metrics render:\n{text}"
+        );
+        Arc::try_unwrap(b)
+            .ok()
+            .expect("still has clones")
+            .shutdown(Duration::from_millis(200))
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn solo_seq_overflow_not_emitted_for_item_under_cap() {
+        // An item UNDER the cap must not trigger solo_seq_overflow.
+        let handle = test_prometheus_handle();
+        let name = "t_solo_no_overflow";
+        let b = Arc::new(DynamicBatcher::with_tokens(
+            name,
+            |ids: Vec<Vec<u32>>| Ok(ids.iter().map(|_| vec![0.0f32; 4]).collect()),
+            /*max_batch_tokens*/ usize::MAX,
+            /*max_batch_items*/ 100,
+            /*max_batch_seq*/ 256,
+            /*padded_model*/ true,
+            /*wait_ms*/ 50,
+            /*max_queue*/ 16,
+        ));
+        let _ = b.embed_tokens(vec![vec![0u32; 50]]).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let text = handle.render();
+        let needle = format!(
+            "embed_batch_seq_capped_total{{model=\"{name}\",reason=\"solo_seq_overflow\"}}"
+        );
+        assert!(
+            !text.contains(&needle),
+            "must NOT see `{needle}` for under-cap item"
+        );
+        Arc::try_unwrap(b)
+            .ok()
+            .expect("still has clones")
+            .shutdown(Duration::from_millis(200))
+            .await;
+    }
+
+    // -----------------------------------------------------------------
+    // E1: embed_batch_max_effective_seq histogram — records the post-
+    // round_up effective max seq_len that goes into the tensor for each
+    // dispatched batch.
+    // -----------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn max_effective_seq_histogram_recorded_per_batch() {
+        let handle = test_prometheus_handle();
+        let name = "t_max_eff_seq";
+        let b = Arc::new(DynamicBatcher::with_tokens(
+            name,
+            |ids: Vec<Vec<u32>>| Ok(ids.iter().map(|_| vec![0.0f32; 4]).collect()),
+            /*max_batch_tokens*/ usize::MAX,
+            /*max_batch_items*/ 100,
+            /*max_batch_seq*/ usize::MAX,
+            /*padded_model*/ true,
+            /*wait_ms*/ 50,
+            /*max_queue*/ 16,
+        ));
+        // Send a 64-token item. After round_up_seq_len (next power of 2), it
+        // becomes 64 (already a power of 2). The histogram must record 64.
+        let _ = b.embed_tokens(vec![vec![0u32; 64]]).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let text = handle.render();
+        let needle = format!("embed_batch_max_effective_seq_count{{model=\"{name}\"}}");
+        assert!(
+            text.contains(&needle),
+            "expected `{needle}` in /metrics render:\n{text}"
+        );
+        Arc::try_unwrap(b)
+            .ok()
+            .expect("still has clones")
+            .shutdown(Duration::from_millis(200))
+            .await;
     }
 }

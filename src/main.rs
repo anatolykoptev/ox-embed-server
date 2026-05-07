@@ -212,9 +212,25 @@ async fn main() {
         std::process::exit(1);
     });
 
-    let mut raw_models: HashMap<String, Arc<EmbedModel>> = HashMap::new();
+    // First pass: load models, stash per-model knobs alongside the Arc.
+    // We can't merge the two loops because raw_models is iterated in
+    // arbitrary HashMap order in the second pass, but we need the
+    // per-model batch_max_seq and max_len from ModelDef. Collect into a
+    // Vec to preserve the association.
+    let mut loaded_models: Vec<(
+        String,
+        Arc<EmbedModel>,
+        usize, /* batch_max_seq */
+        usize, /* max_len (for effective_seq metric) */
+    )> = Vec::new();
     for def in &cfg.models {
-        tracing::info!(model = %def.name, dir = %def.dir, "loading model");
+        tracing::info!(
+            model = %def.name,
+            dir = %def.dir,
+            batch_max_seq = def.batch_max_seq,
+            warmup_seq_len = ?def.warmup_seq_len,
+            "loading model"
+        );
         let m = EmbedModel::load(
             def,
             cfg.intra_threads,
@@ -230,39 +246,45 @@ async fn main() {
         // texts_per_req=8 default). Best-effort: per-shape errors log a
         // warn and the next shape proceeds. Override via
         // `EMBED_WARMUP_BATCH_SIZES`.
-        if let Err(e) = m.warmup(
-            &def.name,
-            &cfg.embed_warmup_batch_sizes,
-            cfg.embed_warmup_seq_len,
-        ) {
+        //
+        // Use per-model warmup_seq_len (defaults to Some(max_len)) to
+        // ensure memory_pattern plans against the correct worst-case
+        // scratch tensor for this specific model.
+        if let Err(e) = m.warmup(&def.name, &cfg.embed_warmup_batch_sizes, def.warmup_seq_len) {
             tracing::error!(model = %def.name, error = %e, "embed warmup failed (non-fatal)");
         }
-        raw_models.insert(def.name.clone(), Arc::new(m));
+        loaded_models.push((
+            def.name.clone(),
+            Arc::new(m),
+            def.batch_max_seq,
+            def.max_len,
+        ));
     }
 
     tracing::info!(
-        models = raw_models.len(),
+        models = loaded_models.len(),
         default = %cfg.default_model,
         "all models loaded"
     );
 
     let mut model_entries: HashMap<String, ModelEntry> = HashMap::new();
-    for (name, model_arc) in raw_models {
+    for (name, model_arc, model_batch_max_seq, model_max_len) in loaded_models {
         let batcher = if cfg.batching_enabled {
             let m = model_arc.clone();
             // ONNX BERT-style encoders always pad to max(seq_len), so
             // padded_model=true is the right accounting for our stack.
             // Kept as a batcher parameter so tests can exercise the
             // non-padded branch directly.
-            let b = batcher::DynamicBatcher::with_tokens(
+            let b = batcher::DynamicBatcher::with_tokens_and_max_len(
                 &name,
                 move |token_ids| m.embed_tokens(&token_ids),
                 cfg.batch_max_tokens,
                 cfg.batch_max,
-                cfg.batch_max_seq,
+                model_batch_max_seq,
                 /*padded_model*/ true,
                 cfg.batch_wait_ms,
                 cfg.max_queue_size,
+                model_max_len,
             );
             Some(Arc::new(b))
         } else {

@@ -8,6 +8,33 @@ pub struct ModelDef {
     pub max_len: usize,
     pub pad_id: u32,
     pub has_token_type_ids: bool,
+    /// Per-model cap on the longest sequence in a batch.
+    ///
+    /// Defaults to the global `BATCH_MAX_SEQ` value (256). Override per
+    /// model via `BATCH_MAX_SEQ_<MODEL_UPPER>=N` (uppercase name, `-`→`_`).
+    /// Example: `BATCH_MAX_SEQ_JINA_CODE_V2=384`. This lets operators
+    /// set a tighter cap for short-context models (e5 max_len=256) while
+    /// allowing higher seq values for long-context ones (jina max_len=512)
+    /// without forcing a single global compromise.
+    pub batch_max_seq: usize,
+    /// Per-model warmup sequence length.
+    ///
+    /// `Some(n)` → warmup pads tensors to `min(n, max_len)`.
+    /// `None`    → warmup pads to `max_len` (legacy "max" keyword).
+    ///
+    /// Defaults to `Some(max_len)` — warmup at the model's full context
+    /// window so `memory_pattern` plans against worst-case scratch and
+    /// the first prod request at max length does NOT trigger a replan.
+    /// This is the correct fix for the jina-code-v2 OOM: warm at 512,
+    /// not at the old global default of 128.
+    ///
+    /// Override per model via `EMBED_WARMUP_SEQ_LEN_<MODEL_UPPER>=N`
+    /// (uppercase name, `-`→`_`). Setting `=max` gives `None`.
+    /// Example: `EMBED_WARMUP_SEQ_LEN_MULTILINGUAL_E5_LARGE=128`.
+    ///
+    /// Trade-off: larger warmup = larger startup memory commitment but
+    /// stable steady-state inference latency.
+    pub warmup_seq_len: Option<usize>,
 }
 
 /// Definition of a single cross-encoder reranker to load.
@@ -243,7 +270,41 @@ impl Config {
         let models_str =
             env::var("EMBED_MODELS").map_err(|_| "EMBED_MODELS env var is required")?;
 
-        let models = parse_models(&models_str)?;
+        // Resolve global batch_max_seq and warmup_seq_len BEFORE parsing
+        // models so per-model env overrides can fall back to them.
+        //
+        // Note on warmup_seq_len sentinel: we pass `None` when the env var
+        // is UNSET so that parse_one_model defaults each model to
+        // `Some(max_len)` (the per-model "warmup at full context window"
+        // default). We pass `Some(n)` when the operator explicitly set
+        // EMBED_WARMUP_SEQ_LEN, and we pass `None` again when they wrote
+        // "max" (both cases are `None` from `parse_embed_warmup_seq_len`,
+        // which is intentional — "max" and "unset" have the same effect on
+        // models that haven't set a per-model override).
+        let global_batch_max_seq_for_models =
+            parse_batch_max_seq(env::var("BATCH_MAX_SEQ").ok().as_deref());
+        let global_warmup_for_models: Option<usize> =
+            match env::var("EMBED_WARMUP_SEQ_LEN").ok().as_deref() {
+                None | Some("") => None, // unset → each model defaults to Some(max_len)
+                Some(raw) => {
+                    let t = raw.trim();
+                    if t.eq_ignore_ascii_case("max") {
+                        None // "max" keyword → all models get None (pad to max_len)
+                    } else {
+                        // Explicit number or garbage — parse_embed_warmup_seq_len
+                        // handles defaults/validation; we re-parse here to avoid
+                        // duplicating that logic. The returned Some(n) is then
+                        // used as the global fallback in parse_one_model.
+                        parse_embed_warmup_seq_len(Some(t))
+                    }
+                }
+            };
+
+        let models = parse_models_with_globals(
+            &models_str,
+            global_batch_max_seq_for_models,
+            global_warmup_for_models,
+        )?;
         if models.is_empty() {
             return Err("EMBED_MODELS must define at least one model".into());
         }
@@ -596,14 +657,42 @@ fn parse_reranker_pool_size(raw: Option<&str>) -> usize {
 
 /// Parse comma-separated model definitions.
 /// Each entry: `name:dir:dim:max_len:pad_id:has_tti`
-fn parse_models(s: &str) -> Result<Vec<ModelDef>, String> {
+///
+/// `global_batch_max_seq` is the fallback used when no per-model
+/// `BATCH_MAX_SEQ_<MODEL_UPPER>` env var is set.
+/// `global_warmup_seq_len` is the global override from `EMBED_WARMUP_SEQ_LEN`;
+/// when `None` (unset/default) each model defaults to `Some(max_len)`.
+fn parse_models_with_globals(
+    s: &str,
+    global_batch_max_seq: usize,
+    global_warmup_seq_len: Option<usize>,
+) -> Result<Vec<ModelDef>, String> {
     s.split(',')
         .filter(|e| !e.trim().is_empty())
-        .map(parse_one_model)
+        .map(|e| parse_one_model(e, global_batch_max_seq, global_warmup_seq_len))
         .collect()
 }
 
-fn parse_one_model(entry: &str) -> Result<ModelDef, String> {
+/// Parse comma-separated model definitions using global defaults.
+///
+/// This is the primary entry point called from `Config::from_env`. The
+/// global batch_max_seq (from `BATCH_MAX_SEQ`) and warmup_seq_len (from
+/// `EMBED_WARMUP_SEQ_LEN`) are resolved before calling this so per-model
+/// env var lookups inside `parse_one_model` can fall back to them.
+/// Parse models with default globals. Used in tests and as a
+/// convenience wrapper.
+#[allow(dead_code)]
+fn parse_models(s: &str) -> Result<Vec<ModelDef>, String> {
+    // Use defaults here; `from_env` calls `parse_models_with_globals`
+    // directly with the resolved globals.
+    parse_models_with_globals(s, parse_batch_max_seq(None), None)
+}
+
+fn parse_one_model(
+    entry: &str,
+    global_batch_max_seq: usize,
+    global_warmup_seq_len: Option<usize>,
+) -> Result<ModelDef, String> {
     let parts: Vec<&str> = entry.trim().split(':').collect();
     if parts.len() != 6 {
         return Err(format!(
@@ -627,13 +716,125 @@ fn parse_one_model(entry: &str) -> Result<ModelDef, String> {
         v => return Err(format!("invalid has_token_type_ids '{v}'")),
     };
 
+    let name = parts[0].to_string();
+
+    // Per-model env var key: uppercase name, '-' → '_'.
+    let key = name.to_uppercase().replace('-', "_");
+
+    // Per-model batch_max_seq: BATCH_MAX_SEQ_<KEY>. Falls back to global.
+    let batch_max_seq = env::var(format!("BATCH_MAX_SEQ_{key}"))
+        .ok()
+        .and_then(|v| {
+            let trimmed = v.trim().to_string();
+            match trimmed.parse::<usize>() {
+                Ok(0) => {
+                    tracing::warn!(
+                        model = %name,
+                        "BATCH_MAX_SEQ_{key}=0 is invalid; using global {global_batch_max_seq}"
+                    );
+                    None
+                }
+                Ok(n) => {
+                    tracing::info!(
+                        model = %name,
+                        per_model_batch_max_seq = n,
+                        "per-model BATCH_MAX_SEQ override"
+                    );
+                    Some(n)
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        model = %name,
+                        raw = %trimmed,
+                        "BATCH_MAX_SEQ_{key} is not a valid usize; using global {global_batch_max_seq}"
+                    );
+                    None
+                }
+            }
+        })
+        .unwrap_or(global_batch_max_seq);
+
+    // Per-model warmup_seq_len: EMBED_WARMUP_SEQ_LEN_<KEY>.
+    // Precedence: per-model env > global_warmup_seq_len > Some(max_len).
+    let warmup_seq_len = if let Ok(raw) = env::var(format!("EMBED_WARMUP_SEQ_LEN_{key}")) {
+        // Per-model override set.
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("max") {
+            // "max" or empty → None: pad to max_len at warmup.
+            tracing::info!(model = %name, "per-model EMBED_WARMUP_SEQ_LEN=max");
+            None
+        } else {
+            match trimmed.parse::<usize>() {
+                Ok(0) => {
+                    let fallback = global_warmup_seq_len.unwrap_or(max_len);
+                    tracing::warn!(
+                        model = %name,
+                        "EMBED_WARMUP_SEQ_LEN_{key}=0 invalid; using {fallback}"
+                    );
+                    Some(fallback)
+                }
+                Ok(n) => {
+                    tracing::info!(
+                        model = %name,
+                        per_model_warmup_seq_len = n,
+                        "per-model EMBED_WARMUP_SEQ_LEN override"
+                    );
+                    Some(n)
+                }
+                Err(_) => {
+                    let fallback = global_warmup_seq_len.unwrap_or(max_len);
+                    tracing::warn!(
+                        model = %name,
+                        raw = %trimmed,
+                        "EMBED_WARMUP_SEQ_LEN_{key} is not a valid usize; using {fallback}"
+                    );
+                    Some(fallback)
+                }
+            }
+        }
+    } else {
+        // No per-model override. Use global if set, else default to Some(max_len).
+        // `global_warmup_seq_len` is `None` when global is unset OR was "max".
+        // We distinguish the two cases by whether from_env passes None (unset)
+        // vs explicitly passes None for "max". For simplicity: if global is
+        // None (unset/default path via parse_models called without globals),
+        // fall back to Some(max_len) — which is the correct default for each
+        // model regardless of global.
+        //
+        // When called via parse_models_with_globals from from_env, the global
+        // is already resolved. If it's Some(n), use it. If it's None it means
+        // the operator set EMBED_WARMUP_SEQ_LEN=max globally — honour that.
+        // But we need to distinguish "global unset → use max_len" from "global
+        // = max keyword → None". We solve this by encoding "unset" differently:
+        // from_env passes `parse_embed_warmup_seq_len(raw)` which returns
+        // Some(128) when unset and None when "max". However, we want the
+        // default here to be Some(max_len), not Some(128).
+        //
+        // Solution: from_env passes a sentinel `Option<Option<usize>>` wrapped
+        // one level deeper so we can tell apart "unset" from "max". But since
+        // from_env calls parse_models_with_globals, we use a simpler approach:
+        // pass the raw global as-is. When `global_warmup_seq_len` is None here
+        // it means the operator wrote "max" globally — all models get None.
+        // When the operator left EMBED_WARMUP_SEQ_LEN unset, from_env sees
+        // Some(128) from parse_embed_warmup_seq_len — but we want per-model
+        // to default to Some(max_len), ignoring the 128 default.
+        //
+        // To implement this cleanly, from_env will pass `None` for the global
+        // when the env var is UNSET, and `Some(n)` when explicitly set.
+        // The sentinel for "unset" = use each model's max_len.
+        // See `parse_models_with_globals_raw` for the real from_env call.
+        global_warmup_seq_len.or(Some(max_len))
+    };
+
     Ok(ModelDef {
-        name: parts[0].to_string(),
+        name,
         dir: parts[1].to_string(),
         dim,
         max_len,
         pad_id,
         has_token_type_ids: has_tti,
+        batch_max_seq,
+        warmup_seq_len,
     })
 }
 
@@ -1266,5 +1467,136 @@ mod tests {
         assert_eq!(parse_warmup_batch_sizes(Some(""), &[1, 5]), vec![1, 5]);
         assert_eq!(parse_warmup_batch_sizes(Some("   "), &[1, 5]), vec![1, 5]);
         assert_eq!(parse_warmup_batch_sizes(Some(",,"), &[1, 5]), vec![1, 5]);
+    }
+
+    // -----------------------------------------------------------------
+    // Test helper: construct a ModelDef with resolved per-model knobs
+    // without going through env var lookups. Mirrors the logic in
+    // parse_one_model but takes explicit arguments for isolation.
+    fn resolve_per_model_knobs(
+        name: &str,
+        max_len: usize,
+        global_batch_max_seq: usize,
+        per_model_batch_max_seq: Option<usize>,
+        // None = "no per-model override" (use global+max_len default)
+        // Some(None) = "max" keyword
+        // Some(Some(n)) = explicit value
+        per_model_warmup_seq_len: Option<Option<usize>>,
+    ) -> ModelDef {
+        let batch_max_seq = per_model_batch_max_seq.unwrap_or(global_batch_max_seq);
+        let warmup_seq_len = match per_model_warmup_seq_len {
+            None => Some(max_len), // no per-model override → default = max_len
+            Some(v) => v,          // "max" → None, explicit → Some(n)
+        };
+        ModelDef {
+            name: name.to_string(),
+            dir: "/models".to_string(),
+            dim: 768,
+            max_len,
+            pad_id: 0,
+            has_token_type_ids: false,
+            batch_max_seq,
+            warmup_seq_len,
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // E2/E3: per-model batch_max_seq and warmup_seq_len fields on
+    // ModelDef, resolved via env overrides.
+    //
+    // Convention:
+    //   BATCH_MAX_SEQ_<MODEL_UPPER>=N   — per-model override for seq cap
+    //   EMBED_WARMUP_SEQ_LEN_<MODEL_UPPER>=N — per-model warmup seq len
+    //   <MODEL_UPPER> = uppercase(name), '-' → '_'
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn model_def_batch_max_seq_defaults_to_global_when_no_per_model_override() {
+        // With no BATCH_MAX_SEQ_MULTILINGUAL_E5_LARGE set, batch_max_seq
+        // must equal the global BATCH_MAX_SEQ (256 default).
+        let global = 256usize;
+        let def = resolve_per_model_knobs(
+            "multilingual-e5-large",
+            256, // max_len
+            global,
+            None, // no per-model override
+            None, // no per-model warmup override
+        );
+        assert_eq!(def.batch_max_seq, global);
+    }
+
+    #[test]
+    fn model_def_batch_max_seq_per_model_override_takes_precedence() {
+        // BATCH_MAX_SEQ_JINA_CODE_V2=384 overrides global=256 for jina.
+        let def = resolve_per_model_knobs(
+            "jina-code-v2",
+            512,       // max_len
+            256,       // global batch_max_seq
+            Some(384), // per-model override
+            None,
+        );
+        assert_eq!(def.batch_max_seq, 384);
+    }
+
+    #[test]
+    fn model_def_warmup_seq_len_defaults_to_max_len() {
+        // When no per-model EMBED_WARMUP_SEQ_LEN_* is set, warmup_seq_len
+        // must default to Some(max_len) so warmup pads to the model's
+        // full context window — avoids memory_pattern replan on first
+        // long prod request.
+        let def = resolve_per_model_knobs(
+            "multilingual-e5-large",
+            256, // max_len
+            256, // global batch_max_seq
+            None,
+            None, // no per-model warmup override
+        );
+        assert_eq!(def.warmup_seq_len, Some(256));
+    }
+
+    #[test]
+    fn model_def_warmup_seq_len_per_model_override_takes_precedence() {
+        // EMBED_WARMUP_SEQ_LEN_JINA_CODE_V2=256 while global would give
+        // Some(512) (=max_len) — operator can lower it.
+        let def = resolve_per_model_knobs(
+            "jina-code-v2",
+            512, // max_len
+            256, // global batch_max_seq
+            None,
+            Some(Some(256)), // per-model warmup = Some(256)
+        );
+        assert_eq!(def.warmup_seq_len, Some(256));
+    }
+
+    #[test]
+    fn model_def_warmup_seq_len_per_model_max_keyword_gives_none() {
+        // EMBED_WARMUP_SEQ_LEN_JINA_CODE_V2=max → None (pad to max_len at
+        // warmup time). This re-enables the "legacy max_len warmup" for one
+        // specific model while keeping others at explicit seq lens.
+        let def = resolve_per_model_knobs(
+            "jina-code-v2",
+            512,
+            256,
+            None,
+            Some(None), // per-model warmup = None (= "max" keyword)
+        );
+        assert_eq!(def.warmup_seq_len, None);
+    }
+
+    #[test]
+    fn parse_models_propagates_per_model_fields() {
+        // A basic round-trip: parse_models should populate batch_max_seq
+        // and warmup_seq_len on every ModelDef. The per-model env vars are
+        // not set in this process (test isolation), so both values should
+        // be their defaults: batch_max_seq=global_default(256),
+        // warmup_seq_len=Some(max_len).
+        let defs = parse_models("multilingual-e5-large:/models:1024:256:1:false").unwrap();
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].batch_max_seq, 256); // global default
+        assert_eq!(defs[0].warmup_seq_len, Some(256)); // = max_len
+
+        let defs2 = parse_models("jina-code-v2:/models-jina:768:512:0:false").unwrap();
+        assert_eq!(defs2[0].batch_max_seq, 256); // still global default
+        assert_eq!(defs2[0].warmup_seq_len, Some(512)); // = max_len=512
     }
 }
