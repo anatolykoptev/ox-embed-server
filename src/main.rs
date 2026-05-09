@@ -515,6 +515,7 @@ async fn main() {
         cache,
         token_cache,
         rerank_semaphore,
+        embed_max_input_array: cfg.embed_max_input_array,
     });
 
     let metrics_handle = prom_handle.clone();

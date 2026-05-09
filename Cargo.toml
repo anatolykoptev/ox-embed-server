@@ -62,6 +62,11 @@ debug = false
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["blocking", "json"] }
+# tower + http-body-util: used by api.rs handler tests (axum oneshot call pattern).
+# Tower is already a transitive dep of axum; pinning explicitly makes the test
+# import `use tower::ServiceExt` reliable across lockfile updates.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 # tempfile — used by `model_reranker::load::discovery_tests` to drive
 # the static-shape filename parser through synthetic dirs without any
 # real ONNX bytes (placeholder empty files only). Keep dev-only so it
