@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use ndarray::Array2;
 use ort::ep;
+use ort::session::RunOptions;
 use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::value::Tensor;
@@ -112,6 +113,33 @@ pub struct EmbedModel {
     /// multilingual-e5-large: 16 heads (XLM-RoBERTa-large backbone)
     /// Unknown models:      12 (conservative fallback)
     num_heads: usize,
+    /// Whether per-run BFCArena shrinkage is enabled for this model.
+    ///
+    /// When `true`, `embed_tokens` and `warmup_at_shape` call
+    /// `session.run_with_options` with a [`RunOptions`] that carries
+    /// `"memory.enable_memory_arena_shrinkage" = "cpu:0"`. This triggers
+    /// `BFCArena::ShrinkRegion()` after each inference, returning fully-free
+    /// AllocationRegions to the OS and preventing `total_allocated_bytes`
+    /// from growing monotonically.
+    ///
+    /// Only set for `memory_pattern=false` models (jina-code-v2) by default.
+    /// For `memory_pattern=true` models (e5-large, reranker, splade), ORT
+    /// plans the entire forward pass as one block — shrinkage would tear it
+    /// down on each run, forcing a cold re-plan. Operator escape hatch:
+    /// `EMBED_ARENA_SHRINK_<MODEL>=true|false|auto` (see `arena_shrink_enabled_for_model`).
+    ///
+    /// IMPORTANT: `run_options.is_some()` is the authoritative runtime gate.
+    /// This field is kept for ops tooling (`arena_shrink_enabled()` accessor)
+    /// and test assertions.
+    #[allow(dead_code)]
+    arena_shrink_enabled: bool,
+    /// Pre-constructed run options with the arena-shrink config entry, reused
+    /// across every inference call. `None` when shrinkage is disabled for
+    /// this model.
+    ///
+    /// `RunOptions<NoSelectedOutputs>` is `Send + Sync` — safe to share
+    /// across threads behind the pool mutex.
+    run_options: Option<RunOptions>,
     /// Background eviction-loop task handle. `Some` when
     /// `idle_evict_secs > 0`. Aborted on `Drop` to avoid leaking the
     /// task across hot reloads / test teardown.
@@ -231,6 +259,46 @@ impl EmbedModel {
             None
         };
 
+        // ── per-run arena shrinkage (Phase A of BUG-004 fragmentation fix) ──
+        // Gate: enabled by default for memory_pattern=false models (jina-code-v2).
+        // Operator escape hatch via EMBED_ARENA_SHRINK_<MODEL_UPPER>.
+        let arena_shrink_enabled = arena_shrink_enabled_for_model(&def.name, def.memory_pattern);
+
+        // Build the RunOptions once at load time; reuse across every inference.
+        // Creating RunOptions requires the ORT library to be loaded (it calls
+        // OrtApi::CreateRunOptions). We do this at startup where an error is
+        // fatal — consistent with how we treat session-builder failures.
+        let run_options = if arena_shrink_enabled {
+            let mut opts = RunOptions::new().map_err(|e| {
+                format!(
+                    "model {}: failed to create RunOptions for arena shrinkage: {e}",
+                    def.name
+                )
+            })?;
+            opts.add_config_entry("memory.enable_memory_arena_shrinkage", "cpu:0")
+                .map_err(|e| {
+                    format!(
+                        "model {}: failed to add arena shrinkage config entry: {e}",
+                        def.name
+                    )
+                })?;
+            tracing::info!(
+                model = %def.name,
+                "arena shrinkage enabled: run_with_options(memory.enable_memory_arena_shrinkage=cpu:0)"
+            );
+            Some(opts)
+        } else {
+            tracing::info!(
+                model = %def.name,
+                memory_pattern = def.memory_pattern,
+                "arena shrinkage disabled (memory_pattern=true or env override)"
+            );
+            None
+        };
+
+        // Publish to /metrics so operators can verify config without reading logs.
+        crate::metrics::set_arena_shrink_enabled(&def.name, arena_shrink_enabled);
+
         Ok(Self {
             name: def.name.clone(),
             sessions,
@@ -241,6 +309,8 @@ impl EmbedModel {
             pad_id: def.pad_id,
             has_token_type_ids: def.has_token_type_ids,
             num_heads,
+            arena_shrink_enabled,
+            run_options,
             eviction_handle,
         })
     }
@@ -341,20 +411,52 @@ impl EmbedModel {
             AcquireError::ReinitFailed(s) => format!("embed session pool: reinit failed: {s}"),
         })?;
 
-        let run_result = if self.has_token_type_ids {
-            let tti_arr = Array2::from_shape_vec([batch, max_seq], tti)
-                .map_err(|e| format!("tti shape: {e}"))?;
-            let tti_tensor = Tensor::from_array(tti_arr).map_err(|e| format!("tti tensor: {e}"))?;
-            session.run(ort::inputs! {
-                "input_ids" => ids_tensor,
-                "attention_mask" => mask_tensor,
-                "token_type_ids" => tti_tensor,
-            })
-        } else {
-            session.run(ort::inputs! {
-                "input_ids" => ids_tensor,
-                "attention_mask" => mask_tensor,
-            })
+        // Choose inference path: run_with_options (arena shrinkage) or plain run.
+        // The shrink RunOptions are pre-built at load time; we just pass a reference.
+        let run_result = match &self.run_options {
+            Some(opts) => {
+                crate::metrics::record_arena_shrink_call(&self.name);
+                if self.has_token_type_ids {
+                    let tti_arr = Array2::from_shape_vec([batch, max_seq], tti)
+                        .map_err(|e| format!("tti shape: {e}"))?;
+                    let tti_tensor =
+                        Tensor::from_array(tti_arr).map_err(|e| format!("tti tensor: {e}"))?;
+                    session.run_with_options(
+                        ort::inputs! {
+                            "input_ids" => ids_tensor,
+                            "attention_mask" => mask_tensor,
+                            "token_type_ids" => tti_tensor,
+                        },
+                        opts,
+                    )
+                } else {
+                    session.run_with_options(
+                        ort::inputs! {
+                            "input_ids" => ids_tensor,
+                            "attention_mask" => mask_tensor,
+                        },
+                        opts,
+                    )
+                }
+            }
+            None => {
+                if self.has_token_type_ids {
+                    let tti_arr = Array2::from_shape_vec([batch, max_seq], tti)
+                        .map_err(|e| format!("tti shape: {e}"))?;
+                    let tti_tensor =
+                        Tensor::from_array(tti_arr).map_err(|e| format!("tti tensor: {e}"))?;
+                    session.run(ort::inputs! {
+                        "input_ids" => ids_tensor,
+                        "attention_mask" => mask_tensor,
+                        "token_type_ids" => tti_tensor,
+                    })
+                } else {
+                    session.run(ort::inputs! {
+                        "input_ids" => ids_tensor,
+                        "attention_mask" => mask_tensor,
+                    })
+                }
+            }
         };
 
         // ── forensic metrics: post-inference observation ──────────────────
@@ -503,21 +605,52 @@ impl EmbedModel {
 
             let start = Instant::now();
 
-            let run_result = if self.has_token_type_ids {
-                let tti_arr = Array2::from_shape_vec([batch, max_seq], tti.clone())
-                    .map_err(|e| format!("warmup tti shape (batch={batch}): {e}"))?;
-                let tti_tensor =
-                    Tensor::from_array(tti_arr).map_err(|e| format!("warmup tti tensor: {e}"))?;
-                session.run(ort::inputs! {
-                    "input_ids" => ids_tensor,
-                    "attention_mask" => mask_tensor,
-                    "token_type_ids" => tti_tensor,
-                })
-            } else {
-                session.run(ort::inputs! {
-                    "input_ids" => ids_tensor,
-                    "attention_mask" => mask_tensor,
-                })
+            // Mirror the production path: use run_with_options when shrinkage
+            // is enabled so warmup itself also exercises the shrink path and
+            // verifies the RunOptions are valid before the first real request.
+            let run_result = match &self.run_options {
+                Some(opts) => {
+                    if self.has_token_type_ids {
+                        let tti_arr = Array2::from_shape_vec([batch, max_seq], tti.clone())
+                            .map_err(|e| format!("warmup tti shape (batch={batch}): {e}"))?;
+                        let tti_tensor = Tensor::from_array(tti_arr)
+                            .map_err(|e| format!("warmup tti tensor: {e}"))?;
+                        session.run_with_options(
+                            ort::inputs! {
+                                "input_ids" => ids_tensor,
+                                "attention_mask" => mask_tensor,
+                                "token_type_ids" => tti_tensor,
+                            },
+                            opts,
+                        )
+                    } else {
+                        session.run_with_options(
+                            ort::inputs! {
+                                "input_ids" => ids_tensor,
+                                "attention_mask" => mask_tensor,
+                            },
+                            opts,
+                        )
+                    }
+                }
+                None => {
+                    if self.has_token_type_ids {
+                        let tti_arr = Array2::from_shape_vec([batch, max_seq], tti.clone())
+                            .map_err(|e| format!("warmup tti shape (batch={batch}): {e}"))?;
+                        let tti_tensor = Tensor::from_array(tti_arr)
+                            .map_err(|e| format!("warmup tti tensor: {e}"))?;
+                        session.run(ort::inputs! {
+                            "input_ids" => ids_tensor,
+                            "attention_mask" => mask_tensor,
+                            "token_type_ids" => tti_tensor,
+                        })
+                    } else {
+                        session.run(ort::inputs! {
+                            "input_ids" => ids_tensor,
+                            "attention_mask" => mask_tensor,
+                        })
+                    }
+                }
             };
 
             match run_result {
@@ -712,6 +845,50 @@ mod seq_pad_tests {
         assert_eq!(round_up_seq_len(250, 300), 256);
         // 257.next_power_of_two() == 512, capped to 300.
         assert_eq!(round_up_seq_len(257, 300), 300);
+    }
+}
+
+/// Determine whether per-run BFCArena shrinkage should be enabled for a model.
+///
+/// Logic (in priority order):
+/// 1. `EMBED_ARENA_SHRINK_<MODEL_UPPER>` env var:
+///    - `"true"` / `"1"` → force on.
+///    - `"false"` / `"0"` → force off.
+///    - Unset / `"auto"` / any other value → fall through to step 2.
+/// 2. Auto gate: enabled iff `memory_pattern == false`.
+///    - `memory_pattern=false` models (jina-code-v2): ORT allocates per-op,
+///      `total_allocated_bytes` grows monotonically over hours → shrinkage is
+///      the targeted fix.
+///    - `memory_pattern=true` models (e5-large, reranker, splade): ORT plans
+///      the entire forward pass as one block; shrinkage tears it down on each
+///      run, forcing a cold re-plan → devastating perf regression, must NOT
+///      be enabled by default.
+///
+/// `model_name` is the raw model name (e.g. `"jina-code-v2"`); the env var
+/// key is derived by uppercasing and replacing `-` with `_` — mirroring the
+/// `EMBED_MEMORY_PATTERN_<MODEL>` convention.
+pub(crate) fn arena_shrink_enabled_for_model(model_name: &str, memory_pattern: bool) -> bool {
+    let key = model_name.to_uppercase().replace('-', "_");
+    let env_val = std::env::var(format!("EMBED_ARENA_SHRINK_{key}")).ok();
+    match env_val.as_deref() {
+        Some("true") | Some("1") => {
+            tracing::info!(
+                model = %model_name,
+                "EMBED_ARENA_SHRINK_{key}=true: arena shrinkage forced on"
+            );
+            true
+        }
+        Some("false") | Some("0") => {
+            tracing::info!(
+                model = %model_name,
+                "EMBED_ARENA_SHRINK_{key}=false: arena shrinkage forced off"
+            );
+            false
+        }
+        _ => {
+            // Auto gate: only enable for memory_pattern=false models.
+            !memory_pattern
+        }
     }
 }
 
@@ -968,5 +1145,137 @@ mod opt_level_tests {
                 assert_eq!(parse_opt_level(), GraphOptimizationLevel::Level3);
             });
         }
+    }
+}
+
+// ── arena shrink gate tests ───────────────────────────────────────────────────
+//
+// These tests exercise the pure `arena_shrink_enabled_for_model` function
+// (defined below in the implementation) and the metrics counter. No real ORT
+// session is needed — all assertions are on return values and Prometheus
+// counters.
+
+#[cfg(test)]
+mod arena_shrink_tests {
+    use super::*;
+
+    /// Sets/unsets an env var around a closure, restoring the previous value.
+    fn with_env<F: FnOnce()>(key: &str, val: Option<&str>, f: F) {
+        let prev = std::env::var(key).ok();
+        match val {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+        f();
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    // ── Test 1: memory_pattern=false → shrinkage enabled (auto gate) ─────────
+
+    #[test]
+    fn embed_model_shrink_enabled_when_memory_pattern_false() {
+        // No env override — gate follows memory_pattern.
+        with_env("EMBED_ARENA_SHRINK_JINA_CODE_V2", None, || {
+            let enabled = arena_shrink_enabled_for_model("jina-code-v2", false);
+            assert!(
+                enabled,
+                "arena shrinkage should be enabled for memory_pattern=false (jina)"
+            );
+        });
+    }
+
+    // ── Test 2: memory_pattern=true → shrinkage disabled (auto gate) ─────────
+
+    #[test]
+    fn embed_model_no_shrink_when_memory_pattern_true() {
+        // No env override — gate follows memory_pattern.
+        with_env("EMBED_ARENA_SHRINK_MULTILINGUAL_E5_LARGE", None, || {
+            let enabled = arena_shrink_enabled_for_model("multilingual-e5-large", true);
+            assert!(
+                !enabled,
+                "arena shrinkage must NOT be enabled for memory_pattern=true (e5-large)"
+            );
+        });
+    }
+
+    // ── Test 3: env force-on overrides memory_pattern=true ───────────────────
+
+    #[test]
+    fn embed_arena_shrink_env_force_on_overrides_memory_pattern_true() {
+        with_env(
+            "EMBED_ARENA_SHRINK_MULTILINGUAL_E5_LARGE",
+            Some("true"),
+            || {
+                // memory_pattern=true but env forces shrinkage on.
+                let enabled = arena_shrink_enabled_for_model("multilingual-e5-large", true);
+                assert!(
+                    enabled,
+                    "EMBED_ARENA_SHRINK_MULTILINGUAL_E5_LARGE=true must force shrinkage on \
+                 regardless of memory_pattern"
+                );
+            },
+        );
+    }
+
+    // ── Test 4: env force-off overrides memory_pattern=false ─────────────────
+
+    #[test]
+    fn embed_arena_shrink_env_force_off_overrides_memory_pattern_false() {
+        with_env("EMBED_ARENA_SHRINK_JINA_CODE_V2", Some("false"), || {
+            // memory_pattern=false but env forces shrinkage off.
+            let enabled = arena_shrink_enabled_for_model("jina-code-v2", false);
+            assert!(
+                !enabled,
+                "EMBED_ARENA_SHRINK_JINA_CODE_V2=false must disable shrinkage \
+                 regardless of memory_pattern"
+            );
+        });
+    }
+
+    // ── Test 5: shrink call counter increments when enabled ───────────────────
+    //
+    // We cannot call `embed_tokens` without a real ONNX session, so we test
+    // the metric helper directly: `record_arena_shrink_call` must increment
+    // `embed_arena_shrink_calls_total{model}` by 1.
+
+    #[test]
+    fn embed_arena_shrink_calls_counter_increments_per_run() {
+        // Use the shared test recorder (OnceLock — safe under parallel tests).
+        let handle = crate::metrics::test_prometheus_handle();
+
+        // Use a unique model label so this test is not sensitive to other
+        // tests also calling record_arena_shrink_call with the same label.
+        let model = "jina-code-v2-shrink-counter-test";
+
+        // Read counter before and after the increment.
+        let before = read_shrink_counter(handle, model);
+        crate::metrics::record_arena_shrink_call(model);
+        let after = read_shrink_counter(handle, model);
+
+        assert_eq!(
+            after,
+            before + 1.0,
+            "embed_arena_shrink_calls_total should increment by exactly 1 per call; \
+             before={before} after={after}"
+        );
+    }
+
+    /// Read `embed_arena_shrink_calls_total{model=...}` from the rendered
+    /// Prometheus output. Returns 0.0 if the counter has not been emitted yet.
+    fn read_shrink_counter(
+        handle: &metrics_exporter_prometheus::PrometheusHandle,
+        model: &str,
+    ) -> f64 {
+        let rendered = handle.render();
+        let target = format!("embed_arena_shrink_calls_total{{model=\"{model}\"}}");
+        rendered
+            .lines()
+            .find(|l| l.starts_with(&target))
+            .and_then(|l| l.split_whitespace().last())
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0)
     }
 }
