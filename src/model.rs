@@ -161,6 +161,7 @@ impl EmbedModel {
         );
 
         let sessions = build_session_pool(
+            &def.name,
             &onnx_path,
             opt_level,
             intra_threads,
@@ -505,6 +506,7 @@ fn round_up_seq_len(n: usize, cap: usize) -> usize {
 /// configuration is identical to the pre-pool single-session path —
 /// see the in-place comments at the call site below for rationale.
 fn build_session_pool(
+    model_key: &str,
     onnx_path: &Path,
     opt_level: GraphOptimizationLevel,
     intra_threads: usize,
@@ -516,7 +518,9 @@ fn build_session_pool(
     // re-evaluated *per session* inside the loop: session 0 sees a miss
     // and writes the optimized graph; sessions 1..N see a hit on their
     // own re-check and skip the Level3 pass entirely.
-    let cache = CacheDir::from_env();
+    // Per-model override: ONNX_OPT_CACHE_DIR_<MODEL_KEY_UPPER> takes
+    // precedence over the global ONNX_OPT_CACHE_DIR.
+    let cache = CacheDir::from_env_for_model(model_key);
     let mut sessions: Vec<Mutex<Session>> = Vec::with_capacity(pool_size);
     for i in 0..pool_size {
         let plan = LoadPlan::decide(cache.as_ref(), onnx_path);
