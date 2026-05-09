@@ -6,6 +6,7 @@ mod batcher;
 mod cache;
 mod cache_flow;
 mod config;
+mod evictable_pool;
 mod metrics;
 mod model;
 mod model_reranker;
@@ -244,6 +245,7 @@ async fn main() {
             cfg.intra_threads,
             cfg.auto_truncate,
             cfg.embed_pool_size,
+            cfg.idle_evict_secs,
         )
         .unwrap_or_else(|e| {
             eprintln!("failed to load model '{}': {e}", def.name);

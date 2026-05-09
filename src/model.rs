@@ -1,6 +1,5 @@
 use std::path::Path;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use ndarray::Array2;
@@ -12,6 +11,7 @@ use tokenizers::Tokenizer;
 use tokenizers::utils::truncation::{TruncationDirection, TruncationParams, TruncationStrategy};
 
 use crate::config::ModelDef;
+use crate::evictable_pool::{AcquireError, EvictablePool};
 use crate::onnx_cache::{self, CacheDir, LoadPlan};
 use crate::pool;
 
@@ -74,15 +74,21 @@ fn parse_opt_level() -> GraphOptimizationLevel {
     }
 }
 
-/// Wraps a pool of ONNX sessions + a single tokenizer for one embedding
-/// model.
+/// Wraps an evictable pool of ONNX sessions + a single tokenizer for one
+/// embedding model.
 ///
-/// `sessions` mirrors the reranker pool (`model_reranker/load.rs`):
-/// `pool_size==1` is byte-for-byte equivalent to the legacy
-/// `Mutex<Session>` path (single-element vector, `next` always %1 == 0).
-/// `pool_size>1` lets concurrent `embed_tokens` calls run inference in
-/// parallel under independent Mutexes — round-robin via `next` keeps the
-/// load even without coordination.
+/// `sessions` is an [`EvictablePool`] that replaces the former
+/// `Vec<Mutex<Session>>` + round-robin `AtomicUsize`. Key differences:
+///
+/// - When `idle_evict_secs == 0` (default) the pool never evicts and
+///   behaves exactly like the old code (pre-allocated, mutex-per-slot).
+/// - When `idle_evict_secs > 0` (opt-in via `EMBED_IDLE_EVICT_SECS`),
+///   sessions idle longer than the threshold are freed and lazily rebuilt
+///   on the next acquire — saving ~250-400 MiB per slot during idle periods.
+/// - Acquire semantics: first non-busy slot is returned. Under low
+///   concurrency (pool_size=1 or pool_size=2 with non-overlapping requests)
+///   this is equivalent to the old round-robin; under high concurrency the
+///   first-available policy maximises throughput without coordination.
 ///
 /// IMPORTANT: ort 2.0-rc has no shared-weights mode, so each pool member
 /// holds its own ~400 MiB weight buffer. The pool size is intentionally
@@ -90,8 +96,9 @@ fn parse_opt_level() -> GraphOptimizationLevel {
 pub struct EmbedModel {
     /// Model name for metric labels (e.g. "jina-code-v2").
     name: String,
-    sessions: Vec<Mutex<Session>>,
-    next: AtomicUsize,
+    sessions: Arc<EvictablePool<Session>>,
+    /// Number of slots for warmup iteration (acquired sequentially).
+    pool_size: usize,
     tokenizer: Tokenizer,
     pub dim: usize,
     max_len: usize,
@@ -105,6 +112,18 @@ pub struct EmbedModel {
     /// multilingual-e5-large: 16 heads (XLM-RoBERTa-large backbone)
     /// Unknown models:      12 (conservative fallback)
     num_heads: usize,
+    /// Background eviction-loop task handle. `Some` when
+    /// `idle_evict_secs > 0`. Aborted on `Drop` to avoid leaking the
+    /// task across hot reloads / test teardown.
+    eviction_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for EmbedModel {
+    fn drop(&mut self) {
+        if let Some(h) = self.eviction_handle.take() {
+            h.abort();
+        }
+    }
 }
 
 impl EmbedModel {
@@ -115,19 +134,23 @@ impl EmbedModel {
     /// truncates inputs longer than `def.max_len`. If false, truncation is
     /// left disabled on the tokenizer.
     ///
-    /// `pool_size` controls how many independent ONNX sessions are
-    /// created. `1` (the historical default) preserves the legacy
-    /// single-session path exactly. Values >1 enable concurrent
-    /// inference, at N× the per-session weight memory cost — see the
-    /// struct doc comment.
+    /// `pool_size` controls how many independent ONNX sessions are created.
+    /// `1` (the historical default) preserves the legacy single-session path
+    /// exactly. Values >1 enable concurrent inference at N× the per-session
+    /// weight memory cost — see the struct doc comment.
+    ///
+    /// `idle_evict_secs == 0` disables eviction (default). Positive value
+    /// enables idle eviction — sessions unused for that many seconds are freed
+    /// and lazily rebuilt on next acquire (cold start ~5-10s).
     pub fn load(
         def: &ModelDef,
         intra_threads: usize,
         auto_truncate: bool,
         pool_size: usize,
+        idle_evict_secs: u64,
     ) -> Result<Self, String> {
         // Defensive clamp — caller contract says >=1, but a stray 0 from
-        // misconfigured plumbing would `% 0` panic in `embed_tokens`.
+        // misconfigured plumbing would leave an empty pool.
         let pool_size = pool_size.max(1);
         // Infer num_heads from the model name. Known families:
         //   multilingual-e5-large → XLM-RoBERTa-large → 16 heads
@@ -157,16 +180,18 @@ impl EmbedModel {
             ?opt_level,
             pool_size,
             intra_threads,
+            idle_evict_secs,
             "creating ONNX session(s)"
         );
 
-        let sessions = build_session_pool(
+        let sessions = build_evictable_pool(
             &def.name,
             &onnx_path,
             opt_level,
             intra_threads,
             pool_size,
             def.memory_pattern,
+            idle_evict_secs,
         )?;
 
         tracing::info!(path = %tok_path.display(), "loading tokenizer");
@@ -183,29 +208,48 @@ impl EmbedModel {
             has_tti = def.has_token_type_ids,
             auto_truncate,
             pool_size,
+            idle_evict_secs,
             "loaded model"
         );
+
+        let sessions = Arc::new(sessions);
+
+        // Spawn the idle-eviction loop when opt-in. Tick interval is
+        // `max(idle_evict_secs/4, 5s)` — short enough to evict near the
+        // threshold, never busy enough to hammer the pool. Mirrors the
+        // ox-whisper v0.7.0 default formula.
+        let eviction_handle = if idle_evict_secs > 0 {
+            let tick = std::time::Duration::from_secs((idle_evict_secs / 4).max(5));
+            tracing::info!(
+                model = %def.name,
+                idle_evict_secs,
+                tick_secs = tick.as_secs(),
+                "spawning ONNX session eviction loop"
+            );
+            Some(sessions.spawn_eviction_loop(tick))
+        } else {
+            None
+        };
 
         Ok(Self {
             name: def.name.clone(),
             sessions,
-            next: AtomicUsize::new(0),
+            pool_size,
             tokenizer,
             dim: def.dim,
             max_len: def.max_len,
             pad_id: def.pad_id,
             has_token_type_ids: def.has_token_type_ids,
             num_heads,
+            eviction_handle,
         })
     }
 
     /// Number of sessions in the inference pool. Used by tests to assert
-    /// `pool_size` plumbing and by future ops tooling. Held even when the
-    /// production hot path doesn't read it — mirrors the reranker
-    /// `session_count` accessor for symmetry.
+    /// `pool_size` plumbing and by future ops tooling.
     #[allow(dead_code)]
     pub fn session_count(&self) -> usize {
-        self.sessions.len()
+        self.pool_size
     }
 
     /// Tokenize a batch of texts into their `input_ids`. Truncation is
@@ -284,15 +328,15 @@ impl EmbedModel {
         let ids_tensor = Tensor::from_array(ids_arr).map_err(|e| format!("ids tensor: {e}"))?;
         let mask_tensor = Tensor::from_array(mask_arr).map_err(|e| format!("mask tensor: {e}"))?;
 
-        // Round-robin pick from the pool. With pool_size==1 this always
-        // resolves to index 0 — identical lock pattern to the legacy
-        // single-Mutex<Session> code. With pool_size>1, concurrent callers
-        // (in the steady state) land on different sessions and run
-        // inference in parallel under separate locks.
-        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.sessions.len();
-        let mut session = self.sessions[idx]
-            .lock()
-            .map_err(|e| format!("lock session #{idx}: {e}"))?;
+        // Acquire a free session from the pool. With pool_size==1 this always
+        // picks the single slot — identical to the legacy single-Mutex<Session>
+        // path. With pool_size>1, concurrent callers land on different slots
+        // and run inference in parallel under independent slot mutexes.
+        // AllBusy = all sessions held concurrently; caller retries or queues.
+        let mut session = self.sessions.acquire().map_err(|e| match e {
+            AcquireError::AllBusy => "embed session pool: all slots busy".to_string(),
+            AcquireError::ReinitFailed(s) => format!("embed session pool: reinit failed: {s}"),
+        })?;
 
         let run_result = if self.has_token_type_ids {
             let tti_arr = Array2::from_shape_vec([batch, max_seq], tti)
@@ -421,9 +465,12 @@ impl EmbedModel {
             pool::build_tensors_from_ids(&token_ids, batch, max_seq, self.pad_id);
 
         // Warm EVERY session in the pool — without this, only the first
-        // session served by round-robin would be hot; the second would
-        // pay the cold-start cost on its first concurrent request.
-        for (i, sess_mu) in self.sessions.iter().enumerate() {
+        // session served would be hot; the rest pay the cold-start cost
+        // on their first concurrent request.
+        // With EvictablePool, we acquire each slot sequentially (pool_size
+        // iterations). Each guard holds one slot exclusively while we run
+        // the warmup forward pass, then releases it before the next acquire.
+        for i in 0..self.pool_size {
             let ids_arr = Array2::from_shape_vec([batch, max_seq], ids.clone())
                 .map_err(|e| format!("warmup ids shape (batch={batch}): {e}"))?;
             let mask_arr = Array2::from_shape_vec([batch, max_seq], mask_i64.clone())
@@ -434,9 +481,22 @@ impl EmbedModel {
                 Tensor::from_array(mask_arr).map_err(|e| format!("warmup mask tensor: {e}"))?;
 
             let start = Instant::now();
-            let mut session = sess_mu
-                .lock()
-                .map_err(|e| format!("warmup lock session #{i} (batch={batch}): {e}"))?;
+            // Acquire any free slot. During startup all slots are idle, so
+            // this always succeeds. If it fails (e.g. all busy from concurrent
+            // warmup calls), log and skip — warmup is best-effort.
+            let mut session = match self.sessions.acquire() {
+                Ok(g) => g,
+                Err(e) => {
+                    tracing::warn!(
+                        model = %name,
+                        slot = i,
+                        batch,
+                        error = %e,
+                        "embed warmup: could not acquire session slot (skipping)"
+                    );
+                    continue;
+                }
+            };
 
             let run_result = if self.has_token_type_ids {
                 let tti_arr = Array2::from_shape_vec([batch, max_seq], tti.clone())
@@ -495,66 +555,103 @@ fn round_up_seq_len(n: usize, cap: usize) -> usize {
     n.next_power_of_two().min(cap)
 }
 
-/// Build N independent ONNX sessions over the same model file. Mirrors
-/// the reranker `build_session_pool` in `model_reranker/load.rs` —
-/// there is no shared-weights mode in ort 2.0-rc, so each session pays
-/// its own ~400 MiB (multilingual-e5-large) / ~250 MiB (jina-code-v2)
-/// weight buffer cost in exchange for true parallelism under
-/// independent Mutexes.
+/// Build an [`EvictablePool`] of `pool_size` ONNX sessions for one model.
 ///
-/// memory_pattern + env-allocator + per-session-CPU-arena-disabled
-/// configuration is identical to the pre-pool single-session path —
-/// see the in-place comments at the call site below for rationale.
-fn build_session_pool(
-    model_key: &str,
+/// The factory closure captures the ONNX path + build parameters and is
+/// called once per slot at startup (and again lazily after eviction).
+/// `idle_evict_secs == 0` disables eviction — the pool never calls the
+/// factory after startup.
+///
+/// Per-model ONNX cache override (`ONNX_OPT_CACHE_DIR_<MODEL_NAME>`) is
+/// resolved inside `build_one_session`, which the factory invokes — so
+/// every cold start (initial fill + post-eviction) re-reads the env.
+fn build_evictable_pool(
+    model_name: &str,
     onnx_path: &Path,
     opt_level: GraphOptimizationLevel,
     intra_threads: usize,
     pool_size: usize,
     memory_pattern: bool,
-) -> Result<Vec<Mutex<Session>>, String> {
-    crate::arena::assert_arena_registered_before_session();
-    // Resolve the cache dir once per pool. The decision (hit / miss) is
-    // re-evaluated *per session* inside the loop: session 0 sees a miss
-    // and writes the optimized graph; sessions 1..N see a hit on their
-    // own re-check and skip the Level3 pass entirely.
-    // Per-model override: ONNX_OPT_CACHE_DIR_<MODEL_KEY_UPPER> takes
-    // precedence over the global ONNX_OPT_CACHE_DIR.
-    let cache = CacheDir::from_env_for_model(model_key);
-    let mut sessions: Vec<Mutex<Session>> = Vec::with_capacity(pool_size);
+    idle_evict_secs: u64,
+) -> Result<EvictablePool<Session>, String> {
+    // Capture everything the factory needs to build one session. The
+    // factory re-reads `ONNX_OPT_CACHE_DIR_<MODEL>` (or global fallback)
+    // on every call so post-eviction cold starts pick up cache changes.
+    let onnx_path_buf = onnx_path.to_path_buf();
+    let model_name_owned = model_name.to_string();
+    let factory: Arc<dyn Fn() -> Result<Session, String> + Send + Sync> = Arc::new(move || {
+        build_one_session(
+            &model_name_owned,
+            &onnx_path_buf,
+            opt_level,
+            intra_threads,
+            memory_pattern,
+        )
+    });
+
+    // Build the initial pool_size sessions up front (startup). Any failure
+    // here is fatal (wrong ONNX path / bad config) — panic is intentional.
+    let mut items = Vec::with_capacity(pool_size);
     for i in 0..pool_size {
-        let plan = LoadPlan::decide(cache.as_ref(), onnx_path);
-        let load_path = plan.load_source(onnx_path).to_path_buf();
-        let t_commit = std::time::Instant::now();
-        // memory_pattern=true: ORT plans scratch reuse within the shared
-        // env-level arena (registered in `arena.rs`). Combined with
-        // `DisableCpuMemArena` (PR #34), the session has only the shared
-        // arena to draw from — pattern planning amortizes per-shape
-        // scratch allocations across requests.
-        let builder = Session::builder().map_err(|e| format!("session builder #{i}: {e}"))?;
-        let builder = onnx_cache::apply_plan(builder, &plan, opt_level)
-            .map_err(|e| format!("apply cache plan #{i}: {e}"))?;
-        let session = builder
-            .with_intra_threads(intra_threads)
-            .map_err(|e| format!("set threads #{i}: {e}"))?
-            .with_memory_pattern(memory_pattern)
-            .map_err(|e| format!("enable memory pattern #{i}: {e}"))?
-            // Use the shared env-level arena registered in arena.rs.
-            .with_env_allocators()
-            .map_err(|e| format!("enable env allocators #{i}: {e}"))?
-            // Belt-and-braces: disable the per-session CPU mem arena.
-            // Without this, ORT's CPU EP defaults to EnableCpuMemArena=1
-            // and may still spawn a session-local BFCArena alongside our
-            // shared one, doubling allocator state.
-            .with_execution_providers([ep::CPU::default().with_arena_allocator(false).build()])
-            .map_err(|e| format!("disable per-session cpu mem arena #{i}: {e}"))?
-            .commit_from_file(&load_path)
-            .map_err(|e| format!("load ONNX #{i} {}: {e}", load_path.display()))?;
-        onnx_cache::observe_post_commit(&plan, t_commit.elapsed().as_millis());
-        sessions.push(Mutex::new(session));
+        let session = (factory)().map_err(|e| format!("embed session #{i} failed: {e}"))?;
+        items.push(session);
     }
-    tracing::info!(count = sessions.len(), "embed ONNX session(s) created");
-    Ok(sessions)
+    tracing::info!(
+        model = %model_name,
+        count = pool_size,
+        idle_evict_secs,
+        "embed ONNX session pool created"
+    );
+    Ok(EvictablePool::from_items(
+        items,
+        idle_evict_secs,
+        model_name,
+        factory,
+    ))
+}
+
+/// Build a single ONNX session with the configured parameters.
+/// Called by the factory closure in [`build_evictable_pool`] — both at
+/// startup (for initial pool fill) and lazily after eviction.
+fn build_one_session(
+    model_name: &str,
+    onnx_path: &std::path::Path,
+    opt_level: GraphOptimizationLevel,
+    intra_threads: usize,
+    memory_pattern: bool,
+) -> Result<Session, String> {
+    // Per-model override: `ONNX_OPT_CACHE_DIR_<MODEL_NAME_UPPER>` takes
+    // precedence over the global `ONNX_OPT_CACHE_DIR`.
+    let cache = CacheDir::from_env_for_model(model_name);
+    let plan = LoadPlan::decide(cache.as_ref(), onnx_path);
+    let load_path = plan.load_source(onnx_path).to_path_buf();
+    let t_commit = std::time::Instant::now();
+    // memory_pattern=true: ORT plans scratch reuse within the shared
+    // env-level arena (registered in `arena.rs`). Combined with
+    // `DisableCpuMemArena` (PR #34), the session has only the shared
+    // arena to draw from — pattern planning amortizes per-shape
+    // scratch allocations across requests.
+    let builder = Session::builder().map_err(|e| format!("session builder: {e}"))?;
+    let builder = onnx_cache::apply_plan(builder, &plan, opt_level)
+        .map_err(|e| format!("apply cache plan: {e}"))?;
+    let session = builder
+        .with_intra_threads(intra_threads)
+        .map_err(|e| format!("set threads: {e}"))?
+        .with_memory_pattern(memory_pattern)
+        .map_err(|e| format!("enable memory pattern: {e}"))?
+        // Use the shared env-level arena registered in arena.rs.
+        .with_env_allocators()
+        .map_err(|e| format!("enable env allocators: {e}"))?
+        // Belt-and-braces: disable the per-session CPU mem arena.
+        // Without this, ORT's CPU EP defaults to EnableCpuMemArena=1
+        // and may still spawn a session-local BFCArena alongside our
+        // shared one, doubling allocator state.
+        .with_execution_providers([ep::CPU::default().with_arena_allocator(false).build()])
+        .map_err(|e| format!("disable per-session cpu mem arena: {e}"))?
+        .commit_from_file(&load_path)
+        .map_err(|e| format!("load ONNX {}: {e}", load_path.display()))?;
+    onnx_cache::observe_post_commit(&plan, t_commit.elapsed().as_millis());
+    Ok(session)
 }
 
 #[cfg(test)]
