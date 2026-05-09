@@ -141,3 +141,120 @@ Key requirements:
 - Use `HTTP/1.1` protocol version
 - Always send explicit `Content-Length` header
 - Use `BaseHTTPRequestHandler` (not WSGI)
+
+---
+
+## BUG-004: jina-code-v2 BFCArena OOM under unbounded `input` arrays + pool=2 concurrency
+
+**Status:** RESOLVED (2026-05-09, 3-layer fix shipped same day)
+**Severity:** Critical (~1 failure/min in prod for ~30 min)
+**Date:** 2026-05-09 (incident discovered, escalated, fully fixed)
+**Component:** ox-embed-server batcher + ONNX Runtime BFCArena + downstream HTTP clients (memdb-go, go-code via go-kit/embed.Client)
+
+### TL;DR
+
+`POST /v1/embeddings` accepted unbounded `input: []` arrays. Memdb-go shipped requests with up to **100 docs/call**. Each became one batcher Item with `n_texts=100` — admitted unconditionally by the batcher's first-item starvation guard (`src/batcher.rs:367-368`), bypassing `BATCH_MAX=8`. For jina-code-v2 (12 heads, max_len=512), this allocated:
+
+```
+B × H × S² × 4 bytes  =  100 × 12 × 512² × 4  =  1,258,291,200 bytes  (1.258 GB)
+```
+
+…of attention scratch per inference. With `EMBED_SESSION_POOL_SIZE=2` (PR #99 latency win), two parallel slots required ~2.5 GB scratch — exceeding the BFCArena cap (3 GiB per PR #98) → `BFCArena::AllocateRawInternal` failure → HTTP 500 + `embed_inference_failures_total{model="jina-code-v2",reason="arena_oom"}`.
+
+### Trigger conditions
+
+| Layer | Pre-incident value | Effect on bug |
+|---|---|---|
+| memdb-go `texts []string` | unbounded | sends 100-doc arrays |
+| ox-embed-server batcher | first-item-admit unconditional | bypasses BATCH_MAX=8 |
+| jina max_len | **512** (PR #80, May 7) | quadratic scratch growth — was 256 before |
+| `EMBED_ARENA_MAX_MEM_BYTES` | 3 GiB (PR #98) | leaves only ~1.16 GiB free for scratch |
+| `EMBED_SESSION_POOL_SIZE` | **2** (PR #99) | 2 concurrent jina batches → 2.5 GiB scratch |
+
+Each PR was safe in isolation. The combination + the latent unbounded-array bug in clients produced emergent failure. Failures appeared after PR #48 (EvictablePool) deploy + PR #99 (pool=2) recreate cleared the BFCArena and ramp-up exposed the worst case.
+
+### Discovery
+
+`mcp__go-code__debug_investigate` on the embed-server service window after PR #48 deploy showed:
+
+- `embed_request_duration_seconds_p99` spike **×93.77**
+- `embed_inference_failures_total` rate **+Inf** (counter appeared from zero)
+- `EmbedBatchWaitHigh` alert: `p95 batch wait > 500ms for 5m (model=jina-code-v2)`
+- 76× ERROR logs in 13 sec on `encoder/layer.0/attention/self/Add` node
+
+Three passes of `debug_investigate` traced the root cause from latency symptom → metrics → code:
+
+1. **Pass 1**: caught the failure spike + log pattern. Initially suspected EvictablePool eviction.
+2. **Pass 2 (after PR #102 EvictablePool rollback)**: failures **continued** — proof EvictablePool was a victim, not the cause. Pointed at pool=2 + arena cap interaction.
+3. **Pass 3 (after PR #103 arena 3→4 GiB raise)**: failures STILL continued at lower rate. `embed_inference_attention_scratch_bytes` histogram showed 35/53 jina inferences in the 1-4 GB bucket. Reverse-math: `1.258 GB / (12 × 4) = B × S²` → with S=512, `B=100`. With BATCH_MAX=8, this is impossible from coalesced batches — must be **single Item with n_texts=100**.
+
+`mcp__go-code__understand` on `EmbedModel.embed_tokens` + `BatchAccum.fits` confirmed the batcher first-item-admit gate.
+
+### Resolution — 3-layer fix shipped 2026-05-09
+
+**Layer 1 — Server-side cap (`ox-embed-server` PR #49, commit `4b5b72e`):**
+
+- New env `EMBED_MAX_INPUT_ARRAY` (default 32, matches arena headroom: `32 × 12 × 512² × 4 = 402 MiB ≪ 4 GiB - weights`).
+- `POST /v1/embeddings` and `/embed_sparse` reject `input.len() > cap` with **HTTP 400** + JSON body `{error:{type,code,message,cap,received}}`. Permanent client misuse, no retry.
+- Three new metrics:
+  - `embed_input_array_size{model}` histogram — natural distribution
+  - `embed_input_array_rejected_total{model,reason}` counter — rejects observed
+  - `embed_batcher_first_item_oversize_total{model,reason}` — fires when first-item-admit accepts an Item that would have failed normal `fits()`
+
+**Layer 2 — Client-side chunking in `go-kit/embed.Client` (go-kit PR #48 → tagged v0.49.0; v0.50.0 includes it):**
+
+- Transparent client-side chunking: `Client.Embed()` and `Client.EmbedWithResult()` auto-split `len(texts) > chunkSize` into sequential sub-batches (default 32, env `GOKIT_EMBED_CHUNK_SIZE`).
+- Chunking gate placed **above** fallback routing (BLOCKER fix from review): fallback-wired clients also chunk. `dispatchChunk()` helper preserves fallback semantics per chunk.
+- Cache placement: **above** chunking — per-text cache keys retain granularity (chunk where every text is cached returns 0 backend calls).
+- Sequential dispatch (not parallel) — server-side batcher already coalesces concurrent calls; parallel client chunks would just cause batcher contention.
+- `ErrDimMismatch.Index` plumbed through: `validateDim` returns per-vector index within chunk; `embedChunked` maps to absolute caller-facing position via `i + de.Index`.
+- New metrics: `embed_chunks_per_call{model}` (1× per call, all paths), `embed_chunk_size{model}` (per dispatched sub-batch).
+
+**Layer 3 — Downstream consumers:**
+
+- `memdb-go` PR #311 (commit `63ad3876`): bumped go-kit to v0.50.0, removed wrapper-level chunking duplicate from `internal/embedder/http.go` (PR #310 was a temporary defense-in-depth pre-go-kit-lift). `MEMDB_EMBED_CHUNK_SIZE` aliased to `WithChunkSize` opt at construction so existing operator config keeps working.
+- `go-code` PR #91 (commit `dc9d25a`): already on go-kit v0.50.0 (transparent protection — no code change at call sites).
+
+**krolik-server compose updates (PR sequence):**
+
+- PR #98 (pre-incident): `EMBED_ARENA_MAX_MEM_BYTES` 6→3 GiB
+- PR #99 (pre-incident): `EMBED_SESSION_POOL_SIZE` 1→2 (latency win)
+- PR #102 (incident response v5): `EMBED_IDLE_EVICT_SECS` 0→600 — **ROLLBACK** (caused 38 cold-start re-init OOM cascade)
+- PR #103 (incident response v6): arena 3→4 GiB, mem 6→7 GiB — partial relief but failures continued (root cause not yet identified)
+- PR #104 (incident response v6 emergency): `EMBED_SESSION_POOL_SIZE` 2→1 — **band-aid** stopped failures by serialising scratch
+- PR #107 (incident close v7): pool 1→2 restored after layered fix shipped — verified 0 failures + 0 server rejects in 30+ min before restore
+
+### Verification commands
+
+After deploy, verify the 3-layer fix is wired:
+
+```bash
+# Server-side cap working:
+curl -s -X POST http://127.0.0.1:8082/v1/embeddings \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"jina-code-v2\",\"input\":[$(seq -s, -f '"x"' 1 33)]}"
+# Expects: HTTP 400 + {error:{code:"input_array_too_large",cap:32,received:33}}
+
+# Server cap counter:
+curl -s http://127.0.0.1:8082/metrics | grep embed_input_array_rejected_total
+
+# Client chunking metric (memdb-go side, after first chunked call):
+curl -s http://127.0.0.1:8080/metrics | grep embed_chunks_per_call
+# Expects: histogram with sample count > 0; sum equals total chunk count
+```
+
+### Lessons
+
+1. **Multiple safe PRs can produce emergent failure.** Each of #80 / #98 / #99 was reviewed individually and looked safe. The combination + the latent unbounded-array bug (existed for ~year+ without surfacing because old config absorbed it) gave the OOM.
+2. **`debug_investigate` cross-references metrics + traces + symbols across boundaries.** Single-source observation (logs only, metrics only) would not have pinpointed the batcher first-item-admit path. Three iterative passes narrowed from latency spike → arena cap interaction → unbounded-array root cause.
+3. **Defense in depth.** Server-side cap protects from any future client. Client-side chunking in shared lib protects all current consumers transparently. Either layer alone would have stopped this incident.
+4. **Emergency band-aids must be marked TEMPORARY.** PR #104 (pool=1) stopped the bleeding but degraded p95 latency. The fix isn't complete until the band-aid is removed (PR #107).
+5. **Reviewer is gold for concurrency code.** The go-kit PR #48 reviewer caught a BLOCKER (WithFallback bypassing chunking gate) that would have caused silent failures for any caller using fallback chains. Tests passed before the fix — review caught what tests didn't.
+
+### Cross-references
+
+- ox-embed-server: PRs #46 (ALiBi precompute), #47 (per-model ONNX cache + arena docs), #48 (EvictablePool port), #49 (server cap)
+- go-kit: PR #48 → tag v0.49.0/v0.50.0 (lift chunking to shared Client)
+- memdb-go: PR #310 (wrapper chunking — temporary), #311 (cleanup + bump v0.50.0)
+- go-code: PR #91 (bump go-kit v0.50.0)
+- krolik-server: PRs #98, #99, #102 (rollback), #103, #104 (band-aid), #107 (restore)
