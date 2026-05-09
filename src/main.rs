@@ -168,14 +168,22 @@ async fn main() {
     // trailing pages back to the kernel. Complements (does not replace)
     // the shared CPU arena registered above.
     //
-    // 100 ms cadence matches TEI: non-blocking, low-overhead, and with
-    // `malloc_trim` itself being a fast no-op when there's nothing to
+    // 1000 ms cadence (was 100 ms, ported from TEI without measurement).
+    //
+    // TEI targets serverless burst-and-idle; embed-server is long-running
+    // steady state. At 100 ms the madvise → page-fault cycle produces
+    // ~39 GB of block I/O per day (measured on ARM Neoverse-N1 prod).
+    // 1000 ms reduces that 10× with negligible latency impact: maximum
+    // RSS drift between trims is ≤ 1 batch cycle (~256 MiB temporary),
+    // which fits within the 0.42 GiB RSS slack observed in prod.
+    //
+    // `malloc_trim` itself is a fast no-op when there's nothing to
     // release. Linux-only — `malloc_trim` is a glibc-specific extension,
     // absent on macOS/Windows.
     #[cfg(target_os = "linux")]
     {
         tokio::spawn(async {
-            let mut tick = tokio::time::interval(Duration::from_millis(100));
+            let mut tick = tokio::time::interval(Duration::from_millis(1000));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
@@ -187,7 +195,7 @@ async fn main() {
                 metrics::record_malloc_trim(released);
             }
         });
-        tracing::info!("glibc malloc_trim(0) background task started (100ms cadence)");
+        tracing::info!("glibc malloc_trim(0) background task started (1000ms cadence)");
     }
 
     // Install Prometheus recorder BEFORE any gauge!()/counter!()/histogram!()

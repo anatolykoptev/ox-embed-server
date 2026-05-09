@@ -53,6 +53,43 @@ use ort::session::builder::{GraphOptimizationLevel, SessionBuilder};
 pub struct CacheDir(PathBuf);
 
 impl CacheDir {
+    /// Read the cache directory for a specific model, with per-model override
+    /// support.
+    ///
+    /// Lookup order:
+    ///   1. `ONNX_OPT_CACHE_DIR_<MODEL_KEY_UPPER>` — per-model override,
+    ///      where `<MODEL_KEY_UPPER>` is `model_key` uppercased with `-`
+    ///      replaced by `_`. Example: `"jina-code-v2"` →
+    ///      `ONNX_OPT_CACHE_DIR_JINA_CODE_V2`.
+    ///   2. `ONNX_OPT_CACHE_DIR` — global fallback (original behaviour).
+    ///   3. `None` — cache disabled (both unset or empty).
+    ///
+    /// This enables enabling the optimized-graph cache for a single model
+    /// (e.g. jina-code-v2) without touching others. The Phase H.21 incident
+    /// on e5-large (Protobuf serialization fail on DeBERTa rel.pos pattern,
+    /// PR #29) caused the global env to remain unset in prod; per-model env
+    /// lets operators safely enable caching one model at a time.
+    ///
+    /// Returns `None` when:
+    ///   - both env vars unset or empty
+    ///   - directory does not exist and cannot be created
+    ///   - directory is not writable (read-only FS, permission denied)
+    pub fn from_env_for_model(model_key: &str) -> Option<Self> {
+        let suffix = model_key.to_uppercase().replace('-', "_");
+        let per_model_key = format!("ONNX_OPT_CACHE_DIR_{suffix}");
+
+        // Per-model env takes precedence over global.
+        if let Ok(raw) = std::env::var(&per_model_key) {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                return Self::from_path(Path::new(trimmed));
+            }
+        }
+
+        // Fall back to global.
+        Self::from_env()
+    }
+
     /// Read `ONNX_OPT_CACHE_DIR` and verify the directory is writable
     /// (touch-and-delete a sentinel file). Returns `None` when:
     ///   - env var unset (feature disabled — default)
@@ -62,6 +99,9 @@ impl CacheDir {
     ///
     /// All non-default outcomes log a warning so operators can tell the
     /// difference between "feature off" and "feature broken".
+    ///
+    /// For new call sites prefer `from_env_for_model` which adds per-model
+    /// override support via `ONNX_OPT_CACHE_DIR_<MODEL_KEY_UPPER>`.
     pub fn from_env() -> Option<Self> {
         let raw = std::env::var("ONNX_OPT_CACHE_DIR").ok()?;
         let trimmed = raw.trim();
@@ -293,6 +333,100 @@ mod tests {
         fs::create_dir_all(&p).unwrap();
         p
     }
+
+    // ── Per-model override tests (RED until from_env_for_model is implemented) ──
+
+    #[test]
+    fn per_model_env_overrides_global() {
+        // ONNX_OPT_CACHE_DIR_JINA_CODE_V2 must win over ONNX_OPT_CACHE_DIR
+        // when the model key is "jina-code-v2".
+        let global_dir = tempdir("global");
+        let model_dir = tempdir("model");
+
+        with_env(
+            "ONNX_OPT_CACHE_DIR",
+            Some(global_dir.to_str().unwrap()),
+            || {
+                with_env(
+                    "ONNX_OPT_CACHE_DIR_JINA_CODE_V2",
+                    Some(model_dir.to_str().unwrap()),
+                    || {
+                        let cache = CacheDir::from_env_for_model("jina-code-v2")
+                            .expect("per-model dir should be Some");
+                        assert_eq!(
+                            cache.0, model_dir,
+                            "per-model env should override global for jina-code-v2"
+                        );
+                    },
+                );
+            },
+        );
+
+        // Another model without a per-model override must fall back to global.
+        with_env(
+            "ONNX_OPT_CACHE_DIR",
+            Some(global_dir.to_str().unwrap()),
+            || {
+                with_env("ONNX_OPT_CACHE_DIR_JINA_CODE_V2", None, || {
+                    let cache = CacheDir::from_env_for_model("multilingual-e5-large")
+                        .expect("global fallback should be Some");
+                    assert_eq!(
+                        cache.0, global_dir,
+                        "should fall back to global when no per-model override"
+                    );
+                });
+            },
+        );
+
+        let _ = fs::remove_dir_all(&global_dir);
+        let _ = fs::remove_dir_all(&model_dir);
+    }
+
+    #[test]
+    fn falls_back_to_global() {
+        let dir = tempdir("fallback");
+        // Only global set, no per-model.
+        with_env("ONNX_OPT_CACHE_DIR", Some(dir.to_str().unwrap()), || {
+            with_env("ONNX_OPT_CACHE_DIR_MULTILINGUAL_E5_LARGE", None, || {
+                let cache = CacheDir::from_env_for_model("multilingual-e5-large")
+                    .expect("should fall back to global");
+                assert_eq!(cache.0, dir);
+            });
+        });
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disabled_when_neither_set() {
+        with_env("ONNX_OPT_CACHE_DIR", None, || {
+            with_env("ONNX_OPT_CACHE_DIR_JINA_CODE_V2", None, || {
+                assert!(
+                    CacheDir::from_env_for_model("jina-code-v2").is_none(),
+                    "both unset → None"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn model_key_normalization() {
+        // model_key "jina-code-v2" → env "ONNX_OPT_CACHE_DIR_JINA_CODE_V2"
+        let dir = tempdir("normalization");
+        with_env("ONNX_OPT_CACHE_DIR", None, || {
+            with_env(
+                "ONNX_OPT_CACHE_DIR_JINA_CODE_V2",
+                Some(dir.to_str().unwrap()),
+                || {
+                    let cache = CacheDir::from_env_for_model("jina-code-v2")
+                        .expect("normalized key should find per-model env");
+                    assert_eq!(cache.0, dir);
+                },
+            );
+        });
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Existing tests (unchanged) ──────────────────────────────────────────
 
     #[test]
     fn from_env_unset_returns_none() {

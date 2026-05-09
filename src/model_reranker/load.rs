@@ -390,7 +390,7 @@ fn load_static_session_pools(
 /// ~550 MB weight buffer cost, in exchange for true parallelism under
 /// independent Mutexes.
 fn build_session_pool(
-    _name: &str,
+    name: &str,
     onnx_path: &Path,
     opt_level: GraphOptimizationLevel,
     intra_threads: usize,
@@ -403,7 +403,9 @@ fn build_session_pool(
     // re-evaluated *per session* inside the loop: session 0 sees a miss
     // and writes the optimized graph; sessions 1..N see a hit on their
     // own re-check and skip the Level3 pass entirely.
-    let cache = CacheDir::from_env();
+    // Per-model override: ONNX_OPT_CACHE_DIR_<MODEL_KEY_UPPER> takes
+    // precedence over the global ONNX_OPT_CACHE_DIR.
+    let cache = CacheDir::from_env_for_model(name);
     let mut sessions: Vec<Mutex<Session>> = Vec::with_capacity(pool_size);
     for i in 0..pool_size {
         // Re-check inside the loop — see comment above. The first
