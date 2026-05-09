@@ -153,7 +153,7 @@ Key requirements:
 
 ### TL;DR
 
-`POST /v1/embeddings` accepted unbounded `input: []` arrays. Memdb-go shipped requests with up to **100 docs/call**. Each became one batcher Item with `n_texts=100` — admitted unconditionally by the batcher's first-item starvation guard (in `BatchAccum::fits` / `run_worker` first-item-admit path; see code anchor `// Empty-batch path admits the first item unconditionally so a single long-doc request never starves`), bypassing `BATCH_MAX=8`. For jina-code-v2 (12 heads, max_len=512), this allocated:
+`POST /v1/embeddings` accepted unbounded `input: []` arrays. Memdb-go shipped requests with up to **100 docs/call**. Each became one batcher Item with `n_texts=100` — admitted unconditionally by the batcher's first-item starvation guard. The invariant lives in `BatchAccum::seq_capped_by`'s doc comment (`src/batcher.rs`): *"the empty-batch path admits the first item unconditionally so a single long-doc request never starves"*. The bypass also covers `BatchAccum::fits` because the worker only calls `fits` after the first item is already admitted. Result: `BATCH_MAX=8` is silently exceeded by any single Item with `n_texts > 8`. For jina-code-v2 (12 heads, max_len=512), B=100 allocates:
 
 ```
 B × H × S² × 4 bytes  =  100 × 12 × 512² × 4  =  1,258,291,200 bytes  (1.258 GB)
@@ -277,7 +277,7 @@ If a future consumer is added, bump go-kit ≥ v0.49.0 (chunking) or v0.50.0 (ch
 
 These are gaps deliberately left open at the time of BUG-004 closure. Each has a specific followup PR scope:
 
-1. **`/v1/rerank` documents-array cap** — `src/api_rerank.rs` accepts unbounded `documents []` with no analogous `RERANK_MAX_INPUT_DOCS` cap. A client sending 500 documents in one rerank call is admitted; reranker attention scratch is `B × pairs × max_len²` (max_len=256 for `gte-multi-rerank` → 4× lower quadratic cost than jina S=512, but still unbounded). Same class-of-bug recurrence risk as BUG-004 itself. **Followup PR**: `feat(api_rerank): cap /v1/rerank documents array` — mirror PR #49 pattern (env `RERANK_MAX_INPUT_DOCS`, default 32, HTTP 400 on overflow, new metrics `embed_rerank_input_docs_size` + `embed_rerank_input_docs_rejected_total`).
+1. **`/v1/rerank` documents-array cap** — `src/api_rerank.rs` accepts unbounded `documents []` with no analogous `RERANK_MAX_INPUT_DOCS` cap. A client sending 500 documents in one rerank call is admitted; reranker attention scratch is `B × pairs × max_len²` (max_len=256 for `gte-multi-rerank` → 4× lower quadratic cost than jina S=512, but still unbounded). Same class-of-bug recurrence risk as BUG-004 itself. **Followup PR**: `feat(api_rerank): cap /v1/rerank documents array` (PR # to be backfilled when shipped) — mirrors PR #49 pattern (env `RERANK_MAX_INPUT_DOCS`, default 32, HTTP 400 on overflow, new metrics `embed_rerank_input_docs_size` + `embed_rerank_input_docs_rejected_total`).
 
 2. **`embed_chunks_per_call` histogram low informativeness for go-search** — go-search's pipeline never exceeds 32 texts per call (`MAX_FETCH_URLS+1=9` max, `embedding_answer` caps at 24). The histogram will always show `chunks_per_call=1` for go-search labels. Operators watching `/metrics` see new series with no signal. Not harmful — Noted only.
 
