@@ -195,7 +195,7 @@ Three passes of `debug_investigate` traced the root cause from latency symptom �
 **Layer 1 — Server-side cap (`ox-embed-server` PR #49, commit `4b5b72e`):**
 
 - New env `EMBED_MAX_INPUT_ARRAY` (default 32, matches arena headroom: `32 × 12 × 512² × 4 = 402 MiB ≪ 4 GiB - weights`).
-- `POST /v1/embeddings` and `/embed_sparse` reject `input.len() > cap` with **HTTP 400** + JSON body `{error:{type,code,message,cap,received}}`. Permanent client misuse, no retry.
+- `POST /v1/embeddings` rejects `input.len() > cap` with **HTTP 400** + JSON body `{error:{type,code,message,cap,received}}`. Permanent client misuse, no retry. Note: `/embed_sparse` (SPLADE) carries the `embed_max_input_array` value on `AppState` but does NOT enforce the cap in its handler — pre-existing gap, see Known Limitations item 5.
 - Three new metrics:
   - `embed_input_array_size{model}` histogram — natural distribution
   - `embed_input_array_rejected_total{model,reason}` counter — rejects observed
@@ -277,10 +277,12 @@ If a future consumer is added, bump go-kit ≥ v0.49.0 (chunking) or v0.50.0 (ch
 
 These are gaps deliberately left open at the time of BUG-004 closure. Each has a specific followup PR scope:
 
-1. **`/v1/rerank` documents-array cap** — `src/api_rerank.rs` accepts unbounded `documents []` with no analogous `RERANK_MAX_INPUT_DOCS` cap. A client sending 500 documents in one rerank call is admitted; reranker attention scratch is `B × pairs × max_len²` (max_len=256 for `gte-multi-rerank` → 4× lower quadratic cost than jina S=512, but still unbounded). Same class-of-bug recurrence risk as BUG-004 itself. **Followup PR**: `feat(api_rerank): cap /v1/rerank documents array` (PR # to be backfilled when shipped) — mirrors PR #49 pattern (env `RERANK_MAX_INPUT_DOCS`, default 32, HTTP 400 on overflow, new metrics `embed_rerank_input_docs_size` + `embed_rerank_input_docs_rejected_total`).
+1. **`/v1/rerank` documents-array cap** — ✅ **CLOSED by PR #52** (commit on main). Added `RERANK_MAX_INPUT_DOCS` env (default 32), HTTP 400 on overflow, new metrics `embed_rerank_input_docs_size{model="unknown"}` + `embed_rerank_input_docs_rejected_total{model="unknown",reason}` (the `model="unknown"` label is a placeholder for schema symmetry with embed cap counters — the cap fires before model resolution from request body, so the actual model is not yet known at recording time).
 
 2. **`embed_chunks_per_call` histogram low informativeness for go-search** — go-search's pipeline never exceeds 32 texts per call (`MAX_FETCH_URLS+1=9` max, `embedding_answer` caps at 24). The histogram will always show `chunks_per_call=1` for go-search labels. Operators watching `/metrics` see new series with no signal. Not harmful — Noted only.
 
 3. **Verification command portability** — the `seq -s, -f '"x"' 1 33` pattern in the verification block above is bash/Linux only (different `seq` flag semantics on macOS). Operators on macOS workstations should generate the payload differently. Noted; not blocking.
 
 4. **`go-kit/embed` env parsing inconsistency** — go-kit PR #48 introduced env reading inline in `client_v2.go` (warn-on-failure pattern) rather than going through a shared factory.go-style helper. Not a bug — just style drift inside the lib. Noted in PR #48 review NIT.
+
+5. **`/embed_sparse` (SPLADE) input-array cap not enforced** — `src/api_splade.rs` carries `embed_max_input_array` field on `AppState` (test constructor sets it), but the live handler never checks `req.input.len() > cap`. PR #49 originally claimed both `/v1/embeddings` and `/embed_sparse` were capped — fact-check during PR #52 review showed only `/v1/embeddings` enforces. SPLADE uses a different pool (smaller models, lower scratch) so the immediate OOM risk is lower than embed/rerank, but the same class-of-bug recurrence-risk pattern applies for any future model swap. **Followup PR**: mirror PR #49's pattern in `api_splade.rs` (reuse same `EMBED_MAX_INPUT_ARRAY` env, same `embed_input_array_rejected_total{model,reason}` counter labels — distinguishes via `model` label which already varies per endpoint).
