@@ -668,6 +668,7 @@ mod tests {
             token_cache: Arc::new(TokenCache::new(0)),
             rerank_semaphore: None,
             embed_max_input_array: cap,
+            rerank_max_input_docs: 32,
         })
     }
 
