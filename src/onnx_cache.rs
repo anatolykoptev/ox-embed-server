@@ -308,6 +308,7 @@ pub fn observe_post_commit(plan: &LoadPlan, elapsed_ms: u128) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::fs;
 
     /// Sets/unsets an env var around a closure and restores it.
@@ -334,9 +335,10 @@ mod tests {
         p
     }
 
-    // ── Per-model override tests (RED until from_env_for_model is implemented) ──
+    // ── Per-model override tests ────────────────────────────────────────────
 
     #[test]
+    #[serial]
     fn per_model_env_overrides_global() {
         // ONNX_OPT_CACHE_DIR_JINA_CODE_V2 must win over ONNX_OPT_CACHE_DIR
         // when the model key is "jina-code-v2".
@@ -383,6 +385,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn falls_back_to_global() {
         let dir = tempdir("fallback");
         // Only global set, no per-model.
@@ -397,6 +400,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn disabled_when_neither_set() {
         with_env("ONNX_OPT_CACHE_DIR", None, || {
             with_env("ONNX_OPT_CACHE_DIR_JINA_CODE_V2", None, || {
@@ -409,6 +413,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn model_key_normalization() {
         // model_key "jina-code-v2" → env "ONNX_OPT_CACHE_DIR_JINA_CODE_V2"
         let dir = tempdir("normalization");
@@ -429,6 +434,7 @@ mod tests {
     // ── Existing tests (unchanged) ──────────────────────────────────────────
 
     #[test]
+    #[serial]
     fn from_env_unset_returns_none() {
         with_env("ONNX_OPT_CACHE_DIR", None, || {
             assert!(CacheDir::from_env().is_none());
@@ -436,6 +442,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn from_env_empty_returns_none() {
         with_env("ONNX_OPT_CACHE_DIR", Some(""), || {
             assert!(CacheDir::from_env().is_none());
@@ -446,6 +453,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn from_env_writable_returns_some() {
         let dir = tempdir("writable");
         with_env("ONNX_OPT_CACHE_DIR", Some(dir.to_str().unwrap()), || {

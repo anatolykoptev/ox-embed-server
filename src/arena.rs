@@ -85,7 +85,7 @@ pub fn assert_arena_registered_before_session() {
 ///   kSameAsRequested never shrinks between calls. Grows monotonically
 ///   to the cap set here. Compose sets cap = 3 GiB (PR #98,
 ///   krolik-server).
-/// - Note: PR #46 (1077095) precomputed ALiBi constants, eliminating
+/// - Note: PR #46 precomputed ALiBi constants, eliminating
 ///   the 1.258 GiB per-call scratch that previously caused jina-code-v2
 ///   to require ~1.5 GiB of arena per inference call.
 ///
