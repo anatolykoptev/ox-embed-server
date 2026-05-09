@@ -821,9 +821,17 @@ pub fn record_batcher_first_item_oversize(model: &str, reason: &str) {
 ///
 /// `reason` is always `"size_cap"` today; the label exists for future
 /// extension (e.g. a token-count-based pre-reject).
+///
+/// **Schema note**: `model="unknown"` is emitted as a placeholder because
+/// the cap fires BEFORE model resolution from the request body — the
+/// reranker model is selected per-request via `model` field, not yet
+/// known at the rejection point. The label exists for schema symmetry
+/// with `embed_input_array_rejected_total{model,reason}` (PR #49) so
+/// dashboards can join both series under the same label set.
 pub fn record_rerank_input_docs_rejected(reason: &str) {
     metrics::counter!(
         "embed_rerank_input_docs_rejected_total",
+        "model" => "unknown",
         "reason" => reason.to_string(),
     )
     .increment(1);
@@ -834,8 +842,18 @@ pub fn record_rerank_input_docs_rejected(reason: &str) {
 /// natural distribution and tune `RERANK_MAX_INPUT_DOCS`.
 ///
 /// Histogram buckets: `[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, +Inf]`.
+///
+/// **Schema note**: `model="unknown"` is emitted as a placeholder because
+/// the size is recorded BEFORE model resolution from the request body —
+/// the reranker model is selected per-request via `model` field. The label
+/// exists for schema symmetry with `embed_input_array_size{model}` (PR #49)
+/// so dashboards can join both series under the same label set.
 pub fn record_rerank_input_docs_size(n: usize) {
-    metrics::histogram!("embed_rerank_input_docs_size").record(n as f64);
+    metrics::histogram!(
+        "embed_rerank_input_docs_size",
+        "model" => "unknown",
+    )
+    .record(n as f64);
 }
 
 // ── shared test helper ────────────────────────────────────────────────────────
