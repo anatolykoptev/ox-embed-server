@@ -814,6 +814,43 @@ pub fn record_batcher_first_item_oversize(model: &str, reason: &str) {
     .increment(1);
 }
 
+/// Set the `embed_arena_shrink_enabled` gauge (1.0 = on, 0.0 = off).
+///
+/// Called once at model load time from `EmbedModel::load` so operators can
+/// verify from `/metrics` whether per-run BFCArena shrinkage is active for
+/// each model without reading logs.
+pub fn set_arena_shrink_enabled(model: &str, enabled: bool) {
+    metrics::gauge!(
+        "embed_arena_shrink_enabled",
+        "model" => model.to_string()
+    )
+    .set(if enabled { 1.0 } else { 0.0 });
+}
+
+/// Increment the per-run arena shrinkage call counter.
+///
+/// Called ONLY from `embed_tokens` when shrinkage is enabled — immediately
+/// before or after `session.run_with_options` that carries the
+/// `"memory.enable_memory_arena_shrinkage"` config entry. Warmup
+/// (`warmup_at_shape`) intentionally does NOT increment this counter so the
+/// rate reflects only production inference, not startup warmup passes.
+///
+/// For models with shrinkage enabled, the counter rate should match
+/// `embed_requests_total{model="<that-model>"}` rate (filter to the same
+/// model label — comparing against the all-models aggregate would
+/// undercount because e5-large + reranker + splade don't increment this
+/// counter when shrinkage is auto-disabled for them). A rate lower than
+/// the per-model `embed_requests_total` means shrinkage is disabled
+/// mid-run or the gate is misfiring; a higher rate indicates
+/// double-counting (a bug).
+pub fn record_arena_shrink_call(model: &str) {
+    metrics::counter!(
+        "embed_arena_shrink_calls_total",
+        "model" => model.to_string()
+    )
+    .increment(1);
+}
+
 /// Increment the rerank-documents-rejected counter. Called when a
 /// `/v1/rerank` request carries more documents than `rerank_max_input_docs`.
 /// The request is rejected with HTTP 400 before tokenization — the counter
