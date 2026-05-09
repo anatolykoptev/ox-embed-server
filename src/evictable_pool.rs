@@ -10,11 +10,10 @@
 //!
 //! # Pool lifecycle
 //!
-//! 1. `EvictablePool::new` pre-fills `size` slots via `factory`.
-//! 2. `EvictablePool::from_items` wraps already-constructed items (used in tests).
-//! 3. `acquire()` returns an `EvictableGuard<T>` which returns the item on `Drop`.
-//! 4. Evicted slots (`None`) are lazily re-created by the next `acquire()` call.
-//! 5. `spawn_eviction_loop` runs a background tokio task; abort the handle to stop it.
+//! 1. `EvictablePool::from_items` wraps already-constructed items (startup path).
+//! 2. `acquire()` returns an `EvictableGuard<T>` which returns the item on `Drop`.
+//! 3. Evicted slots (`None`) are lazily re-created by the next `acquire()` call.
+//! 4. `spawn_eviction_loop` runs a background tokio task; abort the handle to stop it.
 //!
 //! # Concurrency guarantees
 //!
@@ -81,50 +80,12 @@ struct EvictableSlot<T> {
 pub struct EvictablePool<T> {
     slots: Vec<Arc<EvictableSlot<T>>>,
     factory: Arc<dyn Fn() -> Result<T, String> + Send + Sync>,
-    pub idle_secs: u64,
+    pub(crate) idle_secs: u64,
     /// Model name for Prometheus labels (`embed_pool_*{model="..."}` series).
     model: String,
 }
 
 impl<T: Send + 'static> EvictablePool<T> {
-    /// Create a pool with `size` slots pre-filled via `factory`.
-    ///
-    /// `idle_secs == 0` disables eviction (opt-in via `EMBED_IDLE_EVICT_SECS`).
-    /// Panics at startup if factory fails — misconfigured environment, not a
-    /// runtime error.
-    ///
-    /// Currently unused — embed-server's load path constructs sessions
-    /// up-front then wraps via [`EvictablePool::from_items`] (because we
-    /// want to fail fast at startup if any session fails, not panic from
-    /// inside `new`). Kept here for parity with ox-whisper's API and for
-    /// future use if we move to lazy-fill semantics.
-    #[allow(dead_code)]
-    pub fn new(
-        size: usize,
-        idle_secs: u64,
-        model: impl Into<String>,
-        factory: Arc<dyn Fn() -> Result<T, String> + Send + Sync>,
-    ) -> Self {
-        let now = unix_now_secs();
-        let slots = (0..size)
-            .map(|_| {
-                // Unwrap is safe at startup — failure here is a configuration error.
-                let item = (factory)().expect("EvictablePool factory failed during initialisation");
-                Arc::new(EvictableSlot {
-                    item: Mutex::new(Some(item)),
-                    busy: AtomicBool::new(false),
-                    last_used: AtomicU64::new(now),
-                })
-            })
-            .collect();
-        Self {
-            slots,
-            factory,
-            idle_secs,
-            model: model.into(),
-        }
-    }
-
     /// Create a pool pre-filled with already-constructed items.
     ///
     /// `factory` is used only for lazy re-init after eviction.
@@ -169,6 +130,9 @@ impl<T: Send + 'static> EvictablePool<T> {
 
             // ── M4: factory called OUTSIDE the mutex ─────────────────────────
             // Step 1: take lock, check state, determine if reinit is needed.
+            // B1: busy is set INSIDE the MutexGuard scope to close the TOCTOU
+            // window between lock release and busy.store — without this, two
+            // threads could both see needs_reinit=true and both call factory.
             let needs_reinit = {
                 let guard = match slot.item.lock() {
                     Ok(g) => g,
@@ -186,12 +150,18 @@ impl<T: Send + 'static> EvictablePool<T> {
                 if slot.busy.load(Ordering::Acquire) {
                     continue;
                 }
-                guard.is_none()
-            };
+                if guard.is_none() {
+                    // Claim the slot NOW, while still holding the lock.
+                    // This prevents a second thread from also deciding to reinit.
+                    slot.busy.store(true, Ordering::Release);
+                    true
+                } else {
+                    false
+                }
+            }; // lock released HERE — busy=true already set, slot is claimed
 
             if needs_reinit {
-                // Step 2: mark busy to prevent eviction while we reinit.
-                slot.busy.store(true, Ordering::Release);
+                // Step 2: slot is already marked busy (done inside the lock above).
 
                 // Step 3: call factory WITHOUT holding the mutex.
                 metrics::counter!(
@@ -281,7 +251,10 @@ impl<T: Send + 'static> EvictablePool<T> {
         let now = unix_now_secs();
         let mut count = 0;
         for slot in &self.slots {
-            // Never evict a busy slot.
+            // Fast-path skip for busy slots without taking the mutex.
+            // This is a performance optimisation only — the inner re-check
+            // (!slot.busy.load inside the let-chain below) is the actual
+            // race protection that prevents evicting a slot being acquired.
             if slot.busy.load(Ordering::Acquire) {
                 continue;
             }
@@ -315,6 +288,8 @@ impl<T: Send + 'static> EvictablePool<T> {
         let pool = Arc::clone(self);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tick);
+            // tokio::time::interval fires the first tick immediately on creation.
+            // Skip it so eviction doesn't run before the first idle window elapses.
             interval.tick().await; // skip the immediate first tick
             loop {
                 interval.tick().await;
@@ -353,6 +328,17 @@ impl<T: Send + 'static> EvictablePool<T> {
     #[cfg(test)]
     pub fn slot_is_evicted(&self, idx: usize) -> bool {
         self.slots[idx].item.lock().unwrap().is_none()
+    }
+}
+
+impl<T> EvictableGuard<T> {
+    /// Test helper: returns the slot index this guard holds within its pool.
+    #[cfg(test)]
+    pub fn slot_index(&self, pool: &EvictablePool<T>) -> usize {
+        pool.slots
+            .iter()
+            .position(|s| Arc::ptr_eq(s, &self.slot))
+            .expect("guard's slot not found in pool (should never happen)")
     }
 }
 
@@ -408,8 +394,8 @@ mod tests {
     fn make_pool(size: usize, idle_secs: u64) -> EvictablePool<u32> {
         let counter = Arc::new(AtomicU32::new(0));
         let c = counter.clone();
-        EvictablePool::new(
-            size,
+        EvictablePool::from_items(
+            vec![42u32; size],
             idle_secs,
             "test-model",
             Arc::new(move || {
@@ -584,8 +570,8 @@ mod tests {
     // ── drop ordering: concurrent stress ────────────────────────────────────
     #[test]
     fn drop_ordering_no_race() {
-        let pool = Arc::new(EvictablePool::new(
-            2,
+        let pool = Arc::new(EvictablePool::from_items(
+            vec![42u32; 2],
             0,
             "stress-model",
             Arc::new(|| Ok(42u32)),
@@ -612,38 +598,148 @@ mod tests {
         }
     }
 
-    // ── factory called outside lock ──────────────────────────────────────────
+    // ── factory called outside lock (MAJOR 3 rewrite) ───────────────────────
+    /// M4 proof: with pool_size=1, a slow factory (100ms) must NOT block a
+    /// concurrent acquire on the mutex. Thread 2 should return AllBusy quickly
+    /// (within 10ms) rather than blocking for the full 100ms factory duration.
     #[test]
     fn factory_called_outside_lock() {
-        use std::time::Duration;
+        use std::time::{Duration, Instant};
 
-        let pool = Arc::new(EvictablePool::new(
-            2,
+        // pool_size=1: only one slot, so both threads compete for the same slot.
+        let pool = Arc::new(EvictablePool::from_items(
+            vec![0u32],
             1,
-            "slow-factory",
+            "slow-factory-m4",
             Arc::new(|| {
-                std::thread::sleep(Duration::from_millis(50));
+                // Simulate slow ONNX cold start — 100ms.
+                std::thread::sleep(Duration::from_millis(100));
                 Ok(77u32)
             }),
         ));
 
-        // Evict both slots.
+        // Evict the single slot so t1 will trigger a reinit (and call factory).
         pool.force_last_used_ago(10);
         pool.evict_idle(1);
-        for slot in &pool.slots {
-            assert!(slot.item.lock().unwrap().is_none());
-        }
+        assert!(pool.slot_is_evicted(0), "slot must be evicted before test");
 
         let p1 = pool.clone();
         let p2 = pool.clone();
+
+        // t1 starts first and enters the slow factory path.
         let t1 = std::thread::spawn(move || p1.acquire());
-        std::thread::sleep(Duration::from_millis(5));
+
+        // Give t1 time to enter the reinit branch and start the factory call,
+        // but NOT enough time to finish it (factory takes 100ms).
+        std::thread::sleep(Duration::from_millis(10));
+
+        // t2 should return AllBusy quickly WITHOUT blocking on the mutex.
+        let t2_start = Instant::now();
+        let t2 = std::thread::spawn(move || p2.acquire());
+        let r2 = t2.join().expect("t2 must not panic");
+        let t2_elapsed = t2_start.elapsed();
+
+        let _r1 = t1.join().expect("t1 must not panic");
+
+        // If factory was called inside the mutex, t2 would block ~90ms.
+        // With factory outside the mutex, t2 returns AllBusy within ~5ms.
+        assert!(
+            t2_elapsed < Duration::from_millis(20),
+            "t2 blocked {t2_elapsed:?} — factory must be called OUTSIDE the mutex (M4)"
+        );
+        assert!(
+            matches!(r2, Err(AcquireError::AllBusy)),
+            "t2 must get AllBusy (slot is being reinitialised)"
+        );
+    }
+
+    // ── BLOCKER 1: dual-reinit race in acquire reinit path ───────────────────
+    /// Two threads racing on an evicted slot must call factory exactly once.
+    /// The winner gets the guard; the loser gets AllBusy.
+    ///
+    /// Factory sleeps 50ms to widen the race window.
+    #[test]
+    fn dual_reinit_race_yields_single_factory_call() {
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let fc = factory_calls.clone();
+
+        let pool = Arc::new(EvictablePool::from_items(
+            vec![0u32],
+            1,
+            "race-test",
+            Arc::new(move || {
+                fc.fetch_add(1, AOrdering::SeqCst);
+                // Sleep to widen the race window between needs_reinit detection
+                // and busy.store — without the fix, both threads pass the race.
+                std::thread::sleep(Duration::from_millis(50));
+                Ok(99u32)
+            }),
+        ));
+
+        // Evict the only slot.
+        pool.force_last_used_ago(10);
+        pool.evict_idle(1);
+        assert!(pool.slot_is_evicted(0), "slot must be evicted before race");
+
+        let p1 = pool.clone();
+        let p2 = pool.clone();
+
+        // Launch both threads simultaneously — no sleep gap between them.
+        let t1 = std::thread::spawn(move || p1.acquire());
         let t2 = std::thread::spawn(move || p2.acquire());
 
-        let r1 = t1.join().expect("t1 no panic");
-        let r2 = t2.join().expect("t2 no panic");
+        let r1 = t1.join().expect("t1 must not panic");
+        let r2 = t2.join().expect("t2 must not panic");
 
-        let successes = r1.is_ok() as usize + r2.is_ok() as usize;
-        assert!(successes >= 1, "at least one acquire must succeed");
+        // Exactly one factory call — if both reinit, this fails.
+        let calls = factory_calls.load(AOrdering::SeqCst);
+        assert_eq!(
+            calls, 1,
+            "factory must be called exactly once; got {calls} calls (dual-reinit race triggered)"
+        );
+
+        // Exactly one success, one AllBusy.
+        let ok_count = r1.is_ok() as usize + r2.is_ok() as usize;
+        let busy_count = matches!(r1, Err(AcquireError::AllBusy)) as usize
+            + matches!(r2, Err(AcquireError::AllBusy)) as usize;
+        assert_eq!(ok_count, 1, "exactly one acquire must succeed");
+        assert_eq!(busy_count, 1, "exactly one acquire must get AllBusy");
+    }
+
+    // ── BLOCKER 2: acquire skips busy slots in order ─────────────────────────
+    /// With pool_size=3, three sequential acquires (each held) must return
+    /// guards for distinct slot indices (0, 1, 2 in some order).
+    #[test]
+    fn acquire_skips_busy_slots_in_order() {
+        let pool = EvictablePool::from_items(
+            vec![10u32, 20u32, 30u32],
+            0,
+            "order-test",
+            Arc::new(|| Ok(0u32)),
+        );
+
+        let g0 = pool.acquire().expect("first acquire");
+        let g1 = pool.acquire().expect("second acquire");
+        let g2 = pool.acquire().expect("third acquire");
+
+        let i0 = g0.slot_index(&pool);
+        let i1 = g1.slot_index(&pool);
+        let i2 = g2.slot_index(&pool);
+
+        assert_ne!(i0, i1, "first and second guards must be on different slots");
+        assert_ne!(i1, i2, "second and third guards must be on different slots");
+        assert_ne!(i0, i2, "first and third guards must be on different slots");
+
+        // All three slot indices together must cover {0, 1, 2}.
+        let mut indices = [i0, i1, i2];
+        indices.sort_unstable();
+        assert_eq!(
+            indices,
+            [0, 1, 2],
+            "guards must cover all three slots exactly"
+        );
     }
 }

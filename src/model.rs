@@ -245,8 +245,11 @@ impl EmbedModel {
         })
     }
 
-    /// Number of sessions in the inference pool. Used by tests to assert
-    /// `pool_size` plumbing and by future ops tooling.
+    /// Configured pool size (number of ONNX session slots).
+    ///
+    /// Returns the number of slots configured at load time, which may exceed
+    /// the count of live sessions after idle eviction. Use for capacity
+    /// assertions and ops tooling, not for live session availability checks.
     #[allow(dead_code)]
     pub fn session_count(&self) -> usize {
         self.pool_size
@@ -467,10 +470,28 @@ impl EmbedModel {
         // Warm EVERY session in the pool — without this, only the first
         // session served would be hot; the rest pay the cold-start cost
         // on their first concurrent request.
-        // With EvictablePool, we acquire each slot sequentially (pool_size
-        // iterations). Each guard holds one slot exclusively while we run
-        // the warmup forward pass, then releases it before the next acquire.
+        //
+        // Collect ALL guards first so acquire() skips already-busy slots.
+        // If guards were acquired and dropped inside the same loop iteration,
+        // each acquire would find slot 0 free and never reach slot 1+.
+        let mut guards = Vec::with_capacity(self.pool_size);
         for i in 0..self.pool_size {
+            match self.sessions.acquire() {
+                Ok(g) => guards.push(g),
+                Err(e) => {
+                    tracing::warn!(
+                        model = %name,
+                        slot = i,
+                        batch,
+                        error = %e,
+                        "embed warmup: could not acquire session slot (skipping)"
+                    );
+                }
+            }
+        }
+
+        // Run the warmup forward pass on each acquired slot.
+        for (i, session) in guards.iter_mut().enumerate() {
             let ids_arr = Array2::from_shape_vec([batch, max_seq], ids.clone())
                 .map_err(|e| format!("warmup ids shape (batch={batch}): {e}"))?;
             let mask_arr = Array2::from_shape_vec([batch, max_seq], mask_i64.clone())
@@ -481,22 +502,6 @@ impl EmbedModel {
                 Tensor::from_array(mask_arr).map_err(|e| format!("warmup mask tensor: {e}"))?;
 
             let start = Instant::now();
-            // Acquire any free slot. During startup all slots are idle, so
-            // this always succeeds. If it fails (e.g. all busy from concurrent
-            // warmup calls), log and skip — warmup is best-effort.
-            let mut session = match self.sessions.acquire() {
-                Ok(g) => g,
-                Err(e) => {
-                    tracing::warn!(
-                        model = %name,
-                        slot = i,
-                        batch,
-                        error = %e,
-                        "embed warmup: could not acquire session slot (skipping)"
-                    );
-                    continue;
-                }
-            };
 
             let run_result = if self.has_token_type_ids {
                 let tti_arr = Array2::from_shape_vec([batch, max_seq], tti.clone())

@@ -487,10 +487,20 @@ impl Config {
         let embed_warmup_seq_len =
             parse_embed_warmup_seq_len(env::var("EMBED_WARMUP_SEQ_LEN").ok().as_deref());
 
-        let idle_evict_secs = env::var("EMBED_IDLE_EVICT_SECS")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(0);
+        let idle_evict_secs = match env::var("EMBED_IDLE_EVICT_SECS") {
+            Ok(raw) => match raw.trim().parse::<u64>() {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        value = %raw,
+                        error = %e,
+                        "EMBED_IDLE_EVICT_SECS parse failed; defaulting to 0 (eviction disabled)"
+                    );
+                    0
+                }
+            },
+            Err(_) => 0,
+        };
 
         Ok(Config {
             port,
