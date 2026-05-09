@@ -28,6 +28,25 @@ use serde::{Deserialize, Serialize};
 use crate::metrics;
 use crate::types::{AppState, ErrorDetail, ErrorResponse, error_json};
 
+/// Richer error body for `documents_too_many` — includes `cap` and `received`
+/// so clients can immediately see what limit they hit and how to split their
+/// requests without reading docs. Mirrors `InputArrayTooLargeResponse` in
+/// `types.rs` for the embeddings endpoint.
+#[derive(Serialize)]
+struct DocumentsTooManyDetail {
+    #[serde(rename = "type")]
+    error_type: &'static str,
+    code: &'static str,
+    message: String,
+    cap: usize,
+    received: usize,
+}
+
+#[derive(Serialize)]
+struct DocumentsTooManyResponse {
+    error: DocumentsTooManyDetail,
+}
+
 // ---------------------------------------------------------------------
 // G2-server: optional server-side score normalization.
 // ---------------------------------------------------------------------
@@ -301,6 +320,48 @@ pub async fn rerank(
     if req.documents.is_empty() {
         metrics::record_rerank_request("unknown", "bad_request", request_start.elapsed(), 0);
         return error_json("documents must not be empty").into_response();
+    }
+
+    // Always record the documents array size — both accepted and rejected
+    // paths — so operators can see the natural distribution and tune
+    // RERANK_MAX_INPUT_DOCS.
+    let input_len = req.documents.len();
+    metrics::record_rerank_input_docs_size(input_len);
+
+    // Server-side cap: reject oversized documents arrays BEFORE tokenization.
+    // At cap=32, gte-multi-rerank (max_len=256) scratch ≈ 32×1×256²×4 ≈ 8 MiB
+    // per slot — well under the arena. Quadratic cost is 4× lower than jina
+    // (S=512). This is permanent client misuse (HTTP 400), not transient load.
+    let cap = state.rerank_max_input_docs;
+    if input_len > cap {
+        tracing::warn!(
+            input_len,
+            cap,
+            "rerank documents exceed cap; rejecting with 400"
+        );
+        metrics::record_rerank_input_docs_rejected("size_cap");
+        metrics::record_rerank_request(
+            "unknown",
+            "bad_request",
+            request_start.elapsed(),
+            input_len,
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(DocumentsTooManyResponse {
+                error: DocumentsTooManyDetail {
+                    error_type: "invalid_request_error",
+                    code: "documents_too_many",
+                    message: format!(
+                        "documents array contains {input_len} items, server cap is {cap}; \
+                         split into multiple requests"
+                    ),
+                    cap,
+                    received: input_len,
+                },
+            }),
+        )
+            .into_response();
     }
 
     let model_name = match resolve_reranker_name(&state, req.model) {
@@ -881,5 +942,168 @@ mod tests {
         let r: Result<RerankRequest, _> =
             serde_json::from_str(r#"{"query":"q","documents":["a"],"normalize":"softmax"}"#);
         assert!(r.is_err(), "unknown normalize value must error");
+    }
+
+    // -----------------------------------------------------------------
+    // RERANK_MAX_INPUT_DOCS cap — mirrors the EMBED_MAX_INPUT_ARRAY tests
+    // in api.rs. The cap check fires before any model lookup so an empty
+    // rerankers map is sufficient.
+    // -----------------------------------------------------------------
+
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::post;
+    use serde_json::Value;
+    use tokio_util::sync::CancellationToken;
+    use tower::ServiceExt as _;
+
+    use crate::cache::EmbeddingCache;
+    use crate::token_cache::TokenCache;
+    use crate::types::AppState;
+
+    fn test_prom() -> &'static metrics_exporter_prometheus::PrometheusHandle {
+        crate::metrics::test_prometheus_handle()
+    }
+
+    /// Minimal AppState for cap tests: no models, no rerankers. The cap
+    /// check fires before model resolution so missing models are fine.
+    fn make_state(cap: usize) -> Arc<AppState> {
+        Arc::new(AppState {
+            models: HashMap::new(),
+            rerankers: HashMap::new(),
+            splades: HashMap::new(),
+            default_model: "test-model".to_string(),
+            shutdown: CancellationToken::new(),
+            drain_timeout: Duration::from_secs(5),
+            cache: Arc::new(EmbeddingCache::new(0)),
+            token_cache: Arc::new(TokenCache::new(0)),
+            rerank_semaphore: None,
+            embed_max_input_array: 32,
+            rerank_max_input_docs: cap,
+        })
+    }
+
+    /// Build a POST /v1/rerank request with `n` documents.
+    fn make_rerank_request(n: usize) -> Request<Body> {
+        let docs: Vec<String> = (0..n).map(|i| format!("doc {i}")).collect();
+        let body = serde_json::json!({
+            "query": "test query",
+            "documents": docs
+        });
+        Request::builder()
+            .method("POST")
+            .uri("/v1/rerank")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn make_app(state: Arc<AppState>) -> Router {
+        Router::new()
+            .route("/v1/rerank", post(crate::api_rerank::rerank))
+            .with_state(state)
+    }
+
+    // ---- test: oversized documents → 400 with documents_too_many body ----
+
+    #[tokio::test]
+    async fn rerank_handler_rejects_oversized_documents_array() {
+        let handle = test_prom();
+        let state = make_state(32);
+        let app = make_app(state);
+
+        // 33 documents, cap=32 → must reject with 400.
+        let resp = app.oneshot(make_rerank_request(33)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "oversized documents array must return HTTP 400"
+        );
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        assert_eq!(
+            json["error"]["code"], "documents_too_many",
+            "error.code must be documents_too_many"
+        );
+        assert_eq!(
+            json["error"]["type"], "invalid_request_error",
+            "error.type must be invalid_request_error"
+        );
+        assert_eq!(json["error"]["cap"], 32, "cap must equal configured cap");
+        assert_eq!(
+            json["error"]["received"], 33,
+            "received must equal actual documents count"
+        );
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("split into multiple requests"),
+            "message must suggest splitting"
+        );
+
+        // Counter must have been incremented.
+        let counter_text = handle.render();
+        assert!(
+            counter_text.contains("embed_rerank_input_docs_rejected_total"),
+            "embed_rerank_input_docs_rejected_total counter must appear in metrics after rejection"
+        );
+    }
+
+    // ---- test: exactly at cap → cap check passes (not documents_too_many) ----
+
+    #[tokio::test]
+    async fn rerank_handler_accepts_at_cap() {
+        let state = make_state(32);
+        let app = make_app(state);
+
+        // 32 documents, cap=32 → cap check passes (len == cap, NOT > cap).
+        // Request then fails with "no reranker models configured" (empty map),
+        // which is a different 400 — verify it does NOT have code=documents_too_many.
+        let resp = app.oneshot(make_rerank_request(32)).await.unwrap();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        assert_ne!(
+            json["error"]["code"], "documents_too_many",
+            "request at exactly cap=32 must not trigger the documents-size rejection"
+        );
+    }
+
+    // ---- test: histogram records both accept and reject paths ----
+
+    #[tokio::test]
+    async fn embed_rerank_input_docs_size_histogram_records_both_paths() {
+        let handle = test_prom();
+
+        // Rejected path: 33 documents, cap=32.
+        {
+            let app = make_app(make_state(32));
+            let _resp = app.oneshot(make_rerank_request(33)).await.unwrap();
+        }
+
+        // Accepted path: 5 documents, cap=32.
+        {
+            let app = make_app(make_state(32));
+            let _resp = app.oneshot(make_rerank_request(5)).await.unwrap();
+        }
+
+        let metrics_text = handle.render();
+        assert!(
+            metrics_text.contains("embed_rerank_input_docs_size"),
+            "embed_rerank_input_docs_size histogram must appear in /metrics output \
+             for both accepted and rejected requests"
+        );
     }
 }

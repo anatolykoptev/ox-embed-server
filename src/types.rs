@@ -90,6 +90,12 @@ pub struct AppState {
     /// reaching the batcher. Configured via `EMBED_MAX_INPUT_ARRAY`
     /// (default 32). See `Config::embed_max_input_array` for rationale.
     pub embed_max_input_array: usize,
+    /// Maximum number of documents allowed in a single `/v1/rerank` request.
+    /// Requests exceeding this are rejected with HTTP 400 before tokenization.
+    /// Configured via `RERANK_MAX_INPUT_DOCS` (default 32, matching
+    /// `embed_max_input_array` so operators memorise one number).
+    /// See `Config::rerank_max_input_docs` for rationale.
+    pub rerank_max_input_docs: usize,
 }
 
 // --- Request types ---

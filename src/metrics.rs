@@ -64,6 +64,12 @@ pub fn init(version: &str) -> PrometheusHandle {
     let input_array_size_matcher =
         metrics_exporter_prometheus::Matcher::Full("embed_input_array_size".to_string());
 
+    // Documents per /v1/rerank request (both accepted + rejected). Buckets
+    // mirror embed_input_array_size so operators can compare the two caps.
+    // At cap=32 (gte-multi-rerank, max_len=256): 32×1×256²×4 ≈ 8 MiB/slot.
+    let rerank_input_docs_size_matcher =
+        metrics_exporter_prometheus::Matcher::Full("embed_rerank_input_docs_size".to_string());
+
     let handle = PrometheusBuilder::new()
         .set_buckets_for_metric(
             duration_matcher,
@@ -149,6 +155,11 @@ pub fn init(version: &str) -> PrometheusHandle {
             &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0],
         )
         .expect("set input array size buckets")
+        .set_buckets_for_metric(
+            rerank_input_docs_size_matcher,
+            &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0],
+        )
+        .expect("set rerank input docs size buckets")
         .install_recorder()
         .expect("install Prometheus recorder");
 
@@ -801,6 +812,30 @@ pub fn record_batcher_first_item_oversize(model: &str, reason: &str) {
         "reason" => reason.to_string(),
     )
     .increment(1);
+}
+
+/// Increment the rerank-documents-rejected counter. Called when a
+/// `/v1/rerank` request carries more documents than `rerank_max_input_docs`.
+/// The request is rejected with HTTP 400 before tokenization — the counter
+/// lets operators correlate this guard with BFCArena pressure relief.
+///
+/// `reason` is always `"size_cap"` today; the label exists for future
+/// extension (e.g. a token-count-based pre-reject).
+pub fn record_rerank_input_docs_rejected(reason: &str) {
+    metrics::counter!(
+        "embed_rerank_input_docs_rejected_total",
+        "reason" => reason.to_string(),
+    )
+    .increment(1);
+}
+
+/// Record the documents array length for one `/v1/rerank` request — both
+/// accepted and rejected requests are recorded so operators can see the
+/// natural distribution and tune `RERANK_MAX_INPUT_DOCS`.
+///
+/// Histogram buckets: `[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, +Inf]`.
+pub fn record_rerank_input_docs_size(n: usize) {
+    metrics::histogram!("embed_rerank_input_docs_size").record(n as f64);
 }
 
 // ── shared test helper ────────────────────────────────────────────────────────

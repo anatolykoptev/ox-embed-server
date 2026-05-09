@@ -516,6 +516,7 @@ async fn main() {
         token_cache,
         rerank_semaphore,
         embed_max_input_array: cfg.embed_max_input_array,
+        rerank_max_input_docs: cfg.rerank_max_input_docs,
     });
 
     let metrics_handle = prom_handle.clone();

@@ -304,6 +304,20 @@ pub struct Config {
     /// Rejected requests get HTTP 400 (not 503): this is a permanent client
     /// misuse (array too large), not a transient overload.
     pub embed_max_input_array: usize,
+    /// Maximum number of documents allowed in a single `/v1/rerank` request.
+    /// Requests exceeding this are rejected with HTTP 400 before tokenization
+    /// — protecting the BFCArena from oversized cross-encoder scratch allocs.
+    ///
+    /// **Why 32** (same as `embed_max_input_array`): gte-multi-rerank uses
+    /// `max_len=256`. Reranker attention scratch shape is `B × pairs(1) ×
+    /// S² × 4`; at cap=32, docs=32:
+    ///   32 × 1 × 256² × 4 ≈ 8 MiB per slot — well under the arena even
+    ///   with concurrent rerank sessions. Quadratic cost is 4× lower than
+    ///   jina (S=512) because `256² vs 512²`. Keeping the cap aligned with
+    ///   `embed_max_input_array` means operators only memorise one number.
+    ///
+    /// **Override**: set `RERANK_MAX_INPUT_DOCS` to a positive integer.
+    pub rerank_max_input_docs: usize,
 }
 
 impl Config {
@@ -542,6 +556,28 @@ impl Config {
             Err(_) => 32,
         };
 
+        let rerank_max_input_docs = match env::var("RERANK_MAX_INPUT_DOCS") {
+            Ok(raw) => match raw.trim().parse::<usize>() {
+                Ok(v) if v > 0 => v,
+                Ok(_) => {
+                    tracing::warn!(
+                        value = %raw,
+                        "RERANK_MAX_INPUT_DOCS must be > 0; defaulting to 32"
+                    );
+                    32
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        value = %raw,
+                        error = %e,
+                        "RERANK_MAX_INPUT_DOCS parse failed; defaulting to 32"
+                    );
+                    32
+                }
+            },
+            Err(_) => 32,
+        };
+
         Ok(Config {
             port,
             models,
@@ -571,6 +607,7 @@ impl Config {
             embed_warmup_seq_len,
             idle_evict_secs,
             embed_max_input_array,
+            rerank_max_input_docs,
         })
     }
 }
