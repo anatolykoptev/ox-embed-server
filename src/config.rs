@@ -268,6 +268,24 @@ pub struct Config {
     /// already token-bounded (uses tokenizer output directly) and is
     /// not affected.
     pub embed_warmup_seq_len: Option<usize>,
+    /// Idle-eviction threshold for ONNX sessions in all pools.
+    ///
+    /// `0` (default) — eviction disabled. The pool behaves like a simple
+    /// pre-allocated pool: sessions are never evicted and memory is held
+    /// for the lifetime of the process.
+    ///
+    /// Positive value — sessions idle longer than this many seconds are
+    /// evicted (freed). The next acquire triggers a cold start (~5–10s
+    /// at ONNX reload time; no ONNX_OPT_CACHE_DIR — see Phase H.21
+    /// incident). Use with `EMBED_SESSION_POOL_SIZE=2` to trade latency
+    /// tail (rare cold starts) for memory savings (~250 MiB per session
+    /// slot freed during extended idle periods).
+    ///
+    /// Set via `EMBED_IDLE_EVICT_SECS`. Recommended minimum: 300
+    /// (5 minutes) to avoid cold-start churn under intermittent traffic.
+    /// The eviction background tick runs at `max(idle_secs/4, 5s)` so
+    /// the worst-case overshoot is one tick interval past the threshold.
+    pub idle_evict_secs: u64,
 }
 
 impl Config {
@@ -469,6 +487,21 @@ impl Config {
         let embed_warmup_seq_len =
             parse_embed_warmup_seq_len(env::var("EMBED_WARMUP_SEQ_LEN").ok().as_deref());
 
+        let idle_evict_secs = match env::var("EMBED_IDLE_EVICT_SECS") {
+            Ok(raw) => match raw.trim().parse::<u64>() {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        value = %raw,
+                        error = %e,
+                        "EMBED_IDLE_EVICT_SECS parse failed; defaulting to 0 (eviction disabled)"
+                    );
+                    0
+                }
+            },
+            Err(_) => 0,
+        };
+
         Ok(Config {
             port,
             models,
@@ -496,6 +529,7 @@ impl Config {
             embed_warmup_batch_sizes,
             splade_warmup_batch_sizes,
             embed_warmup_seq_len,
+            idle_evict_secs,
         })
     }
 }
