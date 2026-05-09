@@ -885,8 +885,17 @@ pub(crate) fn arena_shrink_enabled_for_model(model_name: &str, memory_pattern: b
             );
             false
         }
-        _ => {
-            // Auto gate: only enable for memory_pattern=false models.
+        // `auto` is the documented sentinel for "follow memory_pattern" — silent.
+        None | Some("auto") | Some("") => !memory_pattern,
+        Some(other) => {
+            // Operator typo (e.g. "yes" / "on" / "enabled"). Mirror the
+            // warn-on-failure pattern from `parse_memory_pattern` (config.rs)
+            // so misconfiguration is visible rather than silently auto-gated.
+            tracing::warn!(
+                model = %model_name,
+                value = %other,
+                "EMBED_ARENA_SHRINK_{key} unrecognised value (expected true/false/1/0/auto/empty); falling back to auto-gate (memory_pattern={memory_pattern})"
+            );
             !memory_pattern
         }
     }
@@ -1158,6 +1167,7 @@ mod opt_level_tests {
 #[cfg(test)]
 mod arena_shrink_tests {
     use super::*;
+    use serial_test::serial;
 
     /// Sets/unsets an env var around a closure, restoring the previous value.
     fn with_env<F: FnOnce()>(key: &str, val: Option<&str>, f: F) {
@@ -1176,6 +1186,7 @@ mod arena_shrink_tests {
     // ── Test 1: memory_pattern=false → shrinkage enabled (auto gate) ─────────
 
     #[test]
+    #[serial]
     fn embed_model_shrink_enabled_when_memory_pattern_false() {
         // No env override — gate follows memory_pattern.
         with_env("EMBED_ARENA_SHRINK_JINA_CODE_V2", None, || {
@@ -1190,6 +1201,7 @@ mod arena_shrink_tests {
     // ── Test 2: memory_pattern=true → shrinkage disabled (auto gate) ─────────
 
     #[test]
+    #[serial]
     fn embed_model_no_shrink_when_memory_pattern_true() {
         // No env override — gate follows memory_pattern.
         with_env("EMBED_ARENA_SHRINK_MULTILINGUAL_E5_LARGE", None, || {
@@ -1204,6 +1216,7 @@ mod arena_shrink_tests {
     // ── Test 3: env force-on overrides memory_pattern=true ───────────────────
 
     #[test]
+    #[serial]
     fn embed_arena_shrink_env_force_on_overrides_memory_pattern_true() {
         with_env(
             "EMBED_ARENA_SHRINK_MULTILINGUAL_E5_LARGE",
@@ -1223,6 +1236,7 @@ mod arena_shrink_tests {
     // ── Test 4: env force-off overrides memory_pattern=false ─────────────────
 
     #[test]
+    #[serial]
     fn embed_arena_shrink_env_force_off_overrides_memory_pattern_false() {
         with_env("EMBED_ARENA_SHRINK_JINA_CODE_V2", Some("false"), || {
             // memory_pattern=false but env forces shrinkage off.
@@ -1233,6 +1247,54 @@ mod arena_shrink_tests {
                  regardless of memory_pattern"
             );
         });
+    }
+
+    // ── Test 4b: explicit `auto` sentinel = same as unset = follow memory_pattern.
+
+    #[test]
+    #[serial]
+    fn embed_arena_shrink_env_auto_follows_memory_pattern() {
+        with_env("EMBED_ARENA_SHRINK_JINA_CODE_V2", Some("auto"), || {
+            assert!(
+                arena_shrink_enabled_for_model("jina-code-v2", false),
+                "auto + memory_pattern=false → shrinkage on"
+            );
+        });
+        with_env(
+            "EMBED_ARENA_SHRINK_MULTILINGUAL_E5_LARGE",
+            Some("auto"),
+            || {
+                assert!(
+                    !arena_shrink_enabled_for_model("multilingual-e5-large", true),
+                    "auto + memory_pattern=true → shrinkage off"
+                );
+            },
+        );
+    }
+
+    // ── Test 4c: invalid env value warns + falls back to auto-gate.
+
+    #[test]
+    #[serial]
+    fn embed_arena_shrink_env_invalid_falls_back_to_auto() {
+        // Operator typo "yes" — falls back to auto-gate behaviour
+        // (warn emitted at runtime, not asserted here).
+        with_env("EMBED_ARENA_SHRINK_JINA_CODE_V2", Some("yes"), || {
+            assert!(
+                arena_shrink_enabled_for_model("jina-code-v2", false),
+                "invalid value 'yes' + memory_pattern=false → auto-gate enables shrinkage"
+            );
+        });
+        with_env(
+            "EMBED_ARENA_SHRINK_MULTILINGUAL_E5_LARGE",
+            Some("nope"),
+            || {
+                assert!(
+                    !arena_shrink_enabled_for_model("multilingual-e5-large", true),
+                    "invalid value 'nope' + memory_pattern=true → auto-gate disables shrinkage"
+                );
+            },
+        );
     }
 
     // ── Test 5: shrink call counter increments when enabled ───────────────────

@@ -829,13 +829,20 @@ pub fn set_arena_shrink_enabled(model: &str, enabled: bool) {
 
 /// Increment the per-run arena shrinkage call counter.
 ///
-/// Called in `embed_tokens` (and `warmup_at_shape`) when shrinkage is enabled
-/// — i.e. immediately before or after `session.run_with_options` that carries
-/// the `"memory.enable_memory_arena_shrinkage"` config entry.
+/// Called ONLY from `embed_tokens` when shrinkage is enabled — immediately
+/// before or after `session.run_with_options` that carries the
+/// `"memory.enable_memory_arena_shrinkage"` config entry. Warmup
+/// (`warmup_at_shape`) intentionally does NOT increment this counter so the
+/// rate reflects only production inference, not startup warmup passes.
 ///
-/// The counter rate should match `embed_requests_total{model}` rate. A rate
-/// lower than `embed_requests_total` means shrinkage is disabled mid-run or
-/// the gate is misfiring; a higher rate indicates double-counting (a bug).
+/// For models with shrinkage enabled, the counter rate should match
+/// `embed_requests_total{model="<that-model>"}` rate (filter to the same
+/// model label — comparing against the all-models aggregate would
+/// undercount because e5-large + reranker + splade don't increment this
+/// counter when shrinkage is auto-disabled for them). A rate lower than
+/// the per-model `embed_requests_total` means shrinkage is disabled
+/// mid-run or the gate is misfiring; a higher rate indicates
+/// double-counting (a bug).
 pub fn record_arena_shrink_call(model: &str) {
     metrics::counter!(
         "embed_arena_shrink_calls_total",
