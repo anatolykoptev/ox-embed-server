@@ -389,6 +389,23 @@ async fn run_worker(
             },
         };
         let mut accum = BatchAccum::default();
+        // Observability only: check whether this first item would have failed
+        // fits() against a hypothetical non-empty accumulator — i.e., it is
+        // being admitted solely because the empty-batch starvation guard
+        // bypasses normal admission checks. Checked BEFORE accum.push so the
+        // synthetic check uses a zero-initialised accum (no items yet).
+        {
+            let hypothetical = BatchAccum::default(); // zero items, zero tokens
+            if !hypothetical.fits(&first, &cfg) {
+                // Determine the specific reason for observability label.
+                let reason = if first.n_texts() > cfg.max_batch_items {
+                    "exceeds_batch_max_items"
+                } else {
+                    "exceeds_max_batch_tokens"
+                };
+                crate::metrics::record_batcher_first_item_oversize(&name, reason);
+            }
+        }
         accum.push(&first);
         // Observability only: first item admitted even if it exceeds
         // max_batch_seq (starvation guard). Emit a distinct counter so
@@ -570,20 +587,13 @@ async fn dispatch_batch(items: Vec<Item>, embed_fn: EmbedFn, name: Arc<String>) 
 #[allow(clippy::await_holding_lock, clippy::ok_expect)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
 
-    use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-
-    /// Install a Prometheus recorder the first time it's needed and cache
-    /// its handle. Subsequent calls return the same handle; the global
-    /// `metrics` recorder can only be installed once per process.
-    fn test_prometheus_handle() -> &'static PrometheusHandle {
-        static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
-        HANDLE.get_or_init(|| {
-            PrometheusBuilder::new()
-                .install_recorder()
-                .expect("install Prometheus recorder for tests")
-        })
+    /// Delegate to the shared test recorder in `metrics` so only one
+    /// `install_recorder()` call happens per process regardless of which
+    /// test module runs first.
+    fn test_prometheus_handle() -> &'static metrics_exporter_prometheus::PrometheusHandle {
+        crate::metrics::test_prometheus_handle()
     }
 
     /// Build a batcher tuned for item-count-style tests (pre-B3 semantics):
@@ -1789,6 +1799,109 @@ mod tests {
             text.contains(&needle),
             "expected `{needle}` in /metrics render:\n{text}"
         );
+        Arc::try_unwrap(b)
+            .ok()
+            .expect("still has clones")
+            .shutdown(Duration::from_millis(200))
+            .await;
+    }
+
+    // -----------------------------------------------------------------
+    // first-item-oversize counter (spec items 8a, 8b)
+    //
+    // The empty-batch starvation guard admits the first item unconditionally
+    // even if it would fail fits() against a non-empty accumulator. The
+    // new counter fires ONLY in that case, without changing admit behaviour.
+    // -----------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn first_item_oversize_counter_fires_when_admit_exceeds_normal_batch_max() {
+        let handle = test_prometheus_handle();
+        // Use a unique model name so this counter doesn't collide with other tests.
+        let name = "t_first_oversize_fire";
+
+        let b = Arc::new(DynamicBatcher::with_tokens(
+            name,
+            |ids: Vec<Vec<u32>>| Ok(ids.iter().map(|_| vec![0.0f32; 4]).collect()),
+            /*max_batch_tokens*/ usize::MAX,
+            /*max_batch_items*/ 8, // normal batch_max_items cap
+            /*max_batch_seq*/ usize::MAX,
+            /*padded_model*/ false,
+            /*wait_ms*/ 50,
+            /*max_queue*/ 256,
+        ));
+
+        // Send one item with n_texts=100 (> max_batch_items=8). The empty-batch
+        // starvation guard admits it anyway. The counter must fire.
+        // A 100-text item has 100 token_ids sub-vecs, each 1 token.
+        let large_input: Vec<Vec<u32>> = (0..100_u32).map(|i| vec![i]).collect();
+        let result = b.embed_tokens(large_input).await;
+        // The item must still be processed (no behaviour regression).
+        assert!(
+            result.is_ok(),
+            "large first item must still be processed (no behavior change)"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let text = handle.render();
+        let needle = format!(
+            "embed_batcher_first_item_oversize_total\
+             {{model=\"{name}\",reason=\"exceeds_batch_max_items\"}}"
+        );
+        assert!(
+            text.contains(&needle),
+            "expected `{needle}` in /metrics render:\n{text}"
+        );
+
+        Arc::try_unwrap(b)
+            .ok()
+            .expect("still has clones")
+            .shutdown(Duration::from_millis(200))
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn first_item_oversize_counter_silent_for_normal_admits() {
+        let handle = test_prometheus_handle();
+        let name = "t_first_oversize_silent";
+
+        let b = Arc::new(DynamicBatcher::with_tokens(
+            name,
+            |ids: Vec<Vec<u32>>| Ok(ids.iter().map(|_| vec![0.0f32; 4]).collect()),
+            /*max_batch_tokens*/ usize::MAX,
+            /*max_batch_items*/ 8,
+            /*max_batch_seq*/ usize::MAX,
+            /*padded_model*/ false,
+            /*wait_ms*/ 50,
+            /*max_queue*/ 256,
+        ));
+
+        // Send item with n_texts=4 (< max_batch_items=8). Fits the hypothetical
+        // empty-accum check → counter must NOT fire.
+        let normal_input: Vec<Vec<u32>> = (0..4_u32).map(|i| vec![i]).collect();
+        let _ = b.embed_tokens(normal_input).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let text = handle.render();
+        let needle = format!(
+            "embed_batcher_first_item_oversize_total\
+             {{model=\"{name}\",reason=\"exceeds_batch_max_items\"}}"
+        );
+        assert!(
+            !text.contains(&needle),
+            "must NOT see `{needle}` for a normal (under-cap) first item"
+        );
+
+        // Also must not appear with the token reason.
+        let needle2 = format!(
+            "embed_batcher_first_item_oversize_total\
+             {{model=\"{name}\",reason=\"exceeds_max_batch_tokens\"}}"
+        );
+        assert!(
+            !text.contains(&needle2),
+            "must NOT see `{needle2}` for a normal first item"
+        );
+
         Arc::try_unwrap(b)
             .ok()
             .expect("still has clones")

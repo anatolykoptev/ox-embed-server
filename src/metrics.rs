@@ -59,6 +59,11 @@ pub fn init(version: &str) -> PrometheusHandle {
     let peak_bytes_matcher =
         metrics_exporter_prometheus::Matcher::Full("embed_inference_peak_bytes".to_string());
 
+    // Input array length per /v1/embeddings request (both accepted + rejected).
+    // Buckets capture happy path (1-32) through pathological 100-text batches.
+    let input_array_size_matcher =
+        metrics_exporter_prometheus::Matcher::Full("embed_input_array_size".to_string());
+
     let handle = PrometheusBuilder::new()
         .set_buckets_for_metric(
             duration_matcher,
@@ -139,6 +144,11 @@ pub fn init(version: &str) -> PrometheusHandle {
             &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0],
         )
         .expect("set max effective seq buckets")
+        .set_buckets_for_metric(
+            input_array_size_matcher,
+            &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0],
+        )
+        .expect("set input array size buckets")
         .install_recorder()
         .expect("install Prometheus recorder");
 
@@ -738,6 +748,80 @@ impl Drop for RerankInFlightGuard {
         )
         .decrement(1.0);
     }
+}
+
+/// Increment the input-array-rejected counter. Called when a `/v1/embeddings`
+/// request carries more texts than `embed_max_input_array`. The request is
+/// rejected with HTTP 400 before reaching the batcher — the counter lets
+/// operators correlate this guard with BFCArena pressure relief.
+///
+/// `reason` is always `"size_cap"` today; the label exists for future
+/// extension (e.g. a token-count-based pre-reject).
+pub fn record_input_array_rejected(model: &str, reason: &str) {
+    metrics::counter!(
+        "embed_input_array_rejected_total",
+        "model" => model.to_string(),
+        "reason" => reason.to_string(),
+    )
+    .increment(1);
+}
+
+/// Record the input array length for one `/v1/embeddings` request — both
+/// accepted and rejected requests are recorded so operators can see the
+/// natural distribution and tune `EMBED_MAX_INPUT_ARRAY` accordingly.
+///
+/// Histogram buckets: `[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, +Inf]`.
+/// These capture both the happy path (1-32 texts from go-search) and the
+/// pathological 100-text memdb-go batches that caused the BFCArena OOM.
+pub fn record_input_array_size(model: &str, n: usize) {
+    metrics::histogram!(
+        "embed_input_array_size",
+        "model" => model.to_string()
+    )
+    .record(n as f64);
+}
+
+/// Increment the batcher first-item-oversize counter. Called from
+/// `run_worker` when the very first item in an empty batch would have
+/// failed `fits()` against a hypothetical non-empty accumulator —
+/// i.e., it was admitted only because empty-batch starvation guard
+/// bypasses normal `fits()` checks.
+///
+/// `reason` is one of:
+/// - `"exceeds_batch_max_items"` — `item.n_texts() > cfg.max_batch_items`
+/// - `"exceeds_max_batch_tokens"` — token-budget would overflow even alone
+///
+/// This counter is pure observability; it does NOT gate admission or change
+/// any behaviour. A rising rate combined with large `embed_input_array_size`
+/// buckets indicates the server-side cap is doing its job.
+pub fn record_batcher_first_item_oversize(model: &str, reason: &str) {
+    metrics::counter!(
+        "embed_batcher_first_item_oversize_total",
+        "model" => model.to_string(),
+        "reason" => reason.to_string(),
+    )
+    .increment(1);
+}
+
+// ── shared test helper ────────────────────────────────────────────────────────
+
+/// Install a Prometheus recorder the first time it's needed and return its
+/// handle. Subsequent calls from any module return the same handle; the global
+/// `metrics` recorder can only be installed once per process.
+///
+/// Used by `batcher::tests`, `api::tests`, and any other in-process test
+/// module that needs to assert on metric values. A single shared function
+/// ensures only one `install_recorder()` call happens regardless of test
+/// parallelism.
+#[cfg(test)]
+pub fn test_prometheus_handle() -> &'static PrometheusHandle {
+    use std::sync::OnceLock;
+    static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+    HANDLE.get_or_init(|| {
+        PrometheusBuilder::new()
+            .install_recorder()
+            .expect("install Prometheus recorder for tests")
+    })
 }
 
 // ── unit tests for bucket-label logic ────────────────────────────────────────

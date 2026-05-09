@@ -85,6 +85,11 @@ pub struct AppState {
     /// `None` = unlimited (legacy behaviour); set via
     /// `MAX_CONCURRENT_RERANK_REQUESTS`.
     pub rerank_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    /// Maximum number of texts allowed in a single `/v1/embeddings` input
+    /// array. Requests exceeding this are rejected with HTTP 400 before
+    /// reaching the batcher. Configured via `EMBED_MAX_INPUT_ARRAY`
+    /// (default 32). See `Config::embed_max_input_array` for rationale.
+    pub embed_max_input_array: usize,
 }
 
 // --- Request types ---
@@ -188,6 +193,24 @@ pub struct ErrorDetail {
     pub message: String,
     #[serde(rename = "type")]
     pub error_type: &'static str,
+}
+
+/// Richer error body for `input_array_too_large` — includes `cap` and
+/// `received` so clients can immediately see what limit they hit and how
+/// to split their requests without reading docs.
+#[derive(Serialize)]
+pub struct InputArrayTooLargeDetail {
+    #[serde(rename = "type")]
+    pub error_type: &'static str,
+    pub code: &'static str,
+    pub message: String,
+    pub cap: usize,
+    pub received: usize,
+}
+
+#[derive(Serialize)]
+pub struct InputArrayTooLargeResponse {
+    pub error: InputArrayTooLargeDetail,
 }
 
 pub fn error_json(msg: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {

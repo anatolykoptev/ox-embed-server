@@ -286,6 +286,24 @@ pub struct Config {
     /// The eviction background tick runs at `max(idle_secs/4, 5s)` so
     /// the worst-case overshoot is one tick interval past the threshold.
     pub idle_evict_secs: u64,
+    /// Maximum number of texts allowed in a single `/v1/embeddings` input
+    /// array. Requests that exceed this cap are rejected with HTTP 400
+    /// **before** they reach the batcher — protecting the BFCArena from
+    /// oversized single-call attention-scratch allocations.
+    ///
+    /// **Why 32**: jina-code-v2 (12 heads, max_len=512) attention scratch
+    /// per inference is `B × H × S² × 4`. At the cap:
+    ///   32 × 12 × 512² × 4 ≈ 402 MiB (under the 512 MiB safe threshold).
+    /// At 100 texts (the memdb-go client's former default):
+    ///   100 × 12 × 512² × 4 ≈ 1.258 GiB → BFCArena OOM (~1/min in prod).
+    ///
+    /// **Override**: set `EMBED_MAX_INPUT_ARRAY` to a positive integer.
+    /// Operators on high-memory hosts can raise this; operators on
+    /// constrained boxes should lower it further.
+    ///
+    /// Rejected requests get HTTP 400 (not 503): this is a permanent client
+    /// misuse (array too large), not a transient overload.
+    pub embed_max_input_array: usize,
 }
 
 impl Config {
@@ -502,6 +520,28 @@ impl Config {
             Err(_) => 0,
         };
 
+        let embed_max_input_array = match env::var("EMBED_MAX_INPUT_ARRAY") {
+            Ok(raw) => match raw.trim().parse::<usize>() {
+                Ok(v) if v > 0 => v,
+                Ok(_) => {
+                    tracing::warn!(
+                        value = %raw,
+                        "EMBED_MAX_INPUT_ARRAY must be > 0; defaulting to 32"
+                    );
+                    32
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        value = %raw,
+                        error = %e,
+                        "EMBED_MAX_INPUT_ARRAY parse failed; defaulting to 32"
+                    );
+                    32
+                }
+            },
+            Err(_) => 32,
+        };
+
         Ok(Config {
             port,
             models,
@@ -530,6 +570,7 @@ impl Config {
             splade_warmup_batch_sizes,
             embed_warmup_seq_len,
             idle_evict_secs,
+            embed_max_input_array,
         })
     }
 }

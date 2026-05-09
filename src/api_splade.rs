@@ -261,6 +261,7 @@ mod tests {
             cache: Arc::new(crate::cache::EmbeddingCache::new(0)),
             token_cache: Arc::new(crate::token_cache::TokenCache::new(0)),
             rerank_semaphore: None,
+            embed_max_input_array: 32,
         }
     }
 

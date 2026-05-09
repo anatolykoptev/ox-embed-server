@@ -10,7 +10,8 @@ use base64::Engine as _;
 use crate::cache_flow::partition_hits_and_misses;
 use crate::types::{
     AppState, EmbedData, EmbedRequest, EmbedResponse, EmbeddingValue, EncodingFormat, ErrorDetail,
-    ErrorResponse, InputType, Usage, error_json,
+    ErrorResponse, InputArrayTooLargeDetail, InputArrayTooLargeResponse, InputType, Usage,
+    error_json,
 };
 
 /// Encode a float32 vector as base64 (little-endian f32 bytes).
@@ -59,6 +60,52 @@ pub async fn embeddings(
     let encoding_format = req.encoding_format.unwrap_or_default();
     let input_type = req.input_type.unwrap_or_default();
 
+    // Parse input early so we can check length and record the histogram
+    // before incurring any model-lookup or batcher cost.
+    let texts = req.input.into_vec();
+    if texts.is_empty() {
+        crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
+        return error_json("input must not be empty").into_response();
+    }
+
+    // Always record the input array size — both accepted and rejected paths —
+    // so operators can see the natural distribution and tune EMBED_MAX_INPUT_ARRAY.
+    crate::metrics::record_input_array_size(&model_name, texts.len());
+
+    // Server-side cap: reject oversized input arrays BEFORE the batcher.
+    // B=100 × H=12 × S=512² × 4 = 1.258 GiB attention scratch per inference
+    // caused BFCArena OOM at ~1/min in prod. Default cap=32 keeps scratch
+    // under 402 MiB. This is a permanent client misuse (HTTP 400), not a
+    // transient overload (503), so Retry-After is intentionally absent.
+    let cap = state.embed_max_input_array;
+    if texts.len() > cap {
+        let input_len = texts.len();
+        tracing::warn!(
+            input_len,
+            cap,
+            model = %model_name,
+            "input array exceeds cap; rejecting with 400"
+        );
+        crate::metrics::record_input_array_rejected(&model_name, "size_cap");
+        crate::metrics::record_request(&model_name, status, t0.elapsed(), input_len);
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(InputArrayTooLargeResponse {
+                error: InputArrayTooLargeDetail {
+                    error_type: "invalid_request_error",
+                    code: "input_array_too_large",
+                    message: format!(
+                        "input array contains {input_len} items, server cap is {cap}; \
+                         split into multiple requests"
+                    ),
+                    cap,
+                    received: input_len,
+                },
+            }),
+        )
+            .into_response();
+    }
+
     let entry = match state.models.get(&model_name) {
         Some(e) => e,
         None => {
@@ -71,11 +118,6 @@ pub async fn embeddings(
     // vectors if an asymmetric model is deployed in the future.
     let cache_key = cache_model_key(&model_name, input_type);
 
-    let texts = req.input.into_vec();
-    if texts.is_empty() {
-        crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
-        return error_json("input must not be empty").into_response();
-    }
     // Capture the original request size — this is what clients asked for
     // and what `embed_texts_per_request` must reflect, regardless of how
     // many turn into cache hits vs. misses.
@@ -580,5 +622,173 @@ mod tests {
         cache.insert(model, text, vec.clone());
         let retrieved = cache.get(model, text).expect("cache hit expected");
         assert_eq!(retrieved, vec);
+    }
+
+    // ------------------------------------------------------------------
+    // Input-array cap (EMBED_MAX_INPUT_ARRAY)
+    // ------------------------------------------------------------------
+    //
+    // These tests drive the embeddings handler through axum's tower stack
+    // using a minimal AppState (no real model entries needed — the cap
+    // check fires before model lookup).
+
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::post;
+    use serde_json::Value;
+    use tokio_util::sync::CancellationToken;
+    use tower::ServiceExt as _;
+
+    use crate::token_cache::TokenCache;
+    use crate::types::AppState;
+
+    /// Delegate to the shared test recorder so only one `install_recorder()`
+    /// call happens per process regardless of which test module runs first.
+    fn test_prom() -> &'static metrics_exporter_prometheus::PrometheusHandle {
+        crate::metrics::test_prometheus_handle()
+    }
+
+    /// Build a minimal `AppState` with the given `embed_max_input_array` cap.
+    /// All model maps are empty — tests targeting the cap check fire before
+    /// the model-lookup path.
+    fn make_state(cap: usize) -> Arc<AppState> {
+        Arc::new(AppState {
+            models: HashMap::new(),
+            rerankers: HashMap::new(),
+            splades: HashMap::new(),
+            default_model: "test-model".to_string(),
+            shutdown: CancellationToken::new(),
+            drain_timeout: Duration::from_secs(5),
+            cache: Arc::new(EmbeddingCache::new(0)),
+            token_cache: Arc::new(TokenCache::new(0)),
+            rerank_semaphore: None,
+            embed_max_input_array: cap,
+        })
+    }
+
+    /// Build a POST /v1/embeddings request with an input array of `n` strings.
+    fn make_request(n: usize) -> Request<Body> {
+        let inputs: Vec<String> = (0..n).map(|i| format!("text {i}")).collect();
+        let body = serde_json::json!({
+            "input": inputs,
+            "model": "test-model"
+        });
+        Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn make_app(state: Arc<AppState>) -> Router {
+        Router::new()
+            .route("/v1/embeddings", post(crate::api::embeddings))
+            .with_state(state)
+    }
+
+    // ---- test: oversized input → 400 with correct JSON body ----
+
+    #[tokio::test]
+    async fn embeddings_handler_rejects_oversized_input_array() {
+        let handle = test_prom();
+        let state = make_state(32);
+        let app = make_app(state);
+
+        // 100 texts, cap=32 → must reject with 400.
+        let resp = app.oneshot(make_request(100)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "oversized input array must return HTTP 400"
+        );
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        assert_eq!(
+            json["error"]["code"], "input_array_too_large",
+            "error.code must be input_array_too_large"
+        );
+        assert_eq!(
+            json["error"]["type"], "invalid_request_error",
+            "error.type must be invalid_request_error"
+        );
+        assert_eq!(json["error"]["cap"], 32, "cap must equal configured cap");
+        assert_eq!(
+            json["error"]["received"], 100,
+            "received must equal actual input length"
+        );
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("split into multiple requests"),
+            "message must suggest splitting"
+        );
+
+        // Counter must have been incremented.
+        let counter_text = handle.render();
+        assert!(
+            counter_text.contains("embed_input_array_rejected_total"),
+            "embed_input_array_rejected_total counter must appear in metrics after rejection"
+        );
+    }
+
+    // ---- test: exactly at cap → cap check passes (no input_array_too_large) ----
+
+    #[tokio::test]
+    async fn embeddings_handler_accepts_at_cap() {
+        let state = make_state(32);
+        let app = make_app(state);
+
+        // 32 texts, cap=32 → cap check passes (len == cap, NOT > cap).
+        // The request then fails with "model not found" (empty models map),
+        // but that's a different 400 — verifying it does NOT have code=input_array_too_large
+        // proves the cap check passed.
+        let resp = app.oneshot(make_request(32)).await.unwrap();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        // Must NOT be an input_array_too_large rejection.
+        assert_ne!(
+            json["error"]["code"], "input_array_too_large",
+            "request at exactly cap=32 must not trigger the array-size rejection"
+        );
+    }
+
+    // ---- test: histogram records both accept and reject paths ----
+
+    #[tokio::test]
+    async fn embed_input_array_size_histogram_records_both_accept_and_reject() {
+        let handle = test_prom();
+
+        // Rejected path: 100 texts, cap=32.
+        {
+            let app = make_app(make_state(32));
+            let _resp = app.oneshot(make_request(100)).await.unwrap();
+        }
+
+        // Accepted path: 5 texts, cap=32.
+        {
+            let app = make_app(make_state(32));
+            let _resp = app.oneshot(make_request(5)).await.unwrap();
+        }
+
+        let metrics_text = handle.render();
+        assert!(
+            metrics_text.contains("embed_input_array_size"),
+            "embed_input_array_size histogram must appear in /metrics output \
+             for both accepted and rejected requests"
+        );
     }
 }
