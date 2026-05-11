@@ -7,6 +7,7 @@ no-default-features = false
 feature-depth = 1
 
 [advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
 # Deny known vulnerabilities; warn on yanked crates so the build stays green
 # while giving visibility that a crate needs updating.
 ignore = [
