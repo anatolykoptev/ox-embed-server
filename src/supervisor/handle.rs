@@ -7,6 +7,9 @@
 //! - move `child` field to `pub(crate)` once WorkerSupervisor actor owns lifecycle
 //! - replace per-handle Child with WorkerSupervisor + watchdog/auto-restart
 //! - reconnect WorkerClient on slot poisoning (currently I/O error renders slot dead)
+//! - send ControlMessage::Shutdown before SIGKILL on graceful drop
+//! - PID-namespace socket files to avoid collision when two server instances share EMBED_WORKER_SOCKET_DIR
+//! - parallelize spawn loop in main.rs (join_all instead of sequential await)
 
 use crate::ipc::client::WorkerClient;
 use std::path::PathBuf;

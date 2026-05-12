@@ -516,12 +516,17 @@ async fn main() {
     // rerank/splade paths.
     let worker_pool: Option<Arc<crate::supervisor::WorkerPool>> = if cfg.multi_process {
         tracing::info!("multi-process mode enabled — spawning worker pool");
+        tracing::warn!(
+            "EMBED_MULTI_PROCESS=1 — workers spawned, but API routing still goes through in-process models in this build. \
+             This doubles resident memory until Wave 2.4 wires the API cutover. \
+             For production: enable only after the embed-server image includes Wave 2.4 routing changes."
+        );
         let pool = crate::supervisor::WorkerPool::new();
         for model_def in &cfg.models {
             // Inherit per-model session knobs from Config.
             // No separate per-model multi-process tuning in Wave 2.3.
-            let pool_size = cfg.embed_pool_size.max(1);
-            let intra_threads = cfg.intra_threads.max(1);
+            let pool_size = cfg.embed_pool_size;
+            let intra_threads = cfg.intra_threads;
             let spec = crate::supervisor::SpawnSpec {
                 model: model_def.name.clone(),
                 worker_bin: cfg.worker_bin_path.clone(),
