@@ -229,16 +229,15 @@ pub async fn embeddings(
         // already computed above for the total_tokens billing count only.
         let infer_start = std::time::Instant::now();
         let resp = pool
-            .dispatch(&model_name, pending_texts.clone(), max_seq_len)
+            .dispatch_embed(&model_name, pending_texts.clone(), max_seq_len)
             .await;
         let infer_elapsed = infer_start.elapsed();
         match resp {
-            Ok(crate::ipc::protocol::InferResponse::Ok { vectors, dims, .. }) => {
-                crate::metrics::record_inference(&model_name, infer_elapsed, vectors.len());
-                let _ = dims; // dims validated implicitly by downstream scatter length check
-                vectors
+            Ok(crate::ipc::protocol::WorkerResponse::Embed(ok)) => {
+                crate::metrics::record_inference(&model_name, infer_elapsed, ok.vectors.len());
+                ok.vectors
             }
-            Ok(crate::ipc::protocol::InferResponse::Err {
+            Ok(crate::ipc::protocol::WorkerResponse::Err {
                 request_id,
                 message,
             }) => {
@@ -254,6 +253,25 @@ pub async fn embeddings(
                     Json(ErrorResponse {
                         error: ErrorDetail {
                             message: "inference failed".to_string(),
+                            error_type: "server_error",
+                        },
+                    }),
+                )
+                    .into_response();
+            }
+            Ok(unexpected) => {
+                tracing::error!(
+                    model = %model_name,
+                    kind = %unexpected.kind(),
+                    request_id = unexpected.request_id(),
+                    "worker returned unexpected response variant for embed request",
+                );
+                crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: ErrorDetail {
+                            message: "inference failed: unexpected response kind".to_string(),
                             error_type: "server_error",
                         },
                     }),

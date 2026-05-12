@@ -38,9 +38,33 @@ fn next_backoff(current: Duration) -> Duration {
     (current * 2).min(MAX_BACKOFF)
 }
 
+/// Inference kind the worker should load.
+///
+/// Passed as `EMBED_WORKER_KIND` env to the worker process. The worker
+/// loads the appropriate model type and expects only the matching
+/// `WorkerRequest` variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerKind {
+    Embed,
+    Rerank,
+    Splade,
+}
+
+impl WorkerKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Embed => "embed",
+            Self::Rerank => "rerank",
+            Self::Splade => "splade",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SpawnSpec {
     pub model: String,
+    /// Kind of model this worker should load. Sets `EMBED_WORKER_KIND` env.
+    pub kind: WorkerKind,
     pub worker_bin: PathBuf,
     pub socket_dir: PathBuf,
     pub pool_size: usize,
@@ -102,6 +126,7 @@ impl WorkerSupervisor {
 
         let mut cmd = Command::new(&spec.worker_bin);
         cmd.env("EMBED_WORKER_MODEL", &spec.model)
+            .env("EMBED_WORKER_KIND", spec.kind.as_str())
             .env("EMBED_WORKER_SOCKET", &socket_path)
             .env("EMBED_WORKER_POOL_SIZE", spec.pool_size.to_string())
             .env("EMBED_WORKER_INTRA_THREADS", spec.intra_threads.to_string())
@@ -267,6 +292,7 @@ mod tests {
 
         let spec = SpawnSpec {
             model: "test-model".into(),
+            kind: super::WorkerKind::Embed,
             worker_bin: fake_worker_path,
             socket_dir: socket_dir.clone(),
             pool_size: 1,

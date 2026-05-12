@@ -45,21 +45,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::protocol::InferRequest;
+    use crate::ipc::protocol::{EmbedRequest, WorkerRequest};
 
     #[tokio::test]
     async fn frame_roundtrip_through_pipe() {
         // 8192 is enough — the payload here is < 100 bytes. Larger payloads would
         // deadlock without spawn (write blocks until reader drains).
         let (mut a, mut b) = tokio::io::duplex(8192);
-        let req = InferRequest {
+        let req = WorkerRequest::Embed(EmbedRequest {
             request_id: 1,
             model: "e5".into(),
             texts: vec!["hello".into()],
             max_seq_len: 128,
-        };
+        });
         write_frame(&mut a, &req).await.unwrap();
-        let decoded: InferRequest = read_frame(&mut b).await.unwrap();
+        let decoded: WorkerRequest = read_frame(&mut b).await.unwrap();
         assert_eq!(req, decoded);
     }
 
@@ -70,7 +70,7 @@ mod tests {
         // Write a length-prefix one byte over the cap, then close to make read fail fast.
         a.write_u32_le(MAX_FRAME_BYTES + 1).await.unwrap();
         drop(a); // close write half
-        let err = read_frame::<_, crate::ipc::protocol::InferRequest>(&mut b)
+        let err = read_frame::<_, crate::ipc::protocol::WorkerRequest>(&mut b)
             .await
             .expect_err("should reject oversized frame");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);

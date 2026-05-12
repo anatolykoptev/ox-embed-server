@@ -1,10 +1,12 @@
 //! Supervisor-side client to one worker process.
 //!
 //! Holds N persistent UDS connections (matches worker's pool_size); each
-//! connection runs requests serially. `infer()` round-robins across pool.
+//! connection runs requests serially. Dispatch methods round-robin across pool.
 
 use crate::ipc::frame::{read_frame, write_frame};
-use crate::ipc::protocol::{InferRequest, InferResponse};
+use crate::ipc::protocol::{
+    EmbedRequest, RerankRequest, SpladeRequest, WorkerRequest, WorkerResponse,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,55 +45,122 @@ impl WorkerClient {
         &self.socket_path
     }
 
-    pub async fn infer(
+    /// Send a request and receive a response, routing to a pool slot via
+    /// round-robin. Verifies request_id echo.
+    async fn send_request(&self, req: WorkerRequest) -> std::io::Result<WorkerResponse> {
+        let idx = (self.next_idx.fetch_add(1, Ordering::Relaxed) as usize) % self.pool.len();
+        let req_id = req.request_id();
+        let conn = self.pool[idx].clone();
+        let mut stream = conn.lock().await;
+        write_frame(&mut *stream, &req).await?;
+        let resp: WorkerResponse = read_frame(&mut *stream).await?;
+        // NOTE: on read_frame/write_frame error the stream is left in undefined state.
+        // This pool slot becomes effectively unusable until WorkerSupervisor (Wave 2.5)
+        // detects the worker death and reconnects all slots.
+        if resp.request_id() != req_id {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("response id {} != request id {}", resp.request_id(), req_id),
+            ));
+        }
+        Ok(resp)
+    }
+
+    /// Dispatch an embed request. Verifies response cardinality matches input texts.
+    pub async fn dispatch_embed(
         &self,
         model: String,
         texts: Vec<String>,
         max_seq_len: u32,
-    ) -> std::io::Result<InferResponse> {
-        // next_idx and req_id are independent Relaxed atomics — under concurrent callers
-        // the pairing (which slot got which id) is arbitrary, but each callsite gets a
-        // consistent (idx, req_id) snapshot. Pool slots serialize via Mutex so a single
-        // slot's req/resp interleaving is correct.
-        let idx = (self.next_idx.fetch_add(1, Ordering::Relaxed) as usize) % self.pool.len();
+    ) -> std::io::Result<WorkerResponse> {
         let req_id = self.request_counter.fetch_add(1, Ordering::Relaxed);
-        // Capture texts_len before moving texts into InferRequest so we can
-        // validate response cardinality after the round-trip.
         let texts_len = texts.len();
-        let req = InferRequest {
-            request_id: req_id,
-            model,
-            texts,
-            max_seq_len,
-        };
-        let conn = self.pool[idx].clone();
-        let mut stream = conn.lock().await;
-        write_frame(&mut *stream, &req).await?;
-        let resp: InferResponse = read_frame(&mut *stream).await?;
-        // NOTE: on read_frame/write_frame error the stream is left in undefined state.
-        // This pool slot becomes effectively unusable until WorkerSupervisor (Wave 2.5)
-        // detects the worker death and reconnects all slots.
-        let resp_id = match &resp {
-            InferResponse::Ok { request_id, .. } => *request_id,
-            InferResponse::Err { request_id, .. } => *request_id,
-        };
-        if resp_id != req_id {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("response id {resp_id} != request id {req_id}"),
-            ));
-        }
-        // Validate that the worker returned exactly one vector per input text.
-        // A cardinality mismatch indicates a worker bug; fail loudly rather than
-        // silently scattering a wrong result into the response cache.
-        if let InferResponse::Ok { ref vectors, .. } = resp
-            && vectors.len() != texts_len
+        let resp = self
+            .send_request(WorkerRequest::Embed(EmbedRequest {
+                request_id: req_id,
+                model,
+                texts,
+                max_seq_len,
+            }))
+            .await?;
+        if let WorkerResponse::Embed(ref ok) = resp
+            && ok.vectors.len() != texts_len
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
                     "worker returned {} vectors for {} input texts",
-                    vectors.len(),
+                    ok.vectors.len(),
+                    texts_len
+                ),
+            ));
+        }
+        Ok(resp)
+    }
+
+    /// Dispatch a rerank request. Verifies response score count matches document count.
+    pub async fn dispatch_rerank(
+        &self,
+        model: String,
+        query: String,
+        documents: Vec<String>,
+        max_seq_len: u32,
+    ) -> std::io::Result<WorkerResponse> {
+        let req_id = self.request_counter.fetch_add(1, Ordering::Relaxed);
+        let docs_len = documents.len();
+        let resp = self
+            .send_request(WorkerRequest::Rerank(RerankRequest {
+                request_id: req_id,
+                model,
+                query,
+                documents,
+                max_seq_len,
+            }))
+            .await?;
+        if let WorkerResponse::Rerank(ref ok) = resp
+            && ok.scores.len() != docs_len
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "worker returned {} scores for {} documents",
+                    ok.scores.len(),
+                    docs_len
+                ),
+            ));
+        }
+        Ok(resp)
+    }
+
+    /// Dispatch a splade request. Verifies response sparse vector count matches input texts.
+    pub async fn dispatch_splade(
+        &self,
+        model: String,
+        texts: Vec<String>,
+        max_seq_len: u32,
+        top_k: u32,
+        min_weight: f32,
+    ) -> std::io::Result<WorkerResponse> {
+        let req_id = self.request_counter.fetch_add(1, Ordering::Relaxed);
+        let texts_len = texts.len();
+        let resp = self
+            .send_request(WorkerRequest::Splade(SpladeRequest {
+                request_id: req_id,
+                model,
+                texts,
+                max_seq_len,
+                top_k,
+                min_weight,
+            }))
+            .await?;
+        if let WorkerResponse::Splade(ref ok) = resp
+            && ok.sparse.len() != texts_len
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "worker returned {} sparse vectors for {} texts",
+                    ok.sparse.len(),
                     texts_len
                 ),
             ));
@@ -103,6 +172,7 @@ impl WorkerClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[tokio::test]
     async fn connect_rejects_zero_pool_size() {
         let path: PathBuf = "/tmp/does-not-matter".into();

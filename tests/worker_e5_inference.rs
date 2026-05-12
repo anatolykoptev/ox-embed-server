@@ -4,13 +4,16 @@
 //! EMBED_DEFAULT_MODEL, ORT_DYLIB_PATH before running.
 //!
 //! Skip gracefully if env not set (CI-safe).
+//!
+//! Wave 2.4b: migrated from InferRequest/InferResponse to
+//! WorkerRequest::Embed + WorkerResponse::Embed.
 
 #[path = "common/mod.rs"]
 mod common;
 use common::ChildGuard;
 
 use embed_server::ipc::frame::{read_frame, write_frame};
-use embed_server::ipc::protocol::{InferRequest, InferResponse};
+use embed_server::ipc::protocol::{EmbedRequest, WorkerRequest, WorkerResponse};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -35,6 +38,7 @@ async fn worker_infers_e5_batch() {
     let worker_bin = env!("CARGO_BIN_EXE_embed-worker");
     let child = Command::new(worker_bin)
         .env("EMBED_WORKER_MODEL", "multilingual-e5-large")
+        .env("EMBED_WORKER_KIND", "embed")
         .env("EMBED_WORKER_SOCKET", &socket)
         .env("EMBED_WORKER_POOL_SIZE", "1")
         .env("EMBED_MODELS", &models_env)
@@ -62,37 +66,32 @@ async fn worker_infers_e5_batch() {
     let mut conn = UnixStream::connect(&socket)
         .await
         .expect("connect to worker UDS");
-    // NOTE: max_seq_len is not yet honoured by the worker (Phase 5 wires it).
-    // Send 128 to match plan, but model uses its configured max_len internally.
-    let req = InferRequest {
+    let req = WorkerRequest::Embed(EmbedRequest {
         request_id: 1,
         model: "multilingual-e5-large".into(),
         texts: vec!["query: hello".into(), "query: world".into()],
         max_seq_len: 128,
-    };
+    });
     write_frame(&mut conn, &req)
         .await
-        .expect("send InferRequest");
+        .expect("send WorkerRequest");
 
-    let resp: InferResponse = read_frame(&mut conn).await.expect("recv InferResponse");
+    let resp: WorkerResponse = read_frame(&mut conn).await.expect("recv WorkerResponse");
     match resp {
-        InferResponse::Ok {
-            request_id,
-            vectors,
-            dims,
-        } => {
-            assert_eq!(request_id, 1, "request_id round-trip");
-            assert_eq!(vectors.len(), 2, "two texts → two vectors");
-            assert_eq!(dims, 1024, "multilingual-e5-large is 1024-d");
-            assert_eq!(vectors[0].len(), 1024, "vector length matches dims");
+        WorkerResponse::Embed(ok) => {
+            assert_eq!(ok.request_id, 1, "request_id round-trip");
+            assert_eq!(ok.vectors.len(), 2, "two texts → two vectors");
+            assert_eq!(ok.dims, 1024, "multilingual-e5-large is 1024-d");
+            assert_eq!(ok.vectors[0].len(), 1024, "vector length matches dims");
             // Sanity: L2-normalised vectors should have norm ≈ 1.0.
-            let norm: f32 = vectors[0].iter().map(|x| x * x).sum::<f32>().sqrt();
+            let norm: f32 = ok.vectors[0].iter().map(|x| x * x).sum::<f32>().sqrt();
             assert!(
                 (norm - 1.0).abs() < 0.01,
                 "vector should be L2-normalised, got norm={norm}"
             );
         }
-        InferResponse::Err { message, .. } => panic!("inference failed: {message}"),
+        WorkerResponse::Err { message, .. } => panic!("inference failed: {message}"),
+        other => panic!("unexpected response variant: {other:?}"),
     }
     // `_guard` drops here — ChildGuard::drop calls kill() + wait() + socket cleanup.
 }

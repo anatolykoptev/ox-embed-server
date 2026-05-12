@@ -150,6 +150,60 @@ pub async fn sparse_embeddings(
     let top_k = req.top_k.unwrap_or(DEFAULT_TOP_K);
     let min_weight = req.min_weight.unwrap_or(DEFAULT_MIN_WEIGHT);
 
+    // Worker pool dispatch (multi-process splade). When enabled, route to
+    // worker before the in-process per-text spawn_blocking path.
+    if let Some(pool) = state.worker_pool.as_ref() {
+        let texts = req.input.clone();
+        let resp = pool
+            .dispatch_splade(&model_name, texts, 0, top_k as u32, min_weight)
+            .await;
+        match resp {
+            Ok(crate::ipc::protocol::WorkerResponse::Splade(s)) => {
+                let data: Vec<SparseEmbeddingItem> = s
+                    .sparse
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, pairs)| {
+                        let mut indices = Vec::with_capacity(pairs.len());
+                        let mut values = Vec::with_capacity(pairs.len());
+                        for (id, w) in pairs {
+                            // Apply top_k / min_weight filters that the worker
+                            // does not know about (it uses fixed defaults).
+                            if w > min_weight {
+                                indices.push(id);
+                                values.push(w);
+                            }
+                        }
+                        indices.truncate(top_k);
+                        values.truncate(top_k);
+                        SparseEmbeddingItem {
+                            index,
+                            indices,
+                            values,
+                        }
+                    })
+                    .collect();
+                return Json(SparseEmbeddingsResponse {
+                    model: model_name,
+                    data,
+                })
+                .into_response();
+            }
+            Ok(crate::ipc::protocol::WorkerResponse::Err { message, .. }) => {
+                tracing::error!(model = %model_name, worker_error = %message, "worker splade returned error");
+                return server_error(message);
+            }
+            Ok(_unexpected) => {
+                tracing::error!(model = %model_name, "worker returned unexpected variant for splade request");
+                return server_error("splade failed: unexpected response kind".to_string());
+            }
+            Err(e) => {
+                tracing::error!(model = %model_name, error = ?e, "worker_pool splade dispatch failed");
+                return server_error("splade failed".to_string());
+            }
+        }
+    }
+
     // Sequential per-text dispatch. v1 deliberately skips the dynamic
     // batcher — each call goes through its own `spawn_blocking` so the
     // async runtime stays responsive while ORT does its CPU-bound work.
