@@ -521,13 +521,15 @@ async fn main() {
              In-process embed sessions also loaded (memory overhead until Phase 3 lazy-load lands)."
         );
         let pool = crate::supervisor::WorkerPool::new();
+
+        // Embed model workers
         for model_def in &cfg.models {
             // Inherit per-model session knobs from Config.
-            // No separate per-model multi-process tuning in Wave 2.3.
             let pool_size = cfg.embed_pool_size;
             let intra_threads = cfg.intra_threads;
             let spec = crate::supervisor::SpawnSpec {
                 model: model_def.name.clone(),
+                kind: crate::supervisor::WorkerKind::Embed,
                 worker_bin: cfg.worker_bin_path.clone(),
                 socket_dir: cfg.worker_socket_dir.clone(),
                 pool_size,
@@ -546,6 +548,55 @@ async fn main() {
                 });
             pool.add(supervisor).await;
         }
+
+        // Reranker workers (Wave 2.4b)
+        for r_def in &cfg.rerankers {
+            let spec = crate::supervisor::SpawnSpec {
+                model: r_def.name.clone(),
+                kind: crate::supervisor::WorkerKind::Rerank,
+                worker_bin: cfg.worker_bin_path.clone(),
+                socket_dir: cfg.worker_socket_dir.clone(),
+                pool_size: cfg.reranker_pool_size.max(1),
+                intra_threads: cfg.reranker_intra_threads.max(1),
+                env_extra: Vec::new(),
+            };
+            let supervisor = crate::supervisor::WorkerSupervisor::launch(spec)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::error!(
+                        reranker = %r_def.name,
+                        error = ?e,
+                        "reranker worker supervisor launch failed"
+                    );
+                    std::process::exit(1);
+                });
+            pool.add(supervisor).await;
+        }
+
+        // SPLADE workers (Wave 2.4b)
+        for s_def in &cfg.splades {
+            let spec = crate::supervisor::SpawnSpec {
+                model: s_def.name.clone(),
+                kind: crate::supervisor::WorkerKind::Splade,
+                worker_bin: cfg.worker_bin_path.clone(),
+                socket_dir: cfg.worker_socket_dir.clone(),
+                pool_size: cfg.splade_pool_size.max(1),
+                intra_threads: cfg.splade_intra_threads.max(1),
+                env_extra: Vec::new(),
+            };
+            let supervisor = crate::supervisor::WorkerSupervisor::launch(spec)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::error!(
+                        splade = %s_def.name,
+                        error = ?e,
+                        "splade worker supervisor launch failed"
+                    );
+                    std::process::exit(1);
+                });
+            pool.add(supervisor).await;
+        }
+
         Some(Arc::new(pool))
     } else {
         None
