@@ -1406,3 +1406,119 @@ impl StandaloneEmbedder {
         Ok((vecs, self.dims))
     }
 }
+
+// ── StandaloneReranker ────────────────────────────────────────────────────────
+
+/// Standalone reranker for worker process — owns model state, no batcher/queue.
+///
+/// Worker creates one on startup and calls `score` per IPC request.
+/// Concurrency limit is enforced by the caller via `tokio::Semaphore`.
+#[allow(dead_code)]
+pub struct StandaloneReranker {
+    inner: crate::model_reranker::RerankerModel,
+}
+
+impl StandaloneReranker {
+    /// Load a single reranker by name from `cfg.rerankers`.
+    #[allow(dead_code)]
+    pub fn load(
+        model_name: &str,
+        cfg: &crate::config::Config,
+        intra_threads: usize,
+        pool_size: usize,
+    ) -> Result<Self, String> {
+        let def = cfg
+            .rerankers
+            .iter()
+            .find(|r| r.name == model_name)
+            .ok_or_else(|| format!("reranker {model_name} not found in RERANKER_MODELS"))?;
+        let inner = crate::model_reranker::RerankerModel::load(
+            &def.name,
+            &def.dir,
+            def.max_len,
+            def.padded_model,
+            intra_threads,
+            pool_size,
+        )?;
+        Ok(Self { inner })
+    }
+
+    /// Tokenize query+docs, run cross-encoder, return one score per document.
+    ///
+    /// `_max_seq_len` is passed through for protocol parity but not yet used
+    /// — truncation is governed by the tokenizer config at load time.
+    #[allow(dead_code)]
+    #[allow(unused_variables)]
+    pub fn score(
+        &self,
+        query: String,
+        documents: Vec<String>,
+        _max_seq_len: u32,
+    ) -> Result<Vec<f32>, String> {
+        let token_ids = self.inner.tokenize_pairs(&query, &documents)?;
+        self.inner.score_pairs(&token_ids)
+    }
+}
+
+// ── StandaloneSplade ──────────────────────────────────────────────────────────
+
+/// Standalone SPLADE encoder for worker process — owns model state, no batcher.
+///
+/// Worker creates one on startup and calls `encode` per IPC request.
+/// Concurrency limit is enforced by the caller via `tokio::Semaphore`.
+#[allow(dead_code)]
+pub struct StandaloneSplade {
+    inner: crate::model_splade::SpladeModel,
+}
+
+impl StandaloneSplade {
+    /// Load a single SPLADE model by name from `cfg.splades`.
+    #[allow(dead_code)]
+    pub fn load(
+        model_name: &str,
+        cfg: &crate::config::Config,
+        intra_threads: usize,
+        pool_size: usize,
+    ) -> Result<Self, String> {
+        let def = cfg
+            .splades
+            .iter()
+            .find(|s| s.name == model_name)
+            .ok_or_else(|| format!("splade {model_name} not found in SPLADE_MODELS"))?;
+        let inner = crate::model_splade::SpladeModel::load(
+            &def.name,
+            &def.dir,
+            def.max_len,
+            intra_threads,
+            pool_size,
+        )?;
+        Ok(Self { inner })
+    }
+
+    /// Tokenize and encode a batch of texts into sparse vectors.
+    ///
+    /// Each text is encoded independently (SPLADE's `encode_sparse` is
+    /// single-text-per-call by design). Returns one `Vec<(token_id, weight)>`
+    /// per input text.
+    ///
+    /// `_max_seq_len` is passed for protocol parity but not yet wired —
+    /// truncation is governed by the tokenizer config at load time.
+    #[allow(dead_code)]
+    #[allow(unused_variables)]
+    pub fn encode(
+        &self,
+        texts: Vec<String>,
+        _max_seq_len: u32,
+    ) -> Result<Vec<Vec<(u32, f32)>>, String> {
+        // Default top_k/min_weight — matches api_splade.rs defaults.
+        const TOP_K: usize = 256;
+        const MIN_WEIGHT: f32 = 0.0;
+        let mut results = Vec::with_capacity(texts.len());
+        for text in texts {
+            let ids = self.inner.tokenize(&text)?;
+            let sparse = self.inner.encode_sparse(ids, TOP_K, MIN_WEIGHT)?;
+            results.push(sparse);
+        }
+        Ok(results)
+    }
+}

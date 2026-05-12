@@ -1,13 +1,21 @@
 //! Worker process — one process per model. Loads one ONNX model, exposes
-//! inference over UDS to the supervisor. Phase 1 of multi-process refactor.
+//! inference over UDS to the supervisor.
 //!
-//! Control messages (Ping/Pong/Shutdown) are handled in Wave 2 via a separate
-//! channel. This binary handles InferRequest only.
+//! Supported model kinds (set via `EMBED_WORKER_KIND` env, default "embed"):
+//!   - "embed"  — dense embedding via StandaloneEmbedder
+//!   - "rerank" — cross-encoder reranker via StandaloneReranker
+//!   - "splade" — SPLADE sparse encoder via StandaloneSplade
+//!
+//! The worker loads the model once at startup, then loops accepting UDS
+//! connections and serving WorkerRequest frames. Each request must match the
+//! worker's loaded kind; a kind mismatch returns WorkerResponse::Err.
 
 use embed_server::config::Config;
 use embed_server::ipc::frame::{read_frame, write_frame};
-use embed_server::ipc::protocol::{InferRequest, InferResponse};
-use embed_server::model::StandaloneEmbedder;
+use embed_server::ipc::protocol::{
+    EmbedResponseOk, RerankResponseOk, SpladeResponseOk, WorkerRequest, WorkerResponse,
+};
+use embed_server::model::{StandaloneEmbedder, StandaloneReranker, StandaloneSplade};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::UnixListener;
@@ -20,10 +28,28 @@ fn require_env(var: &str) -> anyhow::Result<String> {
     })
 }
 
+/// Enum wrapping the three model kinds the worker can load.
+enum LoadedModel {
+    Embed(StandaloneEmbedder),
+    Rerank(StandaloneReranker),
+    Splade(StandaloneSplade),
+}
+
+impl LoadedModel {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Embed(_) => "embed",
+            Self::Rerank(_) => "rerank",
+            Self::Splade(_) => "splade",
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
+    let kind = std::env::var("EMBED_WORKER_KIND").unwrap_or_else(|_| "embed".into());
     let model_name = require_env("EMBED_WORKER_MODEL")?;
     let socket_path: PathBuf = require_env("EMBED_WORKER_SOCKET")?.into();
     let intra_threads: usize = std::env::var("EMBED_WORKER_INTRA_THREADS")
@@ -33,18 +59,46 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "1".into())
         .parse()?;
 
-    tracing::info!(model = %model_name, ?socket_path, intra_threads, pool_size, "worker starting");
+    tracing::info!(
+        kind = %kind,
+        model = %model_name,
+        ?socket_path,
+        intra_threads,
+        pool_size,
+        "worker starting"
+    );
 
     let cfg = Config::from_env().map_err(|e| {
         tracing::error!(error = %e, "config load failed");
         anyhow::anyhow!("config: {e}")
     })?;
-    let embedder = Arc::new(
-        StandaloneEmbedder::load(&model_name, &cfg, intra_threads, pool_size).map_err(|e| {
-            tracing::error!(error = %e, model = %model_name, "model load failed");
-            anyhow::anyhow!("load failed: {e}")
-        })?,
-    );
+
+    let loaded = match kind.as_str() {
+        "embed" => LoadedModel::Embed(
+            StandaloneEmbedder::load(&model_name, &cfg, intra_threads, pool_size).map_err(|e| {
+                tracing::error!(error = %e, model = %model_name, "embed model load failed");
+                anyhow::anyhow!("load failed: {e}")
+            })?,
+        ),
+        "rerank" => LoadedModel::Rerank(
+            StandaloneReranker::load(&model_name, &cfg, intra_threads, pool_size).map_err(|e| {
+                tracing::error!(error = %e, model = %model_name, "reranker load failed");
+                anyhow::anyhow!("load failed: {e}")
+            })?,
+        ),
+        "splade" => LoadedModel::Splade(
+            StandaloneSplade::load(&model_name, &cfg, intra_threads, pool_size).map_err(|e| {
+                tracing::error!(error = %e, model = %model_name, "splade load failed");
+                anyhow::anyhow!("load failed: {e}")
+            })?,
+        ),
+        other => {
+            tracing::error!(kind = %other, "unknown EMBED_WORKER_KIND");
+            anyhow::bail!("unknown EMBED_WORKER_KIND: {other}");
+        }
+    };
+
+    let loaded = Arc::new(loaded);
     let semaphore = Arc::new(Semaphore::new(pool_size));
 
     if socket_path.exists()
@@ -54,18 +108,18 @@ async fn main() -> anyhow::Result<()> {
         return Err(e.into());
     }
     let listener = UnixListener::bind(&socket_path)?;
-    tracing::info!("worker ready");
+    tracing::info!(kind = %loaded.kind(), "worker ready");
 
     loop {
         let (mut stream, _) = listener.accept().await.map_err(|e| {
             tracing::error!(error = %e, "accept failed");
             e
         })?;
-        let embedder = embedder.clone();
+        let loaded = loaded.clone();
         let semaphore = semaphore.clone();
         tokio::spawn(async move {
             loop {
-                let req: InferRequest = match read_frame(&mut stream).await {
+                let req: WorkerRequest = match read_frame(&mut stream).await {
                     Ok(r) => r,
                     Err(_) => break,
                 };
@@ -73,8 +127,8 @@ async fn main() -> anyhow::Result<()> {
                 let _permit = match semaphore.clone().try_acquire_owned() {
                     Ok(p) => p,
                     Err(_) => {
-                        let resp = InferResponse::Err {
-                            request_id: req.request_id,
+                        let resp = WorkerResponse::Err {
+                            request_id: req.request_id(),
                             message: "worker saturated".into(),
                         };
                         let _ = write_frame(&mut stream, &resp).await;
@@ -82,29 +136,63 @@ async fn main() -> anyhow::Result<()> {
                     }
                 };
 
-                // tokenize + embed_tokens are sync/CPU-bound (ONNX inference).
-                // Run on the blocking pool so the async runtime thread is not stalled.
-                let req_id = req.request_id;
-                let texts = req.texts;
-                let max_seq_len = req.max_seq_len;
-                let emb = embedder.clone();
-                let resp = match tokio::task::spawn_blocking(move || emb.infer(texts, max_seq_len))
-                    .await
-                {
-                    Ok(Ok((vectors, dims))) => InferResponse::Ok {
-                        request_id: req_id,
-                        vectors,
-                        dims,
+                // All model inference is sync/CPU-bound (ONNX). Run on the
+                // blocking pool so the async runtime thread is not stalled.
+                let req_id = req.request_id();
+                let loaded_ref = loaded.clone();
+                let resp = tokio::task::spawn_blocking(move || match (&*loaded_ref, req) {
+                    (LoadedModel::Embed(m), WorkerRequest::Embed(r)) => {
+                        match m.infer(r.texts, r.max_seq_len) {
+                            Ok((vectors, dims)) => WorkerResponse::Embed(EmbedResponseOk {
+                                request_id: r.request_id,
+                                vectors,
+                                dims,
+                            }),
+                            Err(e) => WorkerResponse::Err {
+                                request_id: r.request_id,
+                                message: e,
+                            },
+                        }
+                    }
+                    (LoadedModel::Rerank(m), WorkerRequest::Rerank(r)) => {
+                        match m.score(r.query, r.documents, r.max_seq_len) {
+                            Ok(scores) => WorkerResponse::Rerank(RerankResponseOk {
+                                request_id: r.request_id,
+                                scores,
+                            }),
+                            Err(e) => WorkerResponse::Err {
+                                request_id: r.request_id,
+                                message: e,
+                            },
+                        }
+                    }
+                    (LoadedModel::Splade(m), WorkerRequest::Splade(r)) => {
+                        match m.encode(r.texts, r.max_seq_len) {
+                            Ok(sparse) => WorkerResponse::Splade(SpladeResponseOk {
+                                request_id: r.request_id,
+                                sparse,
+                            }),
+                            Err(e) => WorkerResponse::Err {
+                                request_id: r.request_id,
+                                message: e,
+                            },
+                        }
+                    }
+                    (loaded_model, req) => WorkerResponse::Err {
+                        request_id: req.request_id(),
+                        message: format!(
+                            "kind mismatch: model is {}, request is {}",
+                            loaded_model.kind(),
+                            req.kind()
+                        ),
                     },
-                    Ok(Err(e)) => InferResponse::Err {
-                        request_id: req_id,
-                        message: e,
-                    },
-                    Err(e) => InferResponse::Err {
-                        request_id: req_id,
-                        message: format!("spawn_blocking join error: {e}"),
-                    },
-                };
+                })
+                .await
+                .unwrap_or_else(|e| WorkerResponse::Err {
+                    request_id: req_id,
+                    message: format!("spawn_blocking join error: {e}"),
+                });
+
                 if write_frame(&mut stream, &resp).await.is_err() {
                     break;
                 }
