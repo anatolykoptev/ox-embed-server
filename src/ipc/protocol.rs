@@ -61,4 +61,30 @@ mod tests {
             bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
         assert_eq!(resp, decoded);
     }
+
+    #[test]
+    fn roundtrip_infer_response_err() {
+        let resp = InferResponse::Err {
+            request_id: 7,
+            message: "boom".into(),
+        };
+        let bytes = bincode::serde::encode_to_vec(&resp, bincode::config::standard()).unwrap();
+        let (decoded, _): (InferResponse, _) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert_eq!(resp, decoded);
+    }
+
+    #[test]
+    fn roundtrip_control_message_all_variants() {
+        for msg in [
+            ControlMessage::Ping,
+            ControlMessage::Pong,
+            ControlMessage::Shutdown,
+        ] {
+            let bytes = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+            let (decoded, _): (ControlMessage, _) =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+            assert_eq!(msg, decoded);
+        }
+    }
 }
