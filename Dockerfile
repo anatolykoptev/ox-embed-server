@@ -12,10 +12,17 @@ WORKDIR /app
 # Pre-compiles all crates.io dependencies against a stub binary so that
 # source-code changes don't invalidate this layer.
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p src && echo "fn main() {}" > src/main.rs
+# Stubs for all three Cargo targets so the dep-only layer compiles:
+# - src/main.rs       — [[bin]] embed-server (default; implicit pre-Phase-2)
+# - src/bin/worker.rs — [[bin]] embed-worker (added Wave 1.2)
+# - src/lib.rs        — [lib]  embed_server (added Wave 1.2)
+RUN mkdir -p src/bin && \
+    echo "fn main() {}" > src/main.rs && \
+    echo "fn main() {}" > src/bin/worker.rs && \
+    : > src/lib.rs
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/app/target,sharing=locked \
-    cargo build --release --locked && \
+    cargo build --release --locked --bins && \
     rm -rf src
 
 # Layer 2: real source. Rebuilds only the embed-server crate on code changes.
