@@ -74,7 +74,11 @@ fn multi_process_embed_e2e() {
     // Wait up to 60 s for /health — model cold load can be slow.
     let mut ready = false;
     for _ in 0..600 {
-        if client.get(format!("{base}/health")).send().is_ok_and(|r| r.status().is_success()) {
+        if client
+            .get(format!("{base}/health"))
+            .send()
+            .is_ok_and(|r| r.status().is_success())
+        {
             ready = true;
             break;
         }
@@ -99,7 +103,16 @@ fn multi_process_embed_e2e() {
         "embedding field should be array, got: {resp}"
     );
     let dim = embedding.as_array().unwrap().len();
-    assert_eq!(dim, 1024, "e5-large should produce 1024-dim vector, got {dim}");
+    assert_eq!(
+        dim, 1024,
+        "e5-large should produce 1024-dim vector, got {dim}"
+    );
+
+    let total_tokens = resp["usage"]["total_tokens"].as_u64().unwrap_or(0);
+    assert!(
+        total_tokens > 0,
+        "total_tokens should be non-zero for non-empty input, got: {total_tokens}"
+    );
 
     // Explicit cleanup of socket dir (_guard uses remove_file on placeholder).
     let _ = std::fs::remove_dir_all(&socket_dir);

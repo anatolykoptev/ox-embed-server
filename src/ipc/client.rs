@@ -55,6 +55,9 @@ impl WorkerClient {
         // slot's req/resp interleaving is correct.
         let idx = (self.next_idx.fetch_add(1, Ordering::Relaxed) as usize) % self.pool.len();
         let req_id = self.request_counter.fetch_add(1, Ordering::Relaxed);
+        // Capture texts_len before moving texts into InferRequest so we can
+        // validate response cardinality after the round-trip.
+        let texts_len = texts.len();
         let req = InferRequest {
             request_id: req_id,
             model,
@@ -76,6 +79,21 @@ impl WorkerClient {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("response id {resp_id} != request id {req_id}"),
+            ));
+        }
+        // Validate that the worker returned exactly one vector per input text.
+        // A cardinality mismatch indicates a worker bug; fail loudly rather than
+        // silently scattering a wrong result into the response cache.
+        if let InferResponse::Ok { ref vectors, .. } = resp
+            && vectors.len() != texts_len
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "worker returned {} vectors for {} input texts",
+                    vectors.len(),
+                    texts_len
+                ),
             ));
         }
         Ok(resp)

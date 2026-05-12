@@ -238,14 +238,22 @@ pub async fn embeddings(
                 let _ = dims; // dims validated implicitly by downstream scatter length check
                 vectors
             }
-            Ok(crate::ipc::protocol::InferResponse::Err { message, .. }) => {
-                tracing::error!(model = %model_name, error = %message, "worker returned error");
+            Ok(crate::ipc::protocol::InferResponse::Err {
+                request_id,
+                message,
+            }) => {
+                tracing::error!(
+                    model = %model_name,
+                    request_id,
+                    worker_error = %message,
+                    "worker returned inference error",
+                );
                 crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse {
                         error: ErrorDetail {
-                            message: format!("worker error: {message}"),
+                            message: "inference failed".to_string(),
                             error_type: "server_error",
                         },
                     }),
@@ -253,13 +261,13 @@ pub async fn embeddings(
                     .into_response();
             }
             Err(e) => {
-                tracing::error!(model = %model_name, error = %e, "worker dispatch failed");
+                tracing::error!(model = %model_name, error = ?e, "worker_pool dispatch failed");
                 crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse {
                         error: ErrorDetail {
-                            message: format!("worker dispatch failed: {e}"),
+                            message: "inference failed".to_string(),
                             error_type: "server_error",
                         },
                     }),

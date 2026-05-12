@@ -510,10 +510,11 @@ async fn main() {
     };
 
     // Spawn worker pool if multi-process mode is enabled.
-    // Workers are idle for now — API routing via workers lands in Wave 2.4.
-    // TODO(Wave 2.4): spawn workers for reranker and splade models too.
-    // For now embedders only — api.rs routing in Wave 2.4 will handle the
-    // rerank/splade paths.
+    // Wave 2.4 wires /v1/embeddings through worker_pool. Reranker + SPLADE
+    // remain on the in-process path (Wave 2.4b will extend IPC protocol +
+    // route api_rerank.rs + api_splade.rs through workers).
+    // TODO(Wave 2.4b): spawn workers for reranker and splade models, extend
+    // WorkerRequest/WorkerResponse with rerank + splade variants.
     let worker_pool: Option<Arc<crate::supervisor::WorkerPool>> = if cfg.multi_process {
         tracing::info!("multi-process mode enabled — spawning worker pool");
         tracing::warn!(
