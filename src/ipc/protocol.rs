@@ -40,9 +40,8 @@ mod tests {
             texts: vec!["fn main() {}".into()],
             max_seq_len: 512,
         };
-        let bytes = bincode::serde::encode_to_vec(&req, bincode::config::standard()).unwrap();
-        let (decoded, _): (InferRequest, _) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        let bytes = postcard::to_allocvec(&req).unwrap();
+        let decoded: InferRequest = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(req, decoded);
     }
 
@@ -53,9 +52,8 @@ mod tests {
             vectors: vec![vec![0.1, 0.2, 0.3]],
             dims: 3,
         };
-        let bytes = bincode::serde::encode_to_vec(&resp, bincode::config::standard()).unwrap();
-        let (decoded, _): (InferResponse, _) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        let bytes = postcard::to_allocvec(&resp).unwrap();
+        let decoded: InferResponse = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(resp, decoded);
     }
 
@@ -65,9 +63,8 @@ mod tests {
             request_id: 7,
             message: "boom".into(),
         };
-        let bytes = bincode::serde::encode_to_vec(&resp, bincode::config::standard()).unwrap();
-        let (decoded, _): (InferResponse, _) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        let bytes = postcard::to_allocvec(&resp).unwrap();
+        let decoded: InferResponse = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(resp, decoded);
     }
 
@@ -78,9 +75,8 @@ mod tests {
             ControlMessage::Pong,
             ControlMessage::Shutdown,
         ] {
-            let bytes = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
-            let (decoded, _): (ControlMessage, _) =
-                bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+            let bytes = postcard::to_allocvec(&msg).unwrap();
+            let decoded: ControlMessage = postcard::from_bytes(&bytes).unwrap();
             assert_eq!(msg, decoded);
         }
     }

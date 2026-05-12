@@ -3,14 +3,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub const MAX_FRAME_BYTES: u32 = 64 * 1024 * 1024; // 64 MiB safety cap
 
-/// Writes a length-prefixed bincode-encoded message to the stream.
+/// Writes a length-prefixed postcard-encoded message to the stream.
 pub async fn write_frame<W, T>(stream: &mut W, value: &T) -> io::Result<()>
 where
     W: AsyncWriteExt + Unpin,
     T: serde::Serialize,
 {
-    let bytes = bincode::serde::encode_to_vec(value, bincode::config::standard())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let bytes =
+        postcard::to_allocvec(value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     if bytes.len() > MAX_FRAME_BYTES as usize {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -22,7 +22,7 @@ where
     stream.flush().await
 }
 
-/// Reads a length-prefixed bincode-encoded message from the stream.
+/// Reads a length-prefixed postcard-encoded message from the stream.
 pub async fn read_frame<R, T>(stream: &mut R) -> io::Result<T>
 where
     R: AsyncReadExt + Unpin,
@@ -37,8 +37,8 @@ where
     }
     let mut buf = vec![0u8; len as usize];
     stream.read_exact(&mut buf).await?;
-    let (value, _): (T, _) = bincode::serde::decode_from_slice(&buf, bincode::config::standard())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let value: T =
+        postcard::from_bytes(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(value)
 }
 
