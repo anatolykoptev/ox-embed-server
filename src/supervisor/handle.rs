@@ -7,8 +7,21 @@
 //!   - automatically respawns with exponential backoff (2s → 60s cap)
 //!   - increments restart_count on each successful respawn
 //!
+//! Backoff schedule: 2s → 4s → 8s → … → 60s (capped). Backoff advances
+//! exactly once per failed spawn attempt and resets to INITIAL_BACKOFF on
+//! the first successful respawn.
+//!
 //! SpawnSpec is unchanged from Wave 2.3 (no .kind field yet; that lands in
 //! Wave 2.4b when reranker/splade IPC variants are added).
+//!
+//! TODO followups:
+//! - Connection-error != worker-death detection (latent slot poisoning when
+//!   worker listener dies but process alive). Wave 2.5b heartbeat or
+//!   detection ping needed.
+//! - dispatch_timeout env-gate (currently hardcoded 30s).
+//! - Watchdog circuit-breaker: stop respawning after N consecutive failures
+//!   with no success in between (currently retries forever).
+//! - Graceful shutdown via ControlMessage::Shutdown before kill_on_drop SIGKILL.
 
 use crate::ipc::client::WorkerClient;
 use std::path::PathBuf;
@@ -16,6 +29,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::process::{Child, Command};
 use tokio::sync::RwLock;
+
+const INITIAL_BACKOFF: Duration = Duration::from_secs(2);
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Advance exponential backoff by doubling, capped at MAX_BACKOFF.
+fn next_backoff(current: Duration) -> Duration {
+    (current * 2).min(MAX_BACKOFF)
+}
 
 #[derive(Debug, Clone)]
 pub struct SpawnSpec {
@@ -124,107 +145,68 @@ impl WorkerSupervisor {
         Ok((child, client))
     }
 
-    /// Watchdog: block on `child.wait()`, clear slot, backoff, respawn. Loops
-    /// forever — the tokio task owning this function is the process lifetime.
+    /// Watchdog: block on `child.wait()`, clear slot, respawn with exponential
+    /// backoff. Loops forever — the tokio task is the process lifetime.
     ///
-    /// Exit codes 134 (panic-abort / SIGABRT) and 137 (OOM-kill / SIGKILL) are
-    /// treated identically to a clean exit — any status triggers respawn with
-    /// the same 2s→60s backoff schedule.
+    /// Backoff advances exactly once per failed spawn attempt (in the Err arm)
+    /// and resets to INITIAL_BACKOFF on the first success. Exit codes 134
+    /// (SIGABRT) and 137 (SIGKILL/OOM) are treated identically to clean exit.
     async fn watchdog_loop(self: Arc<Self>, mut child: Child) {
-        let mut backoff = Duration::from_secs(2);
+        let mut backoff = INITIAL_BACKOFF;
         loop {
-            // --- wait for current child to exit ---
+            // Wait for the current child to exit.
             let status = match child.wait().await {
-                Ok(s) => s,
+                Ok(s) => Some(s),
                 Err(e) => {
-                    tracing::error!(model = %self.spec.model, error = %e, "child.wait() error; clearing slot and respawning");
-                    // Treat wait error like a crash: clear slot, backoff, respawn.
-                    *self.client_slot.write().await = None;
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(60));
-                    match Self::spawn_one(&self.spec).await {
-                        Ok((c, client)) => {
-                            *self.client_slot.write().await = Some(client);
-                            self.restart_count
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            child = c;
-                            backoff = Duration::from_secs(2);
-                        }
-                        Err(e2) => {
-                            tracing::error!(model = %self.spec.model, error = ?e2, "respawn failed; will retry next iteration");
-                            // child is consumed; create a dummy placeholder by re-entering
-                            // the outer loop after a full backoff. We skip re-assigning child
-                            // here, so the next loop iteration would need a fresh child.
-                            // Instead we loop with another backoff via `continue`.
-                            // NOTE: we can't re-enter without a valid child. Instead,
-                            // keep retrying spawn until we succeed.
-                            loop {
-                                tokio::time::sleep(backoff).await;
-                                backoff = (backoff * 2).min(Duration::from_secs(60));
-                                match Self::spawn_one(&self.spec).await {
-                                    Ok((c, client)) => {
-                                        *self.client_slot.write().await = Some(client);
-                                        self.restart_count
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        child = c;
-                                        backoff = Duration::from_secs(2);
-                                        break;
-                                    }
-                                    Err(e3) => {
-                                        tracing::error!(model = %self.spec.model, error = ?e3, "respawn retry failed");
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    continue;
+                    tracing::error!(
+                        model = %self.spec.model,
+                        error = %e,
+                        "child.wait() errored"
+                    );
+                    None
                 }
             };
 
-            let restart_count = self
-                .restart_count
-                .load(std::sync::atomic::Ordering::Relaxed);
-            tracing::warn!(
-                model = %self.spec.model,
-                ?status,
-                code = ?status.code(),
-                restart_count,
-                "worker exited; clearing client slot and respawning"
-            );
+            // Log exit with signal info where available.
+            if let Some(ref status) = status {
+                #[cfg(unix)]
+                let signal = std::os::unix::process::ExitStatusExt::signal(status);
+                #[cfg(not(unix))]
+                let signal: Option<i32> = None;
+                tracing::warn!(
+                    model = %self.spec.model,
+                    ?status,
+                    code = ?status.code(),
+                    ?signal,
+                    restart_count = self.restart_count.load(std::sync::atomic::Ordering::Relaxed),
+                    "worker exited; clearing client slot and respawning"
+                );
+            }
 
-            // Clear client slot — dispatchers will see None and wait/timeout.
+            // Clear client slot — dispatchers see "worker unavailable".
             *self.client_slot.write().await = None;
 
-            // Backoff, then attempt respawn.
-            tokio::time::sleep(backoff).await;
-            match Self::spawn_one(&self.spec).await {
-                Ok((c, client)) => {
-                    *self.client_slot.write().await = Some(client);
-                    self.restart_count
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    child = c;
-                    backoff = Duration::from_secs(2); // reset on success
-                }
-                Err(e) => {
-                    tracing::error!(model = %self.spec.model, error = ?e, "respawn failed; will retry");
-                    backoff = (backoff * 2).min(Duration::from_secs(60));
-                    // Retry loop — keep trying until we have a live child to loop back.
-                    loop {
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(Duration::from_secs(60));
-                        match Self::spawn_one(&self.spec).await {
-                            Ok((c, client)) => {
-                                *self.client_slot.write().await = Some(client);
-                                self.restart_count
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                child = c;
-                                backoff = Duration::from_secs(2);
-                                break;
-                            }
-                            Err(e2) => {
-                                tracing::error!(model = %self.spec.model, error = ?e2, "respawn retry failed");
-                            }
-                        }
+            // Respawn loop — each failed attempt advances backoff exactly once.
+            loop {
+                tokio::time::sleep(backoff).await;
+                match Self::spawn_one(&self.spec).await {
+                    Ok((new_child, new_client)) => {
+                        *self.client_slot.write().await = Some(new_client);
+                        self.restart_count
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        crate::metrics::worker_restart_inc(&self.spec.model);
+                        backoff = INITIAL_BACKOFF; // reset on success
+                        child = new_child;
+                        break; // exit inner loop, back to outer wait()
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            model = %self.spec.model,
+                            error = ?e,
+                            backoff_secs = backoff.as_secs(),
+                            "respawn failed; will retry"
+                        );
+                        backoff = next_backoff(backoff);
                     }
                 }
             }
@@ -237,7 +219,7 @@ impl WorkerSupervisor {
     }
 
     /// Number of successful respawns since launch. Zero until first crash.
-    #[allow(dead_code)] // used by health/metrics endpoints in future waves
+    #[allow(dead_code)] // TODO(Phase 3 metrics): expose via /health or /metrics endpoint
     pub fn restart_count(&self) -> u64 {
         self.restart_count
             .load(std::sync::atomic::Ordering::Relaxed)
