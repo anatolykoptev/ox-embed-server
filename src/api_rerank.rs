@@ -409,6 +409,62 @@ pub async fn rerank(
         }};
     }
 
+    // ---- Phase: worker pool dispatch (multi-process rerank) --------------
+    // When multi-process mode is enabled, route to the worker before the
+    // in-process tokenize+batcher path. The worker handles its own
+    // tokenization and inference.
+    if let Some(pool) = state.worker_pool.as_ref() {
+        // max_seq_len is 0 here — the worker uses its tokenizer config.
+        let resp = pool
+            .dispatch_rerank(&model_name, query.clone(), documents.clone(), 0)
+            .await;
+        match resp {
+            Ok(crate::ipc::protocol::WorkerResponse::Rerank(r)) => {
+                let mut scores = r.scores;
+                apply_normalize(&mut scores, normalize.unwrap_or_default());
+                let echo_docs: Option<&[String]> = if return_documents {
+                    Some(&documents)
+                } else {
+                    None
+                };
+                let results = build_sorted_results(&scores, req.top_n, echo_docs);
+                let response = Json(RerankResponse {
+                    id: opaque_request_id(),
+                    model: model_name.clone(),
+                    results,
+                })
+                .into_response();
+                finish!("success", response);
+            }
+            Ok(crate::ipc::protocol::WorkerResponse::Err {
+                request_id,
+                message,
+            }) => {
+                tracing::error!(
+                    model = %model_name,
+                    request_id,
+                    worker_error = %message,
+                    "worker rerank returned error"
+                );
+                finish!("server_error", server_error("rerank failed".to_string()));
+            }
+            Ok(_unexpected) => {
+                tracing::error!(
+                    model = %model_name,
+                    "worker returned unexpected response variant for rerank request"
+                );
+                finish!(
+                    "server_error",
+                    server_error("rerank failed: unexpected response kind".to_string())
+                );
+            }
+            Err(e) => {
+                tracing::error!(model = %model_name, error = ?e, "worker_pool rerank dispatch failed");
+                finish!("server_error", server_error("rerank failed".to_string()));
+            }
+        }
+    }
+
     // ---- Phase: tokenize (with H.7 cache + timing) -----------------------
     let token_ids =
         match tokenize_with_cache(&state, &model_name, &entry.model, &query, &documents).await {
