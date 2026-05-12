@@ -96,6 +96,12 @@ pub struct AppState {
     /// `embed_max_input_array` so operators memorise one number).
     /// See `Config::rerank_max_input_docs` for rationale.
     pub rerank_max_input_docs: usize,
+    /// Active worker pool in multi-process mode (`EMBED_MULTI_PROCESS=1`).
+    ///
+    /// `None` in legacy single-process mode. When `Some`, `/v1/embeddings`
+    /// dispatches through worker processes; rerank/splade remain in-process
+    /// until their IPC protocol support lands (followup wave).
+    pub worker_pool: Option<Arc<crate::supervisor::WorkerPool>>,
 }
 
 // --- Request types ---

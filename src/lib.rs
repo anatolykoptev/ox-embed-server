@@ -2,6 +2,7 @@
 pub mod config;
 pub mod ipc;
 pub mod model;
+pub mod supervisor;
 
 // model.rs imports these internally via `crate::` — they must be pub
 // so the library crate compiles when `model` is exposed. Demoting to

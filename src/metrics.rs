@@ -851,6 +851,20 @@ pub fn record_arena_shrink_call(model: &str) {
     .increment(1);
 }
 
+/// Increment the worker-restart counter on successful supervisor respawn.
+///
+/// Called by `watchdog_loop` in `supervisor::handle` after each successful
+/// `spawn_one`. Label `model` matches the `SpawnSpec::model` string so
+/// operators can correlate restarts with request-error spikes on the same
+/// model series.
+pub fn worker_restart_inc(model: &str) {
+    metrics::counter!(
+        "embed_worker_restart_total",
+        "model" => model.to_string()
+    )
+    .increment(1);
+}
+
 /// Increment the rerank-documents-rejected counter. Called when a
 /// `/v1/rerank` request carries more documents than `rerank_max_input_docs`.
 /// The request is rejected with HTTP 400 before tokenization — the counter

@@ -318,6 +318,28 @@ pub struct Config {
     ///
     /// **Override**: set `RERANK_MAX_INPUT_DOCS` to a positive integer.
     pub rerank_max_input_docs: usize,
+    /// Enable multi-process mode — each embedding model runs in a separate
+    /// `embed-worker` child process communicating over Unix domain sockets.
+    ///
+    /// When `false` (default), the server runs all models in-process (legacy
+    /// behaviour, unchanged). When `true`, `WorkerSupervisor::launch` is called
+    /// for each model at startup; HTTP routing via workers landed in Wave 2.4.
+    ///
+    /// Set via `EMBED_MULTI_PROCESS=1` or `EMBED_MULTI_PROCESS=true`.
+    pub multi_process: bool,
+    /// Path to the `embed-worker` binary to spawn in multi-process mode.
+    ///
+    /// Set via `EMBED_WORKER_BIN` (default `/usr/local/bin/embed-worker`).
+    /// Ignored when `multi_process` is `false`.
+    pub worker_bin_path: std::path::PathBuf,
+    /// Directory for worker Unix domain sockets in multi-process mode.
+    ///
+    /// Each model gets `<dir>/<model_name>.sock`. The directory is created
+    /// by `WorkerSupervisor::launch` if it does not exist.
+    ///
+    /// Set via `EMBED_WORKER_SOCKET_DIR` (default `/tmp/embed-workers`).
+    /// Ignored when `multi_process` is `false`.
+    pub worker_socket_dir: std::path::PathBuf,
 }
 
 impl Config {
@@ -396,10 +418,20 @@ impl Config {
         // cores = 2× oversub instead of 5×, ~2× throughput under load
         // at the cost of ~10–20 % solo-inference latency. Operators on
         // dedicated-CPU hosts can override back to 4.
-        let intra_threads = env::var("EMBED_INTRA_THREADS")
-            .unwrap_or_else(|_| "2".into())
-            .parse::<usize>()
-            .map_err(|e| format!("invalid EMBED_INTRA_THREADS: {e}"))?;
+        let intra_threads = {
+            let raw = env::var("EMBED_INTRA_THREADS")
+                .unwrap_or_else(|_| "2".into())
+                .parse::<usize>()
+                .map_err(|e| format!("invalid EMBED_INTRA_THREADS: {e}"))?;
+            if raw == 0 {
+                tracing::warn!(
+                    "EMBED_INTRA_THREADS=0 is not supported (would mean ORT auto-select, but our session pool expects an explicit count). Falling back to 2."
+                );
+                2
+            } else {
+                raw
+            }
+        };
 
         let embed_pool_size =
             parse_embed_pool_size(env::var("EMBED_SESSION_POOL_SIZE").ok().as_deref());
@@ -578,6 +610,15 @@ impl Config {
             Err(_) => 32,
         };
 
+        let multi_process =
+            parse_multi_process_flag(env::var("EMBED_MULTI_PROCESS").as_deref().ok());
+        let worker_bin_path = env::var("EMBED_WORKER_BIN")
+            .unwrap_or_else(|_| "/usr/local/bin/embed-worker".into())
+            .into();
+        let worker_socket_dir = env::var("EMBED_WORKER_SOCKET_DIR")
+            .unwrap_or_else(|_| "/tmp/embed-workers".into())
+            .into();
+
         Ok(Config {
             port,
             models,
@@ -608,6 +649,9 @@ impl Config {
             idle_evict_secs,
             embed_max_input_array,
             rerank_max_input_docs,
+            multi_process,
+            worker_bin_path,
+            worker_socket_dir,
         })
     }
 }
@@ -757,6 +801,21 @@ fn parse_embed_pool_size(raw: Option<&str>) -> usize {
             Ok(n) => n,
             Err(_) => DEFAULT,
         },
+    }
+}
+
+/// Parse `EMBED_MULTI_PROCESS` env value.
+///
+/// - Unset or `None` → `false` (default: single-process mode).
+/// - `"1"` or `"true"` (case-insensitive) → `true`.
+/// - Any other value → `false` (strict: unrecognized values don't activate
+///   multi-process to avoid accidental double-memory by a typo).
+///
+/// Extracted as a pure function so it can be unit-tested without env mutation.
+pub(crate) fn parse_multi_process_flag(raw: Option<&str>) -> bool {
+    match raw {
+        Some(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+        None => false,
     }
 }
 
@@ -1842,5 +1901,28 @@ mod tests {
             true, // per_model_memory_pattern: true (default)
         );
         assert!(def2.memory_pattern);
+    }
+
+    // -----------------------------------------------------------------
+    // EMBED_MULTI_PROCESS flag parser — pure function, no env mutation.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_multi_process_flag_cases() {
+        use super::parse_multi_process_flag;
+        // Default off when unset.
+        assert!(!parse_multi_process_flag(None));
+        // Explicit off values.
+        assert!(!parse_multi_process_flag(Some("0")));
+        assert!(!parse_multi_process_flag(Some("false")));
+        assert!(!parse_multi_process_flag(Some("")));
+        // On values.
+        assert!(parse_multi_process_flag(Some("1")));
+        assert!(parse_multi_process_flag(Some("true")));
+        assert!(parse_multi_process_flag(Some("True")));
+        assert!(parse_multi_process_flag(Some("TRUE")));
+        // Unrecognized values must NOT activate multi-process (typo guard).
+        assert!(!parse_multi_process_flag(Some("yes")));
+        assert!(!parse_multi_process_flag(Some("on")));
     }
 }

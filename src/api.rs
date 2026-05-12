@@ -213,14 +213,69 @@ pub async fn embeddings(
     // non-padded token lengths across all unique miss texts.
     let total_tokens: u32 = token_ids.iter().map(|v| v.len() as u32).sum();
 
-    // Run inference via batcher (if enabled) or legacy spawn_blocking path.
+    // Run inference via worker pool (multi-process), batcher, or legacy spawn_blocking path.
     // Only the miss set flows through here.
+    //
+    // Worker pool path: dispatch raw pending_texts to the worker process; the
+    // worker handles its own tokenization + inference internally.
     //
     // Cache inserts happen AFTER successful inference — if any error path
     // below is taken, we never populate the cache with a partial result.
     //
     // Note: batcher already calls record_inference inside dispatch_batch — do not call it here.
-    let miss_vectors = if let Some(b) = &entry.batcher {
+    let max_seq_len: u32 = token_ids.iter().map(|v| v.len() as u32).max().unwrap_or(1);
+    let miss_vectors = if let Some(pool) = state.worker_pool.as_ref() {
+        // Multi-process path: send raw texts to the worker; token_ids were
+        // already computed above for the total_tokens billing count only.
+        let infer_start = std::time::Instant::now();
+        let resp = pool
+            .dispatch(&model_name, pending_texts.clone(), max_seq_len)
+            .await;
+        let infer_elapsed = infer_start.elapsed();
+        match resp {
+            Ok(crate::ipc::protocol::InferResponse::Ok { vectors, dims, .. }) => {
+                crate::metrics::record_inference(&model_name, infer_elapsed, vectors.len());
+                let _ = dims; // dims validated implicitly by downstream scatter length check
+                vectors
+            }
+            Ok(crate::ipc::protocol::InferResponse::Err {
+                request_id,
+                message,
+            }) => {
+                tracing::error!(
+                    model = %model_name,
+                    request_id,
+                    worker_error = %message,
+                    "worker returned inference error",
+                );
+                crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: ErrorDetail {
+                            message: "inference failed".to_string(),
+                            error_type: "server_error",
+                        },
+                    }),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                tracing::error!(model = %model_name, error = ?e, "worker_pool dispatch failed");
+                crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: ErrorDetail {
+                            message: "inference failed".to_string(),
+                            error_type: "server_error",
+                        },
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    } else if let Some(b) = &entry.batcher {
         match b.embed_tokens(token_ids).await {
             Ok(v) => v,
             Err(crate::batcher::BatchError::QueueFull(e)) => {
@@ -669,6 +724,7 @@ mod tests {
             rerank_semaphore: None,
             embed_max_input_array: cap,
             rerank_max_input_docs: 32,
+            worker_pool: None,
         })
     }
 
