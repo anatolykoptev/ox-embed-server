@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-#[allow(dead_code)] // Wave 1.2+ — used by WorkerClient / IpcServer
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InferRequest {
     pub request_id: u64,
@@ -9,7 +8,6 @@ pub struct InferRequest {
     pub max_seq_len: u32,
 }
 
-#[allow(dead_code)] // Wave 1.2+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum InferResponse {
     Ok {
@@ -23,7 +21,6 @@ pub enum InferResponse {
     },
 }
 
-#[allow(dead_code)] // Wave 1.2+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ControlMessage {
     Ping,

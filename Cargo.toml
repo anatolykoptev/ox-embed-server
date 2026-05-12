@@ -78,3 +78,15 @@ tempfile = "3"
 # std::env::set_var. std::env::set_var is unsafe since Rust 1.82 (glibc
 # setenv is non-reentrant); concurrent calls from parallel test threads = UB.
 serial_test = "3"
+
+[[bin]]
+name = "embed-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "embed-worker"
+path = "src/bin/worker.rs"
+
+[lib]
+name = "embed_server"
+path = "src/lib.rs"

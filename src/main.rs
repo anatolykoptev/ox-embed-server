@@ -7,7 +7,6 @@ mod cache;
 mod cache_flow;
 mod config;
 mod evictable_pool;
-mod ipc;
 mod metrics;
 mod model;
 mod model_reranker;

@@ -1,11 +1,9 @@
 use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-#[allow(dead_code)] // Wave 1.2+
 pub const MAX_FRAME_BYTES: u32 = 64 * 1024 * 1024; // 64 MiB safety cap
 
 /// Writes a length-prefixed bincode-encoded message to the stream.
-#[allow(dead_code)] // Wave 1.2+
 pub async fn write_frame<W, T>(stream: &mut W, value: &T) -> io::Result<()>
 where
     W: AsyncWriteExt + Unpin,
@@ -25,7 +23,6 @@ where
 }
 
 /// Reads a length-prefixed bincode-encoded message from the stream.
-#[allow(dead_code)] // Wave 1.2+
 pub async fn read_frame<R, T>(stream: &mut R) -> io::Result<T>
 where
     R: AsyncReadExt + Unpin,
