@@ -22,6 +22,7 @@ moka = { version = "0.12", features = ["sync"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false }
 tokio-util = { version = "0.7", features = ["rt"] }
+bincode = { version = "2.0.0-rc.3", features = ["serde"] }
 
 # Phase H.18 — OTEL distributed tracing. Pipes tracing::span!/info_span!/
 # #[instrument] into Jaeger via OTLP gRPC, correlated with memdb-go traces
