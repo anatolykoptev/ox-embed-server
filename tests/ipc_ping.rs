@@ -21,6 +21,7 @@ impl Drop for ChildGuard {
 }
 
 #[tokio::test]
+#[ignore = "Wave 2 will reintroduce control channel; worker now speaks InferRequest only"]
 async fn supervisor_pings_worker() {
     let socket: PathBuf =
         std::env::temp_dir().join(format!("embed-worker-test-{}.sock", std::process::id()));
