@@ -1350,7 +1350,8 @@ mod arena_shrink_tests {
 /// Concurrency limit is enforced by the caller (worker main loop) via
 /// `tokio::Semaphore` matching `EMBED_WORKER_POOL_SIZE`.
 // Used by the `embed-worker` binary; the `embed-server` binary does not
-// construct it, hence the dead_code allow below.
+// construct it. The allow below is intentional: the lib crate is compiled
+// for both binaries; from `embed-server`'s perspective these items are unused.
 #[allow(dead_code)]
 pub struct StandaloneEmbedder {
     inner: EmbedModel,

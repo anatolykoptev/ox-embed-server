@@ -56,7 +56,7 @@ async fn worker_infers_e5_batch() {
         .spawn()
         .expect("spawn worker binary");
 
-    let mut guard = ChildGuard {
+    let _guard = ChildGuard {
         child: Some(child),
         socket: socket.clone(),
     };
@@ -73,6 +73,8 @@ async fn worker_infers_e5_batch() {
     let mut conn = UnixStream::connect(&socket)
         .await
         .expect("connect to worker UDS");
+    // NOTE: max_seq_len is not yet honoured by the worker (Phase 5 wires it).
+    // Send 128 to match plan, but model uses its configured max_len internally.
     let req = InferRequest {
         request_id: 1,
         model: "multilingual-e5-large".into(),
@@ -103,9 +105,5 @@ async fn worker_infers_e5_batch() {
         }
         InferResponse::Err { message, .. } => panic!("inference failed: {message}"),
     }
-
-    if let Some(mut c) = guard.child.take() {
-        let _ = c.kill();
-        let _ = c.wait();
-    }
+    // `_guard` drops here — ChildGuard::drop calls kill() + wait() + socket cleanup.
 }

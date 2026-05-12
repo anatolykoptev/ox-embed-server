@@ -13,12 +13,19 @@ use std::sync::Arc;
 use tokio::net::UnixListener;
 use tokio::sync::Semaphore;
 
+fn require_env(var: &str) -> anyhow::Result<String> {
+    std::env::var(var).map_err(|_e| {
+        tracing::error!(var, "required environment variable missing");
+        anyhow::anyhow!("required env var missing: {var}")
+    })
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let model_name = std::env::var("EMBED_WORKER_MODEL")?;
-    let socket_path: PathBuf = std::env::var("EMBED_WORKER_SOCKET")?.into();
+    let model_name = require_env("EMBED_WORKER_MODEL")?;
+    let socket_path: PathBuf = require_env("EMBED_WORKER_SOCKET")?.into();
     let intra_threads: usize = std::env::var("EMBED_WORKER_INTRA_THREADS")
         .unwrap_or_else(|_| "2".into())
         .parse()?;
@@ -28,10 +35,15 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(model = %model_name, ?socket_path, intra_threads, pool_size, "worker starting");
 
-    let cfg = Config::from_env().map_err(|e| anyhow::anyhow!("config error: {e}"))?;
+    let cfg = Config::from_env().map_err(|e| {
+        tracing::error!(error = %e, "config load failed");
+        anyhow::anyhow!("config: {e}")
+    })?;
     let embedder = Arc::new(
-        StandaloneEmbedder::load(&model_name, &cfg, intra_threads, pool_size)
-            .map_err(|e| anyhow::anyhow!("model load failed: {e}"))?,
+        StandaloneEmbedder::load(&model_name, &cfg, intra_threads, pool_size).map_err(|e| {
+            tracing::error!(error = %e, model = %model_name, "model load failed");
+            anyhow::anyhow!("load failed: {e}")
+        })?,
     );
     let semaphore = Arc::new(Semaphore::new(pool_size));
 
