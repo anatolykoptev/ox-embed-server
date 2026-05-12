@@ -73,6 +73,17 @@ async fn main() -> anyhow::Result<()> {
         anyhow::anyhow!("config: {e}")
     })?;
 
+    // Register the shared CPU arena BEFORE any Session::builder() call.
+    // Each worker is a fresh process — the parent supervisor's registration
+    // doesn't carry over. RerankerModel::load and SpladeModel::load both
+    // assert this; EmbedModel::load silently falls back to per-session
+    // BFCArena without it (less efficient).
+    if let Err(e) = embed_server::arena::register_shared_cpu_arena() {
+        tracing::warn!(error = %e, "shared arena registration failed; sessions will use per-session BFCArena");
+    } else {
+        tracing::info!("shared CPU arena registered (worker)");
+    }
+
     let loaded = match kind.as_str() {
         "embed" => LoadedModel::Embed(
             StandaloneEmbedder::load(&model_name, &cfg, intra_threads, pool_size).map_err(|e| {
