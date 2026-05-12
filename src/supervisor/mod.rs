@@ -1,10 +1,9 @@
 //! Supervisor — manages child worker processes per model.
 //!
-//! Phase 2 scaffold: spawn workers, route requests through WorkerPool.
-//! Auto-restart watchdog lands in Wave 2.5.
+//! Wave 2.5: WorkerHandle replaced by WorkerSupervisor (watchdog + auto-restart).
 
 pub mod handle;
 pub mod pool;
 
-pub use handle::{SpawnSpec, WorkerHandle};
+pub use handle::{SpawnSpec, WorkerSupervisor};
 pub use pool::WorkerPool;

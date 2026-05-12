@@ -1,14 +1,10 @@
-//! End-to-end: WorkerPool spawns a real worker, dispatches inference via the
-//! pool, verifies response. Skips if model env not set.
-
-#[path = "common/mod.rs"]
-mod common;
-// Note: SpawnSpec uses kill_on_drop, so we don't strictly need ChildGuard
-// for the spawned worker — but socket file cleanup still benefits.
-use common::ChildGuard;
+//! End-to-end: WorkerSupervisor launches a real worker, dispatches inference via
+//! the pool, verifies response. Skips if model env not set.
+//!
+//! Wave 2.5: replaced WorkerHandle::spawn with WorkerSupervisor::launch.
 
 use embed_server::ipc::protocol::InferResponse;
-use embed_server::supervisor::{SpawnSpec, WorkerHandle, WorkerPool};
+use embed_server::supervisor::{SpawnSpec, WorkerPool, WorkerSupervisor};
 use std::path::PathBuf;
 
 #[tokio::test]
@@ -26,7 +22,6 @@ async fn pool_dispatches_to_spawned_worker() {
     let socket_dir: PathBuf =
         std::env::temp_dir().join(format!("embed-pool-test-{}", std::process::id()));
 
-    // Resolve worker bin via cargo env
     let worker_bin: PathBuf = env!("CARGO_BIN_EXE_embed-worker").into();
 
     let spec = SpawnSpec {
@@ -42,17 +37,12 @@ async fn pool_dispatches_to_spawned_worker() {
         ],
     };
 
-    let handle = WorkerHandle::spawn(spec).await.expect("spawn worker");
-    let socket_path = handle.socket_path.clone();
-
-    // Use ChildGuard just for socket cleanup; the tokio Child has kill_on_drop.
-    let _socket_guard = ChildGuard {
-        child: None,
-        socket: socket_path,
-    };
+    let supervisor = WorkerSupervisor::launch(spec)
+        .await
+        .expect("launch supervisor");
 
     let pool = WorkerPool::new();
-    pool.add(handle).await;
+    pool.add(supervisor).await;
 
     let resp = pool
         .dispatch(
@@ -70,7 +60,7 @@ async fn pool_dispatches_to_spawned_worker() {
         InferResponse::Err { message, .. } => panic!("infer failed: {message}"),
     }
 
-    // Dispatch to unknown model errors out
+    // Dispatch to unknown model errors out.
     let err = pool
         .dispatch("nonexistent-model", vec!["x".into()], 64)
         .await
@@ -78,7 +68,7 @@ async fn pool_dispatches_to_spawned_worker() {
     let msg = format!("{err}");
     assert!(msg.contains("no worker for model"), "got: {msg}");
 
-    // Verify models() lists the registered model
+    // Verify models() lists the registered model.
     let models = pool.models().await;
     assert!(
         models.contains(&"multilingual-e5-large".to_string()),
@@ -90,7 +80,5 @@ async fn pool_dispatches_to_spawned_worker() {
         "only one model registered, got: {models:?}"
     );
 
-    // Clean up socket directory
-    drop(_socket_guard);
     let _ = std::fs::remove_dir_all(&socket_dir);
 }

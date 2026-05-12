@@ -16,7 +16,6 @@ mod model_splade;
 mod onnx_cache;
 mod otel;
 mod pool;
-#[allow(dead_code)] // supervisor::WorkerHandle fields and pool::models used in future waves
 mod supervisor;
 mod token_cache;
 mod types;
@@ -535,17 +534,17 @@ async fn main() {
                 intra_threads,
                 env_extra: Vec::new(), // parent env is inherited by tokio::process::Command
             };
-            let handle = crate::supervisor::WorkerHandle::spawn(spec)
+            let supervisor = crate::supervisor::WorkerSupervisor::launch(spec)
                 .await
                 .unwrap_or_else(|e| {
                     tracing::error!(
                         model = %model_def.name,
                         error = ?e,
-                        "worker spawn failed"
+                        "worker supervisor launch failed"
                     );
                     std::process::exit(1);
                 });
-            pool.add(handle).await;
+            pool.add(supervisor).await;
         }
         Some(Arc::new(pool))
     } else {

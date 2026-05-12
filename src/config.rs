@@ -322,8 +322,8 @@ pub struct Config {
     /// `embed-worker` child process communicating over Unix domain sockets.
     ///
     /// When `false` (default), the server runs all models in-process (legacy
-    /// behaviour, unchanged). When `true`, `WorkerHandle::spawn` is called
-    /// for each model at startup; HTTP routing via workers lands in Wave 2.4.
+    /// behaviour, unchanged). When `true`, `WorkerSupervisor::launch` is called
+    /// for each model at startup; HTTP routing via workers landed in Wave 2.4.
     ///
     /// Set via `EMBED_MULTI_PROCESS=1` or `EMBED_MULTI_PROCESS=true`.
     pub multi_process: bool,
@@ -335,7 +335,7 @@ pub struct Config {
     /// Directory for worker Unix domain sockets in multi-process mode.
     ///
     /// Each model gets `<dir>/<model_name>.sock`. The directory is created
-    /// by `WorkerHandle::spawn` if it does not exist.
+    /// by `WorkerSupervisor::launch` if it does not exist.
     ///
     /// Set via `EMBED_WORKER_SOCKET_DIR` (default `/tmp/embed-workers`).
     /// Ignored when `multi_process` is `false`.
