@@ -1349,6 +1349,9 @@ mod arena_shrink_tests {
 /// Worker creates one on startup and calls `infer` per IPC request.
 /// Concurrency limit is enforced by the caller (worker main loop) via
 /// `tokio::Semaphore` matching `EMBED_WORKER_POOL_SIZE`.
+// Used by the `embed-worker` binary; the `embed-server` binary does not
+// construct it, hence the dead_code allow below.
+#[allow(dead_code)]
 pub struct StandaloneEmbedder {
     inner: EmbedModel,
     dims: u32,
@@ -1360,6 +1363,8 @@ impl StandaloneEmbedder {
     ///
     /// `pool_size` maps to the ONNX session pool; for the worker process a
     /// value of 1 is typical (concurrency limited externally by the semaphore).
+    // Called only from embed-worker binary, not embed-server binary.
+    #[allow(dead_code)]
     pub fn load(
         model_name: &str,
         cfg: &crate::config::Config,
@@ -1377,7 +1382,7 @@ impl StandaloneEmbedder {
             intra_threads,
             false, // auto_truncate — worker does not silently truncate
             pool_size,
-            0,     // idle_evict_secs — disabled; worker is short-lived
+            0, // idle_evict_secs — disabled; worker is short-lived
         )?;
         Ok(Self { inner, dims })
     }
@@ -1387,6 +1392,8 @@ impl StandaloneEmbedder {
     /// `_max_seq_len` is currently unused — sequence capping is handled by the
     /// tokenizer config and `EmbedModel` internals. Phase 5 will wire
     /// per-request seq-len overrides once the IPC protocol is extended.
+    // Called only from embed-worker binary, not embed-server binary.
+    #[allow(dead_code)]
     #[allow(unused_variables)] // TODO(phase-5): wire _max_seq_len into tokenizer truncation
     pub fn infer(
         &self,

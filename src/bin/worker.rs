@@ -35,11 +35,11 @@ async fn main() -> anyhow::Result<()> {
     );
     let semaphore = Arc::new(Semaphore::new(pool_size));
 
-    if socket_path.exists() {
-        if let Err(e) = std::fs::remove_file(&socket_path) {
-            tracing::error!(path = ?socket_path, error = %e, "stale socket cleanup failed");
-            return Err(e.into());
-        }
+    if socket_path.exists()
+        && let Err(e) = std::fs::remove_file(&socket_path)
+    {
+        tracing::error!(path = ?socket_path, error = %e, "stale socket cleanup failed");
+        return Err(e.into());
     }
     let listener = UnixListener::bind(&socket_path)?;
     tracing::info!("worker ready");
@@ -76,10 +76,8 @@ async fn main() -> anyhow::Result<()> {
                 let texts = req.texts;
                 let max_seq_len = req.max_seq_len;
                 let emb = embedder.clone();
-                let resp = match tokio::task::spawn_blocking(move || {
-                    emb.infer(texts, max_seq_len)
-                })
-                .await
+                let resp = match tokio::task::spawn_blocking(move || emb.infer(texts, max_seq_len))
+                    .await
                 {
                     Ok(Ok((vectors, dims))) => InferResponse::Ok {
                         request_id: req_id,
