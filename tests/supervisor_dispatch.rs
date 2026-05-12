@@ -80,7 +80,15 @@ async fn pool_dispatches_to_spawned_worker() {
 
     // Verify models() lists the registered model
     let models = pool.models().await;
-    assert_eq!(models, vec!["multilingual-e5-large".to_string()]);
+    assert!(
+        models.contains(&"multilingual-e5-large".to_string()),
+        "models() should include the registered model, got: {models:?}"
+    );
+    assert_eq!(
+        models.len(),
+        1,
+        "only one model registered, got: {models:?}"
+    );
 
     // Clean up socket directory
     drop(_socket_guard);
