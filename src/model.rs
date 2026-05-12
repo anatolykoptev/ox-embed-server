@@ -1341,3 +1341,68 @@ mod arena_shrink_tests {
             .unwrap_or(0.0)
     }
 }
+
+// ── StandaloneEmbedder ────────────────────────────────────────────────────────
+
+/// Standalone embedder for worker process — owns model state, no batcher/queue.
+///
+/// Worker creates one on startup and calls `infer` per IPC request.
+/// Concurrency limit is enforced by the caller (worker main loop) via
+/// `tokio::Semaphore` matching `EMBED_WORKER_POOL_SIZE`.
+// Used by the `embed-worker` binary; the `embed-server` binary does not
+// construct it. The allow below is intentional: the lib crate is compiled
+// for both binaries; from `embed-server`'s perspective these items are unused.
+#[allow(dead_code)]
+pub struct StandaloneEmbedder {
+    inner: EmbedModel,
+    dims: u32,
+}
+
+impl StandaloneEmbedder {
+    /// Load a single model by name. Looks up `ModelDef` in `cfg.models` and
+    /// calls `EmbedModel::load`.
+    ///
+    /// `pool_size` maps to the ONNX session pool; for the worker process a
+    /// value of 1 is typical (concurrency limited externally by the semaphore).
+    // Called only from embed-worker binary, not embed-server binary.
+    #[allow(dead_code)]
+    pub fn load(
+        model_name: &str,
+        cfg: &crate::config::Config,
+        intra_threads: usize,
+        pool_size: usize,
+    ) -> Result<Self, String> {
+        let def = cfg
+            .models
+            .iter()
+            .find(|m| m.name == model_name)
+            .ok_or_else(|| format!("model {model_name} not found in EMBED_MODELS"))?;
+        let dims = def.dim as u32;
+        let inner = EmbedModel::load(
+            def,
+            intra_threads,
+            false, // auto_truncate — worker does not silently truncate
+            pool_size,
+            0, // idle_evict_secs — disabled; worker is short-lived
+        )?;
+        Ok(Self { inner, dims })
+    }
+
+    /// Tokenize + embed in one call. Returns `(vectors, dims)`.
+    ///
+    /// `_max_seq_len` is currently unused — sequence capping is handled by the
+    /// tokenizer config and `EmbedModel` internals. Phase 5 will wire
+    /// per-request seq-len overrides once the IPC protocol is extended.
+    // Called only from embed-worker binary, not embed-server binary.
+    #[allow(dead_code)]
+    #[allow(unused_variables)] // TODO(phase-5): wire _max_seq_len into tokenizer truncation
+    pub fn infer(
+        &self,
+        texts: Vec<String>,
+        _max_seq_len: u32,
+    ) -> Result<(Vec<Vec<f32>>, u32), String> {
+        let ids = self.inner.tokenize(&texts)?;
+        let vecs = self.inner.embed_tokens(&ids)?;
+        Ok((vecs, self.dims))
+    }
+}

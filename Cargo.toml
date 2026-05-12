@@ -5,6 +5,7 @@ edition = "2024"
 license = "MIT"
 
 [dependencies]
+anyhow = "1"
 axum = "0.8"
 base64 = "0.22"
 tokio = { version = "1", features = ["full"] }
@@ -22,6 +23,7 @@ moka = { version = "0.12", features = ["sync"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false }
 tokio-util = { version = "0.7", features = ["rt"] }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
 
 # Phase H.18 — OTEL distributed tracing. Pipes tracing::span!/info_span!/
 # #[instrument] into Jaeger via OTLP gRPC, correlated with memdb-go traces
@@ -77,3 +79,15 @@ tempfile = "3"
 # std::env::set_var. std::env::set_var is unsafe since Rust 1.82 (glibc
 # setenv is non-reentrant); concurrent calls from parallel test threads = UB.
 serial_test = "3"
+
+[lib]
+name = "embed_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "embed-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "embed-worker"
+path = "src/bin/worker.rs"
