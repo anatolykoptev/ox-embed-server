@@ -1,25 +1,15 @@
 //! Drives the WorkerClient against a spawned embed-worker binary
 //! loading multilingual-e5-large. Skips if env not set.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::ChildGuard;
+
 use embed_server::ipc::client::WorkerClient;
 use embed_server::ipc::protocol::InferResponse;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::Duration;
-
-struct ChildGuard {
-    child: Option<Child>,
-    socket: PathBuf,
-}
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        if let Some(mut c) = self.child.take() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-        let _ = std::fs::remove_file(&self.socket);
-    }
-}
 
 #[tokio::test]
 async fn client_roundtrip_e5() {
@@ -55,7 +45,7 @@ async fn client_roundtrip_e5() {
         socket: socket.clone(),
     };
 
-    // 30s for cold load
+    // Wait up to 30s for the worker to create the socket (cold model load ~5-10s).
     for _ in 0..300 {
         if socket.exists() {
             break;
@@ -79,11 +69,12 @@ async fn client_roundtrip_e5() {
         .expect("io");
     match resp {
         InferResponse::Ok {
-            request_id,
+            // request_id correlation is now verified inside WorkerClient::infer
+            // (see Fix 1 — mismatch returns InvalidData).
+            request_id: _,
             vectors,
             dims,
         } => {
-            assert_eq!(request_id, 0);
             assert_eq!(vectors.len(), 1);
             assert_eq!(dims, 1024);
             assert_eq!(vectors[0].len(), 1024);
@@ -102,11 +93,12 @@ async fn client_roundtrip_e5() {
         .expect("io");
     match resp2 {
         InferResponse::Ok {
-            request_id,
+            // request_id correlation is now verified inside WorkerClient::infer
+            // (see Fix 1 — mismatch returns InvalidData).
+            request_id: _,
             vectors,
             dims,
         } => {
-            assert_eq!(request_id, 1);
             assert_eq!(vectors.len(), 2);
             assert_eq!(dims, 1024);
         }

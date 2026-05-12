@@ -49,6 +49,10 @@ impl WorkerClient {
         texts: Vec<String>,
         max_seq_len: u32,
     ) -> std::io::Result<InferResponse> {
+        // next_idx and req_id are independent Relaxed atomics — under concurrent callers
+        // the pairing (which slot got which id) is arbitrary, but each callsite gets a
+        // consistent (idx, req_id) snapshot. Pool slots serialize via Mutex so a single
+        // slot's req/resp interleaving is correct.
         let idx = (self.next_idx.fetch_add(1, Ordering::Relaxed) as usize) % self.pool.len();
         let req_id = self.request_counter.fetch_add(1, Ordering::Relaxed);
         let req = InferRequest {
@@ -61,6 +65,19 @@ impl WorkerClient {
         let mut stream = conn.lock().await;
         write_frame(&mut *stream, &req).await?;
         let resp: InferResponse = read_frame(&mut *stream).await?;
+        // NOTE: on read_frame/write_frame error the stream is left in undefined state.
+        // This pool slot becomes effectively unusable until WorkerSupervisor (Wave 2.5)
+        // detects the worker death and reconnects all slots.
+        let resp_id = match &resp {
+            InferResponse::Ok { request_id, .. } => *request_id,
+            InferResponse::Err { request_id, .. } => *request_id,
+        };
+        if resp_id != req_id {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("response id {resp_id} != request id {req_id}"),
+            ));
+        }
         Ok(resp)
     }
 }
