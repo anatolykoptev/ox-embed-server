@@ -15,6 +15,7 @@ mod onnx_cache;
 mod otel;
 mod pool;
 mod token_cache;
+mod ipc;
 mod types;
 
 use std::collections::HashMap;
