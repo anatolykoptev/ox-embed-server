@@ -318,6 +318,28 @@ pub struct Config {
     ///
     /// **Override**: set `RERANK_MAX_INPUT_DOCS` to a positive integer.
     pub rerank_max_input_docs: usize,
+    /// Enable multi-process mode — each embedding model runs in a separate
+    /// `embed-worker` child process communicating over Unix domain sockets.
+    ///
+    /// When `false` (default), the server runs all models in-process (legacy
+    /// behaviour, unchanged). When `true`, `WorkerHandle::spawn` is called
+    /// for each model at startup; HTTP routing via workers lands in Wave 2.4.
+    ///
+    /// Set via `EMBED_MULTI_PROCESS=1` or `EMBED_MULTI_PROCESS=true`.
+    pub multi_process: bool,
+    /// Path to the `embed-worker` binary to spawn in multi-process mode.
+    ///
+    /// Set via `EMBED_WORKER_BIN` (default `/usr/local/bin/embed-worker`).
+    /// Ignored when `multi_process` is `false`.
+    pub worker_bin_path: std::path::PathBuf,
+    /// Directory for worker Unix domain sockets in multi-process mode.
+    ///
+    /// Each model gets `<dir>/<model_name>.sock`. The directory is created
+    /// by `WorkerHandle::spawn` if it does not exist.
+    ///
+    /// Set via `EMBED_WORKER_SOCKET_DIR` (default `/tmp/embed-workers`).
+    /// Ignored when `multi_process` is `false`.
+    pub worker_socket_dir: std::path::PathBuf,
 }
 
 impl Config {
@@ -578,6 +600,16 @@ impl Config {
             Err(_) => 32,
         };
 
+        let multi_process = env::var("EMBED_MULTI_PROCESS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let worker_bin_path = env::var("EMBED_WORKER_BIN")
+            .unwrap_or_else(|_| "/usr/local/bin/embed-worker".into())
+            .into();
+        let worker_socket_dir = env::var("EMBED_WORKER_SOCKET_DIR")
+            .unwrap_or_else(|_| "/tmp/embed-workers".into())
+            .into();
+
         Ok(Config {
             port,
             models,
@@ -608,6 +640,9 @@ impl Config {
             idle_evict_secs,
             embed_max_input_array,
             rerank_max_input_docs,
+            multi_process,
+            worker_bin_path,
+            worker_socket_dir,
         })
     }
 }

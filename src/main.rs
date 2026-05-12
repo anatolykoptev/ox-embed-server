@@ -7,6 +7,8 @@ mod cache;
 mod cache_flow;
 mod config;
 mod evictable_pool;
+#[allow(dead_code)] // ipc items used by supervisor submodule; unused from main.rs directly
+mod ipc;
 mod metrics;
 mod model;
 mod model_reranker;
@@ -14,6 +16,8 @@ mod model_splade;
 mod onnx_cache;
 mod otel;
 mod pool;
+#[allow(dead_code)] // WorkerPool::dispatch and WorkerHandle fields used in Wave 2.4
+mod supervisor;
 mod token_cache;
 mod types;
 
@@ -505,6 +509,44 @@ async fn main() {
         }
     };
 
+    // Spawn worker pool if multi-process mode is enabled.
+    // Workers are idle for now — API routing via workers lands in Wave 2.4.
+    // TODO(Wave 2.4): spawn workers for reranker and splade models too.
+    // For now embedders only — api.rs routing in Wave 2.4 will handle the
+    // rerank/splade paths.
+    let worker_pool: Option<Arc<crate::supervisor::WorkerPool>> = if cfg.multi_process {
+        tracing::info!("multi-process mode enabled — spawning worker pool");
+        let pool = crate::supervisor::WorkerPool::new();
+        for model_def in &cfg.models {
+            // Inherit per-model session knobs from Config.
+            // No separate per-model multi-process tuning in Wave 2.3.
+            let pool_size = cfg.embed_pool_size.max(1);
+            let intra_threads = cfg.intra_threads.max(1);
+            let spec = crate::supervisor::SpawnSpec {
+                model: model_def.name.clone(),
+                worker_bin: cfg.worker_bin_path.clone(),
+                socket_dir: cfg.worker_socket_dir.clone(),
+                pool_size,
+                intra_threads,
+                env_extra: Vec::new(), // parent env is inherited by tokio::process::Command
+            };
+            let handle = crate::supervisor::WorkerHandle::spawn(spec)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::error!(
+                        model = %model_def.name,
+                        error = ?e,
+                        "worker spawn failed"
+                    );
+                    std::process::exit(1);
+                });
+            pool.add(handle).await;
+        }
+        Some(Arc::new(pool))
+    } else {
+        None
+    };
+
     let state = Arc::new(AppState {
         models: model_entries,
         rerankers: reranker_entries,
@@ -517,6 +559,7 @@ async fn main() {
         rerank_semaphore,
         embed_max_input_array: cfg.embed_max_input_array,
         rerank_max_input_docs: cfg.rerank_max_input_docs,
+        worker_pool,
     });
 
     let metrics_handle = prom_handle.clone();

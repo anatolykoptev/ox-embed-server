@@ -669,6 +669,7 @@ mod tests {
             rerank_semaphore: None,
             embed_max_input_array: cap,
             rerank_max_input_docs: 32,
+            worker_pool: None,
         })
     }
 
