@@ -32,7 +32,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 COPY src ./src
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/app/target,sharing=locked \
-    touch src/main.rs src/bin/worker.rs && \
+    touch src/main.rs src/bin/worker.rs src/lib.rs && \
     cargo build --release --locked --bins && \
     mkdir -p /binaries && \
     cp target/release/embed-server /binaries/embed-server && \
