@@ -16,7 +16,7 @@ mod model_splade;
 mod onnx_cache;
 mod otel;
 mod pool;
-#[allow(dead_code)] // WorkerPool::dispatch and WorkerHandle fields used in Wave 2.4
+#[allow(dead_code)] // supervisor::WorkerHandle fields and pool::models used in future waves
 mod supervisor;
 mod token_cache;
 mod types;
@@ -517,9 +517,8 @@ async fn main() {
     let worker_pool: Option<Arc<crate::supervisor::WorkerPool>> = if cfg.multi_process {
         tracing::info!("multi-process mode enabled — spawning worker pool");
         tracing::warn!(
-            "EMBED_MULTI_PROCESS=1 — workers spawned, but API routing still goes through in-process models in this build. \
-             This doubles resident memory until Wave 2.4 wires the API cutover. \
-             For production: enable only after the embed-server image includes Wave 2.4 routing changes."
+            "EMBED_MULTI_PROCESS=1 — embed models route through workers; rerank/splade remain in-process. \
+             In-process embed sessions also loaded (memory overhead until Phase 3 lazy-load lands)."
         );
         let pool = crate::supervisor::WorkerPool::new();
         for model_def in &cfg.models {
