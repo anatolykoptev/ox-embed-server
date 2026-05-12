@@ -32,13 +32,19 @@ async fn main() -> std::io::Result<()> {
     tracing::info!(model = %cfg.model, socket = ?cfg.socket_path, "worker starting");
 
     if cfg.socket_path.exists() {
-        std::fs::remove_file(&cfg.socket_path)?;
+        std::fs::remove_file(&cfg.socket_path).map_err(|e| {
+            tracing::error!(path = ?cfg.socket_path, error = %e, "failed to remove stale socket");
+            e
+        })?;
     }
     let listener = UnixListener::bind(&cfg.socket_path)?;
     tracing::info!("worker listening on UDS");
 
     loop {
-        let (mut stream, _) = listener.accept().await?;
+        let (mut stream, _) = listener.accept().await.map_err(|e| {
+            tracing::error!(error = %e, "accept failed");
+            e
+        })?;
         let model = cfg.model.clone();
         tokio::spawn(async move {
             loop {
@@ -53,8 +59,8 @@ async fn main() -> std::io::Result<()> {
                         std::process::exit(0);
                     }
                     other => {
-                        tracing::warn!(?other, "unexpected message");
-                        ControlMessage::Pong
+                        tracing::warn!(?other, "unexpected control message, closing connection");
+                        break;
                     }
                 };
                 if write_frame(&mut stream, &reply).await.is_err() {

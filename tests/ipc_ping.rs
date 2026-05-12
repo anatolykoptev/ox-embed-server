@@ -1,16 +1,33 @@
 use embed_server::ipc::frame::{read_frame, write_frame};
 use embed_server::ipc::protocol::ControlMessage;
-use std::process::{Command, Stdio};
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use tokio::net::UnixStream;
 
+struct ChildGuard {
+    child: Option<Child>,
+    socket: PathBuf,
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        let _ = std::fs::remove_file(&self.socket);
+    }
+}
+
 #[tokio::test]
 async fn supervisor_pings_worker() {
-    let socket = format!("/home/krolik/embed-worker-test-{}.sock", std::process::id());
+    let socket: PathBuf =
+        std::env::temp_dir().join(format!("embed-worker-test-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
 
     let worker_bin = env!("CARGO_BIN_EXE_embed-worker");
-    let mut child = Command::new(worker_bin)
+    let child = Command::new(worker_bin)
         .env("EMBED_WORKER_MODEL", "test-model")
         .env("EMBED_WORKER_SOCKET", &socket)
         .stdout(Stdio::null())
@@ -18,17 +35,18 @@ async fn supervisor_pings_worker() {
         .spawn()
         .expect("spawn worker");
 
-    // Wait for socket to appear (worker startup race).
+    let mut guard = ChildGuard {
+        child: Some(child),
+        socket: socket.clone(),
+    };
+
     for _ in 0..50 {
-        if std::path::Path::new(&socket).exists() {
+        if socket.exists() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(
-        std::path::Path::new(&socket).exists(),
-        "worker did not create socket"
-    );
+    assert!(socket.exists(), "worker did not create socket");
 
     let mut conn = UnixStream::connect(&socket).await.expect("connect");
     write_frame(&mut conn, &ControlMessage::Ping).await.unwrap();
@@ -38,6 +56,8 @@ async fn supervisor_pings_worker() {
     write_frame(&mut conn, &ControlMessage::Shutdown)
         .await
         .unwrap();
-    let _ = child.wait();
-    let _ = std::fs::remove_file(&socket);
+    if let Some(mut c) = guard.child.take() {
+        let _ = c.wait();
+    }
+    // guard Drop still cleans socket
 }

@@ -79,6 +79,10 @@ tempfile = "3"
 # setenv is non-reentrant); concurrent calls from parallel test threads = UB.
 serial_test = "3"
 
+[lib]
+name = "embed_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "embed-server"
 path = "src/main.rs"
@@ -86,7 +90,3 @@ path = "src/main.rs"
 [[bin]]
 name = "embed-worker"
 path = "src/bin/worker.rs"
-
-[lib]
-name = "embed_server"
-path = "src/lib.rs"
