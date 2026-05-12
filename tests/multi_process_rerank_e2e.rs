@@ -119,7 +119,9 @@ fn multi_process_rerank_e2e() {
     for r in results {
         let idx = r["index"].as_u64().expect("index field");
         assert!(idx < 3, "index {idx} out of range");
-        let score = r["relevance_score"].as_f64().expect("relevance_score field");
+        let score = r["relevance_score"]
+            .as_f64()
+            .expect("relevance_score field");
         assert!(
             score.is_finite(),
             "relevance_score must be finite, got {score}"
