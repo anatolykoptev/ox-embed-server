@@ -262,7 +262,8 @@ pub async fn embeddings(
             Ok(unexpected) => {
                 tracing::error!(
                     model = %model_name,
-                    kind = %unexpected.request_id(),
+                    kind = %unexpected.kind(),
+                    request_id = unexpected.request_id(),
                     "worker returned unexpected response variant for embed request",
                 );
                 crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);

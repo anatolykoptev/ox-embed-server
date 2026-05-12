@@ -178,7 +178,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                     (LoadedModel::Splade(m), WorkerRequest::Splade(r)) => {
-                        match m.encode(r.texts, r.max_seq_len) {
+                        match m.encode(r.texts, r.max_seq_len, r.top_k, r.min_weight) {
                             Ok(sparse) => WorkerResponse::Splade(SpladeResponseOk {
                                 request_id: r.request_id,
                                 sparse,

@@ -154,7 +154,9 @@ pub async fn sparse_embeddings(
     // worker before the in-process per-text spawn_blocking path.
     if let Some(pool) = state.worker_pool.as_ref() {
         let texts = req.input.clone();
-        let resp = pool.dispatch_splade(&model_name, texts, 0).await;
+        let resp = pool
+            .dispatch_splade(&model_name, texts, 0, top_k as u32, min_weight)
+            .await;
         match resp {
             Ok(crate::ipc::protocol::WorkerResponse::Splade(s)) => {
                 let data: Vec<SparseEmbeddingItem> = s

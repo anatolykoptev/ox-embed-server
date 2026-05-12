@@ -91,10 +91,12 @@ impl WorkerPool {
         model: &str,
         texts: Vec<String>,
         max_seq_len: u32,
+        top_k: u32,
+        min_weight: f32,
     ) -> anyhow::Result<WorkerResponse> {
         let client = self.get_client(model).await?;
         Ok(client
-            .dispatch_splade(model.to_string(), texts, max_seq_len)
+            .dispatch_splade(model.to_string(), texts, max_seq_len, top_k, min_weight)
             .await?)
     }
 

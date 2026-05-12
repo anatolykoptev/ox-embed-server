@@ -1440,6 +1440,11 @@ impl StandaloneReranker {
             intra_threads,
             pool_size,
         )?;
+        tracing::info!(
+            model = %model_name,
+            tokenizer_max_len = def.max_len,
+            "reranker loaded; max_seq_len from IPC is advisory (tokenizer truncates at load-time max_len)"
+        );
         Ok(Self { inner })
     }
 
@@ -1492,6 +1497,11 @@ impl StandaloneSplade {
             intra_threads,
             pool_size,
         )?;
+        tracing::info!(
+            model = %model_name,
+            tokenizer_max_len = def.max_len,
+            "splade loaded; max_seq_len from IPC is advisory (tokenizer truncates at load-time max_len)"
+        );
         Ok(Self { inner })
     }
 
@@ -1503,20 +1513,30 @@ impl StandaloneSplade {
     ///
     /// `_max_seq_len` is passed for protocol parity but not yet wired —
     /// truncation is governed by the tokenizer config at load time.
+    ///
+    /// `top_k`: maximum sparse entries per output. 0 means unlimited (passes
+    /// `usize::MAX` to `encode_sparse`, which applies no top-k truncation).
+    ///
+    /// `min_weight`: drop entries with weight <= this threshold. 0.0 disables
+    /// filtering (only exact zeros from the post-ReLU output are dropped).
     #[allow(dead_code)]
     #[allow(unused_variables)]
     pub fn encode(
         &self,
         texts: Vec<String>,
         _max_seq_len: u32,
+        top_k: u32,
+        min_weight: f32,
     ) -> Result<Vec<Vec<(u32, f32)>>, String> {
-        // Default top_k/min_weight — matches api_splade.rs defaults.
-        const TOP_K: usize = 256;
-        const MIN_WEIGHT: f32 = 0.0;
+        let effective_top_k: usize = if top_k == 0 {
+            usize::MAX
+        } else {
+            top_k as usize
+        };
         let mut results = Vec::with_capacity(texts.len());
         for text in texts {
             let ids = self.inner.tokenize(&text)?;
-            let sparse = self.inner.encode_sparse(ids, TOP_K, MIN_WEIGHT)?;
+            let sparse = self.inner.encode_sparse(ids, effective_top_k, min_weight)?;
             results.push(sparse);
         }
         Ok(results)

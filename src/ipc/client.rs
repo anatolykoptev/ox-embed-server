@@ -138,6 +138,8 @@ impl WorkerClient {
         model: String,
         texts: Vec<String>,
         max_seq_len: u32,
+        top_k: u32,
+        min_weight: f32,
     ) -> std::io::Result<WorkerResponse> {
         let req_id = self.request_counter.fetch_add(1, Ordering::Relaxed);
         let texts_len = texts.len();
@@ -147,6 +149,8 @@ impl WorkerClient {
                 model,
                 texts,
                 max_seq_len,
+                top_k,
+                min_weight,
             }))
             .await?;
         if let WorkerResponse::Splade(ref ok) = resp

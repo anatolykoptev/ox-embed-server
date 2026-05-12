@@ -66,11 +66,11 @@ fn multi_process_rerank_e2e() {
     let mut healthy = false;
     for _ in 0..120 {
         std::thread::sleep(Duration::from_millis(500));
-        if let Ok(resp) = reqwest::blocking::get(&health_url) {
-            if resp.status().is_success() {
-                healthy = true;
-                break;
-            }
+        if let Ok(resp) = reqwest::blocking::get(&health_url)
+            && resp.status().is_success()
+        {
+            healthy = true;
+            break;
         }
     }
     if !healthy {

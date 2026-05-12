@@ -48,6 +48,11 @@ pub struct SpladeRequest {
     pub model: String,
     pub texts: Vec<String>,
     pub max_seq_len: u32,
+    /// Maximum sparse entries per output. 0 means unlimited (pass full vocab
+    /// size to the model; the model will apply its own default).
+    pub top_k: u32,
+    /// Drop sparse entries with weight <= this threshold. 0.0 disables filtering.
+    pub min_weight: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -65,6 +70,15 @@ impl WorkerResponse {
             Self::Rerank(r) => r.request_id,
             Self::Splade(r) => r.request_id,
             Self::Err { request_id, .. } => *request_id,
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Embed(_) => "embed",
+            Self::Rerank(_) => "rerank",
+            Self::Splade(_) => "splade",
+            Self::Err { .. } => "err",
         }
     }
 }
@@ -139,6 +153,8 @@ mod tests {
             model: "splade".into(),
             texts: vec!["hi".into()],
             max_seq_len: 128,
+            top_k: 256,
+            min_weight: 0.01,
         }));
         roundtrip(WorkerResponse::Splade(SpladeResponseOk {
             request_id: 3,
@@ -169,5 +185,42 @@ mod tests {
             scores: vec![],
         });
         assert_eq!(resp.request_id(), 99);
+    }
+
+    #[test]
+    fn response_kind_all_variants() {
+        assert_eq!(
+            WorkerResponse::Embed(EmbedResponseOk {
+                request_id: 1,
+                vectors: vec![],
+                dims: 0
+            })
+            .kind(),
+            "embed"
+        );
+        assert_eq!(
+            WorkerResponse::Rerank(RerankResponseOk {
+                request_id: 1,
+                scores: vec![]
+            })
+            .kind(),
+            "rerank"
+        );
+        assert_eq!(
+            WorkerResponse::Splade(SpladeResponseOk {
+                request_id: 1,
+                sparse: vec![]
+            })
+            .kind(),
+            "splade"
+        );
+        assert_eq!(
+            WorkerResponse::Err {
+                request_id: 1,
+                message: "boom".into()
+            }
+            .kind(),
+            "err"
+        );
     }
 }
