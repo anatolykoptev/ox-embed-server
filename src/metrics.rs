@@ -491,6 +491,23 @@ pub fn record_arena_register_skipped() {
 ///
 /// See `record_token_cache_hit` for the batch-increment semantic and
 /// startup pre-warm contract.
+///
+/// ## Computing hit ratio in Grafana / PromQL
+///
+/// The hit ratio is exposed as two split counters (`outcome="hit"` /
+/// `outcome="miss"`), not a precomputed gauge — gauges of ratios are a
+/// Prometheus anti-pattern (loses rate information). Compute in PromQL:
+///
+/// ```promql
+/// sum by (model) (rate(embed_token_cache_total{outcome="hit"}[5m]))
+///   /
+/// sum by (model) (rate(embed_token_cache_total[5m]))
+/// ```
+///
+/// Returns the fraction of token-cache lookups that hit, per model, averaged
+/// over the last 5 minutes. Useful for tuning `TOKEN_CACHE_MAX_ENTRIES` —
+/// ratio < 0.3 means the cache is too small for the workload, > 0.95 means
+/// memory could be reclaimed by shrinking it.
 pub fn record_token_cache_miss(model: &str, n: u64) {
     metrics::counter!(
         "embed_token_cache_total",

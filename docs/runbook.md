@@ -40,6 +40,21 @@ Worker process started but failed to bind UDS. Likely causes:
 
 Watchdog will retry indefinitely with exponential backoff (2s→60s). Per CLAUDE.md "no silent errors" — failure is logged with full error context.
 
+### Token cache hit ratio (tuning `TOKEN_CACHE_MAX_ENTRIES`)
+
+```promql
+sum by (model) (rate(embed_token_cache_total{outcome="hit"}[5m]))
+  /
+sum by (model) (rate(embed_token_cache_total[5m]))
+```
+
+Interpretation:
+- `< 0.3` — cache too small for workload; raise `TOKEN_CACHE_MAX_ENTRIES`.
+- `0.5 – 0.9` — healthy band, no action.
+- `> 0.95` — cache may be over-sized; consider reducing to reclaim memory.
+
+Reranker uses token cache heavily (cross-encoder pair tokenization); embed path bypasses it. Watch the `gte-multi-rerank` series specifically.
+
 ### Rolling back multi-process
 
 ```bash
