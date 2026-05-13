@@ -101,6 +101,11 @@ impl WorkerSupervisor {
         let (child, client) = Self::spawn_one(&supervisor.spec).await?;
         *supervisor.client_slot.write().await = Some(client);
 
+        // Pre-touch the restart counter to 0 — makes "healthy / no restarts"
+        // observable as a present-but-zero series, not absent (which
+        // Prometheus operators read as "metric not wired").
+        crate::metrics::worker_restart_touch(&supervisor.spec.model);
+
         // Hand off the Child to the watchdog task; it owns the Child for its
         // entire lifetime.
         let sup_clone = supervisor.clone();
