@@ -1,0 +1,90 @@
+specification {
+  element person { style { shape: person } }
+  element system
+  element container
+  element component
+}
+
+model {
+  user = person "HTTP client" "memdb-go / go-code / go-nerv / any consumer on the krolik-server Docker network."
+
+  embed_server = system "embed-server" {
+    description '''
+      Unified Rust ONNX sidecar (axum, :8082) serving 4 models:
+      e5-large + jina-code-v2 (embed), gte-multi-rerank (rerank),
+      splade-v3-distilbert (sparse).
+
+      Since 2026-05-12 runs as supervisor + N worker child processes
+      (EMBED_MULTI_PROCESS=1). Each worker owns isolated BFCArena —
+      eliminates jina-code-v2 fragmentation (BUG-004).
+    '''
+
+    supervisor = container "embed-server (supervisor)" {
+      description '''
+        Main process. axum HTTP on :8082. Routes /v1/embeddings,
+        /v1/rerank, /embed_sparse to per-model workers via UDS.
+        Also loads in-process model sessions for the EMBED_MULTI_PROCESS=0
+        legacy fallback path.
+      '''
+      technology "Rust + axum + tokio"
+      icon tech:rust
+
+      worker_pool = component "WorkerPool" {
+        description "HashMap<model, Arc<WorkerSupervisor>>. dispatch_{embed,rerank,splade} polls 30s for client during respawn."
+      }
+      ipc_layer = component "IPC layer (ipc/)" {
+        description "WorkerClient: per-request UDS conn (cancel-safe). postcard tagged-enum frames, 64 MiB cap."
+      }
+      api_handlers = component "API handlers (api*.rs)" {
+        description "axum routes. Worker-pool branch BEFORE legacy in-process dispatch."
+      }
+    }
+
+    worker_e5 = container "embed-worker (e5-large)" {
+      description "KIND=embed. UDS /tmp/embed-workers/multilingual-e5-large.sock. Own OrtEnv + BFCArena."
+      technology "Rust"
+      icon tech:rust
+    }
+    worker_jina = container "embed-worker (jina-code-v2)" {
+      description "KIND=embed. UDS /tmp/embed-workers/jina-code-v2.sock. memory_pattern=false (ALiBi, variable seq)."
+      technology "Rust"
+      icon tech:rust
+    }
+    worker_rerank = container "embed-worker (gte-multi-rerank)" {
+      description "KIND=rerank. UDS /tmp/embed-workers/gte-multi-rerank.sock. Cross-encoder."
+      technology "Rust"
+      icon tech:rust
+    }
+    worker_splade = container "embed-worker (splade-v3-distilbert)" {
+      description "KIND=splade. UDS /tmp/embed-workers/splade-v3-distilbert.sock. Sparse encoder."
+      technology "Rust"
+      icon tech:rust
+    }
+  }
+
+  user -> embed_server.supervisor "POST /v1/embeddings, /v1/rerank, /embed_sparse"
+  embed_server.supervisor -> embed_server.worker_e5 "UDS + postcard"
+  embed_server.supervisor -> embed_server.worker_jina "UDS + postcard"
+  embed_server.supervisor -> embed_server.worker_rerank "UDS + postcard"
+  embed_server.supervisor -> embed_server.worker_splade "UDS + postcard"
+}
+
+views {
+  view index {
+    title "Top level"
+    include user, embed_server, embed_server.supervisor
+    autoLayout LeftRight
+  }
+
+  view multi_process of embed_server {
+    title "Multi-process topology"
+    include *
+    autoLayout TopBottom
+  }
+
+  view supervisor_components of embed_server.supervisor {
+    title "Supervisor components"
+    include *
+    autoLayout LeftRight
+  }
+}

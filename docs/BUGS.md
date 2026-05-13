@@ -146,9 +146,9 @@ Key requirements:
 
 ## BUG-004: jina-code-v2 BFCArena OOM under unbounded `input` arrays + pool=2 concurrency
 
-**Status:** RESOLVED (2026-05-09, 3-layer fix shipped same day)
-**Severity:** Critical (~1 failure/min in prod for ~30 min)
-**Date:** 2026-05-09 (incident discovered, escalated, fully fixed)
+**Status:** RESOLVED (2026-05-09 3-layer fix; **architecturally eliminated 2026-05-12 multi-process refactor — jina-code-v2 now runs in its own process with isolated BFCArena, fragmentation cannot cross-poison other models**)
+**Severity:** Critical (~1 failure/min in prod for ~30 min; later 92% error rate from arena fragmentation cycles motivated the multi-process refactor)
+**Date:** 2026-05-09 (incident discovered, escalated, 3-layer fix shipped same day); 2026-05-12 (root cause eliminated via per-process arena isolation)
 **Component:** ox-embed-server batcher + ONNX Runtime BFCArena + downstream HTTP clients (memdb-go, go-code via go-kit/embed.Client)
 
 ### TL;DR
