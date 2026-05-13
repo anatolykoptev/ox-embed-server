@@ -1,21 +1,39 @@
 use ndarray::ArrayViewD;
 
-/// Build padded i64 tensors for input_ids, attention_mask, token_type_ids
-/// from pre-tokenized `Vec<u32>` ids (one per sequence).
+/// Build padded i64 tensors for input_ids, attention_mask, and optionally
+/// token_type_ids from pre-tokenized `Vec<u32>` ids (one per sequence).
 ///
 /// `attention_mask[i, j] = 1` iff `j < token_ids[i].len()` (synthesised
 /// mask: 1 over real positions, 0 over pad positions). `token_type_ids`
 /// are always zeros — single-input embedding has no segment-B.
+///
+/// `with_tti` controls whether `token_type_ids` are allocated:
+///
+/// - `true`  → returns `Some(vec![0i64; total])` (BERT-family models that
+///   expose a `token_type_ids` input).
+/// - `false` → returns `None`, skipping the allocation entirely.
+///
+/// # tti (token_type_ids) is BERT-specific; XLM-RoBERTa / RoBERTa / DistilBERT
+/// models don't use it. Caller passes false for ~3-of-4 prod models, avoiding
+/// a per-request 64 KiB zeroed Vec.
 pub fn build_tensors_from_ids(
     token_ids: &[Vec<u32>],
     batch: usize,
     max_seq: usize,
     pad_id: u32,
-) -> (Vec<i64>, Vec<i64>, Vec<i64>) {
+    with_tti: bool,
+) -> (Vec<i64>, Vec<i64>, Option<Vec<i64>>) {
     let total = batch * max_seq;
     let mut ids = vec![pad_id as i64; total];
     let mut mask = vec![0i64; total];
-    let tti = vec![0i64; total]; // always zeros
+    // tti (token_type_ids) is BERT-specific; XLM-RoBERTa / RoBERTa / DistilBERT
+    // models don't use it. Caller passes false for ~3-of-4 prod models, avoiding
+    // a per-request 64 KiB zeroed Vec.
+    let tti = if with_tti {
+        Some(vec![0i64; total])
+    } else {
+        None
+    };
 
     for (i, seq) in token_ids.iter().enumerate() {
         let len = seq.len().min(max_seq);
