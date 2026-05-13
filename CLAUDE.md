@@ -2,140 +2,90 @@
 
 **Rust / axum** · Docker · Prometheus `/metrics` · branch `main`
 
-Single process serving three model classes concurrently:
+axum HTTP on `:8082` serving 4 ONNX models. Since 2026-05-12 runs as supervisor + N worker child processes (`EMBED_MULTI_PROCESS=1`), one worker per model with isolated BFCArena.
 
-| Class    | Default model(s)                                        | Endpoint             | API shape |
+| Class    | Model                                                   | Endpoint             | API shape |
 |----------|---------------------------------------------------------|----------------------|-----------|
 | Dense    | `multilingual-e5-large` (1024d), `jina-code-v2` (768d)  | `POST /v1/embeddings`| OpenAI    |
 | Reranker | `gte-multi-rerank`                                      | `POST /v1/rerank`    | Cohere    |
-| Sparse   | SPLADE                                                  | `POST /embed_sparse` | TEI       |
+| Sparse   | `splade-v3-distilbert`                                  | `POST /embed_sparse` | TEI       |
 
-## Source layout (`src/`, ~5.6k LOC)
+## Documentation map
 
-| File                 | LOC  | Role |
-|----------------------|-----:|------|
-| `main.rs`            |  385 | axum router, startup, graceful SIGTERM |
-| `config.rs`          |  694 | env parsing: `EMBED_MODELS`, `RERANKER_MODELS`, batching knobs |
-| `types.rs`           |  145 | `AppState`, `ModelEntry`, error types |
-| `api.rs`             |  307 | `/v1/embeddings` handler |
-| `api_rerank.rs`      |  510 | `/v1/rerank` handler (Cohere-shape) |
-| `api_splade.rs`      |  271 | `/embed_sparse` handler (TEI-shape) |
-| `model.rs`           |  382 | Dense ONNX session + tokenizer + mean-pool |
-| `model_reranker.rs`  |  600 | Cross-encoder ONNX scoring, session pool |
-| `model_splade.rs`    |  499 | SPLADE sparse model |
-| `batcher.rs`         | 1150 | `DynamicBatcher` + token-budget batcher, carry-over |
-| `cache.rs`           |  216 | moka response cache (embeddings only; rerank bypasses) |
-| `cache_flow.rs`      |  186 | probe→insert hot path |
-| `pool.rs`            |   94 | mean-pool + L2 normalize |
-| `metrics.rs`         |  196 | Prometheus exposition helpers |
-| `bench.py`           |    — | load harness (run under `rtk` for untruncated output) |
+- **Architecture (multi-process)**: `docs/architecture/multi-process.md` — process model, IPC protocol, supervisor lifecycle, memory cost, observability. Diagrams: `docs/architecture/embed-server.c4` (LikeC4).
+- **Runbook** (operations, symptom → response): `docs/runbook.md`
+- **Bugs** (historical workarounds): `docs/BUGS.md` (BUG-004 jina-code-v2 OOM — resolved by multi-process Phase 2)
+- **Roadmap / plans**: `docs/ROADMAP.md`, `docs/superpowers/plans/2026-05-12-multi-process-refactor.md`
+- **Benchmarks**: `docs/benchmarks/` (ARM Neoverse-N1 baselines)
 
 ## API
 
-- `POST /v1/embeddings` — OpenAI-compat. Model picked via `model` field
-  (fallback: `EMBED_DEFAULT_MODEL`). 503 + `Retry-After: 1` when queue full,
-  503 + `Retry-After: 5` during shutdown. Response cache in front.
-- `POST /v1/rerank` — Cohere-shape: `{query, documents[], top_n, return_documents}`
-  → `{results:[{index, relevance_score}]}`. Documents accepted as plain string
-  or `{"text":...}` (untagged serde). **No cache** — `(query, doc)` pairs are
-  nearly always unique.
-- `POST /embed_sparse` — TEI convention (no `/v1/` prefix by design).
-- `GET /health` — plain `ok`.
-- `GET /metrics` — Prometheus `embed_*` series. Counters
-  (`embed_requests_total`, `embed_rerank_requests_total`,
-  `embed_token_cache_total`, etc.), latency histograms
-  (`embed_request_duration_seconds`, `embed_inference_duration_seconds`,
-  `embed_rerank_request_duration_seconds`,
-  `embed_rerank_inference_duration_seconds`,
-  `embed_rerank_pool_acquire_duration_seconds`,
-  `embed_rerank_tokenizer_duration_seconds`), batch-shape histograms
-  (`embed_batch_size`, `embed_rerank_batch_size`,
-  `embed_rerank_pairs_per_request`, `embed_batch_tokens`,
-  `embed_batch_padding_waste_ratio`,
-  `embed_rerank_padding_waste_ratio`), gauges
-  (`embed_queue_depth_current`, `embed_rerank_in_flight`,
-  `embed_build_info`). All histograms have suffix-matched bucket
-  configs in `metrics::init`.
+- `POST /v1/embeddings` — OpenAI-compat. 503 + `Retry-After: 1` on queue full, 503 + `Retry-After: 5` during shutdown. Response cache in front.
+- `POST /v1/rerank` — Cohere-shape. Documents accepted as plain string or `{"text":...}` (untagged serde). No cache.
+- `POST /embed_sparse` — TEI convention (no `/v1/` prefix). Body: `{"input":["text",...]}` (singular `input`).
+- `GET /health` — `ok`.
+- `GET /metrics` — Prometheus. Multi-process specific: `embed_worker_restart_total{model}` (pre-touched to 0). Full series list: see `metrics::init` in `src/metrics.rs`.
 
-## Environment (live prod values)
+## Environment — key flags
 
-| Variable                     | Prod value | Notes |
-|------------------------------|------------|------|
-| `EMBED_PORT`                 | `8082`     | |
-| `EMBED_MODELS`               | `multilingual-e5-large:/models:1024:256:1:false,jina-code-v2:/models-jina:768:512:0:false` | Format: `name:dir:dim:max_len:pad_id:has_tti[:model_file]` |
-| `EMBED_DEFAULT_MODEL`        | `multilingual-e5-large` | |
-| `EMBED_INTRA_THREADS`        | `2` (default; was `4` until 2026-05-06) | ONNX threads per inference. Lowered after kernel-level audit found 5× thread oversubscription on 4-core ARM Neoverse-N1 — DynamicQuantizeMatMul + MatMulIntegerToFloat run at NEON INT8 GEMM hardware ceiling (IPC=2.46, cache-miss 1.3 %), so contention dominates. Combined with `EMBED_SESSION_POOL_SIZE=2` → 4 concurrent inference slots × 2 threads = 8 ORT threads on 4 cores = 2× oversub (was 5× with intra=4 + no pool). Solo inference ~10–20 % slower; throughput ~2× under concurrent load. Operators on dedicated-CPU hosts can override back to `4`. |
-| `EMBED_SESSION_POOL_SIZE`    | `1` (default; recommended prod `2`) | ONNX `Session` instances per embedding model. `1` preserves legacy single-Mutex<Session> path byte-for-byte. ort 2.0-rc has no shared-weights mode → each pool member duplicates the ~400 MiB (e5-large) / ~250 MiB (jina-code-v2) weight buffer. Round-robin via `AtomicUsize`. When raising, lower `EMBED_INTRA_THREADS` so `pool_size * intra_threads ≤ cores`. |
-| `RERANKER_MODELS`            | `gte-multi-rerank:/models-gte-rerank:256:true` | Format: `name:dir:max_len:padded` |
-| `RERANKER_INTRA_THREADS`     | `2` | |
-| `RERANKER_SESSION_POOL_SIZE` | `2` | |
-| `BATCHING_ENABLED`           | `true` | |
-| `BATCH_MAX`                  | `32` | Coalesced batch cap |
-| `BATCH_MAX_TOKENS`           | `16384` | Token-budget cap (TEI-style, real limiter) |
-| `BATCH_MAX_SEQ`              | `256` | Per-batch `max(seq_len)` cap. Long-doc outliers split into B=1 batches so shorts don't pad up. Counter `embed_batch_seq_capped_total{reason="seq_overflow"}`. |
-| `BATCH_WAIT_MS`              | `30` | Coalescing window |
-| `MAX_QUEUE_SIZE`             | `256` | Queue cap → 503 |
-| `CACHE_MAX_ENTRIES`          | `10000` | moka embedding cache |
-| `DRAIN_TIMEOUT_S`            | `10` | SIGTERM drain window |
-| `ORT_DYLIB_PATH`             | `/usr/lib/libonnxruntime.so` | required by `ort` with `load-dynamic` |
-| `ORT_OPT_LEVEL`              | `3` | |
-| `EMBED_VERSION`              | `dev` | stamped into `embed_build_info` |
-| `EMBED_ARENA_MAX_MEM_BYTES`  | TBD (default 6442450944 = 6 GiB) | BFCArena hard ceiling; 3→6 GiB bump fixes jina-code-v2 92% error rate (FU-24) |
-| `EMBED_ARENA_INITIAL_CHUNK_BYTES` | TBD (default 1048576 = 1 MiB) | First BFCArena allocation block size |
-| `EMBED_ARENA_MAX_DEAD_BYTES` | TBD (default 67108864 = 64 MiB) | Dead-bytes threshold for chunk reuse (aggressive vs ORT default 128 MiB; 32 MiB was too small — BERT scratch ~8 MiB/tensor caused extend thrash) |
-| `EMBED_ARENA_EXTEND_STRATEGY` | TBD (default 1 = kSameAsRequested) | 0=kNextPowerOfTwo, 1=kSameAsRequested |
-| `EMBED_WARMUP_SEQ_LEN` | (default `128`) | Cap on warmup tensor `max_seq` for dense embedders + rerankers. `max` = pad to model `max_len` (legacy). With `memory_pattern=true`, ORT re-plans on first long prod request — saves 200-400 MiB resident vs worst-case warmup. |
-| `EMBED_MEMORY_PATTERN_<MODEL>` | (default `true`) | Per-model ORT memory-pattern flag. `<MODEL>` = uppercase model name with `-` → `_` (e.g. `EMBED_MEMORY_PATTERN_JINA_CODE_V2`). `true` = pre-allocate entire forward-pass plan as one BFCArena block (stable shapes, e5-large). `false` = per-op alloc (~80 MiB vs 1.258 GiB plan-block for jina S=512); required for jina-code-v2 (variable seq, BFCArena fills monotonically). Invalid values fall back to `true` with a warn. |
+Multi-process (live prod):
+- `EMBED_MULTI_PROCESS=1` — supervisor spawns workers. Set to `0` for monolith rollback.
+- `EMBED_WORKER_BIN=/usr/local/bin/embed-worker` — shipped in image.
+- `EMBED_WORKER_SOCKET_DIR=/tmp/embed-workers` — UDS socket directory.
+
+Models (live prod values):
+- `EMBED_PORT=8082`
+- `EMBED_MODELS="multilingual-e5-large:/models:1024:256:1:false,jina-code-v2:/models-jina:768:512:0:false"` — format `name:dir:dim:max_len:pad_id:has_tti[:model_file]`
+- `EMBED_DEFAULT_MODEL=multilingual-e5-large`
+- `RERANKER_MODELS="gte-multi-rerank:/models-gte-rerank:256:true"` — format `name:dir:max_len:padded`
+- `SPLADE_MODELS="splade-v3-distilbert:/models-splade:256"` — format `name:dir:max_len`
+
+ORT tuning (prod-validated):
+- `EMBED_INTRA_THREADS=2`, `EMBED_SESSION_POOL_SIZE=2` — `pool_size * intra_threads ≤ cores` rule on 4-core ARM Neoverse-N1.
+- `EMBED_MEMORY_PATTERN_JINA_CODE_V2=false` — required for jina (variable seq + ALiBi). Other models keep default `true`.
+- `EMBED_ARENA_MAX_MEM_BYTES=6442450944` (6 GiB) — BFCArena ceiling per worker.
+- `ORT_DYLIB_PATH=/usr/lib/libonnxruntime.so` — required by `ort` with `load-dynamic`.
+
+Batcher (in-process path; pre-existing):
+- `BATCH_MAX=32`, `BATCH_MAX_TOKENS=16384`, `BATCH_MAX_SEQ=256`, `BATCH_WAIT_MS=30`, `MAX_QUEUE_SIZE=256`.
+
+Full env reference with per-variable rationale: see `compose/memdb.yml` inline comments (each env line is annotated with the incident or PR that set its value).
 
 ## Local CI
 
 GitHub Actions runs only release-please. Cargo gates are local — run `make ci` before pushing.
 
-| Target | What it runs | Warm time |
-|--------|-------------|-----------|
-| `make fmt` | `cargo fmt --all -- --check` | ~1s |
-| `make clippy` | `cargo clippy --locked --all-targets --workspace -- -D warnings` | ~5s |
-| `make lint` | fmt + clippy | ~5s |
-| `make test` | `cargo test --locked --all-targets --workspace` | ~30s |
-| `make build` | `cargo build --release --locked` | ~90s |
-| `make ci` | lint + test + build (full gate) | ~2 min |
+| Target | What it runs |
+|--------|--------------|
+| `make fmt` | `cargo fmt --all -- --check` |
+| `make clippy` | `cargo clippy --locked --all-targets --workspace -- -D warnings` |
+| `make test` | `cargo nextest run --locked --all-targets --workspace` |
+| `make build` | `cargo build --release --locked` |
+| `make ci` | lint + test + build (full gate, ~2 min warm) |
 
-`--locked` is mandatory on all targets — catches `Cargo.lock` drift that `cargo check` misses (real incident 2026-05-02).
+`--locked` mandatory on all targets — catches `Cargo.lock` drift that `cargo check` misses (incident 2026-05-02).
+
+Integration tests with real models require: `EMBED_MODELS=...` + `RERANKER_MODELS=...` + `SPLADE_MODELS=...` + `ORT_DYLIB_PATH=...` env. Run `--test-threads=1` (parallel OOMs 4-core 24 GB).
 
 ## Deploy
 
+Auto-deploy: push to `main` → dozor webhook (`~/.dozor/deploy-repos.yaml`, repo `anatolykoptev/ox-embed-server`) → rebuild image → `docker compose up -d --no-deps --force-recreate embed-server`. Smoke timeout 120 s (workers warm up in ~3.4 s parallel).
+
+Manual:
 ```bash
 cd ~/deploy/krolik-server
-docker compose build embed-server        # code-only: ~40s (BuildKit cache mounts)
+docker compose build --no-cache embed-server   # ~3 min cold deps, ~40 s warm
 docker compose up -d --no-deps --force-recreate embed-server
 ```
 
-- `--no-cache` only when `Cargo.toml` / `Cargo.lock` change; regular code hits
-  the dummy-main dep layer (`Dockerfile` Layer 1). Cold deps: ~3 min. Warm: ~2s.
-- Auto-deploy: push to `main` → dozor webhook (`~/.dozor/deploy-repos.yaml`,
-  repo `anatolykoptev/ox-embed-server`).
-- **Releases:** release-please on push to `main`. Conventional commits →
-  auto-PR + tag. Do not tag manually.
+Releases: release-please on push to `main`. Conventional commits → auto PR + tag. Do not tag manually.
 
 ## Gotchas
 
-- `ort` + `load-dynamic` → `libonnxruntime.so` loaded from `ORT_DYLIB_PATH` at
-  startup, not linked at build.
-- `model_optimized.onnx` (graph-fused via `onnxruntime.transformers.optimizer`)
-  is **slower** than `model_quantized.onnx` on ARM Neoverse-N1 for our
-  BERT-family models. Do not switch `MODEL_FILE` without benchmarking.
-- `ort-sys` downloads the ORT binary on first compile (~30s cold, reused after).
-- Batcher has `carry: Option<Item>` — items that would overflow `BATCH_MAX`
-  defer to the next batch (not dropped). If log shows `item exceeded
-  max_batch after coalesce`, running image predates commit `3598b48` — rebuild.
-  Visible as `embed_carry_events_total` in `/metrics`.
-- `BATCH_MAX` historical rule was `≤8` on ARM (cache thrash). Prod now runs
-  `32` with `BATCH_MAX_TOKENS=16384` as the real cap — re-bench with `bench.py`
-  if you change either.
-
-## References
-
-- **Benchmarks:** `docs/benchmarks/` (ARM Neoverse-N1 baselines).
-- **Bugs / historical workarounds:** `docs/BUGS.md` (BUG-001 resolved Apr 2026).
-- **Roadmap / phase plans:** `docs/ROADMAP.md`, `docs/plans/`.
-- **Runbook:** `docs/runbook.md`.
+- `ort` + `load-dynamic` → `libonnxruntime.so` from `ORT_DYLIB_PATH` at startup.
+- `model_optimized.onnx` (graph-fused) is **slower** than `model_quantized.onnx` on ARM Neoverse-N1 for BERT-family. Don't switch `MODEL_FILE` without benchmarking.
+- `ort-sys` downloads the ORT binary on first compile (~30 s cold).
+- Batcher `carry: Option<Item>` — items overflowing `BATCH_MAX` defer to next batch. Tracked as `embed_carry_events_total`.
+- Multi-process worker test parallelism: **`--test-threads=1` mandatory** for `cargo nextest run --test multi_process_*` — each test spawns its own embed-server with full model set, parallel OOMs on 24 GB ARM.
+- Worker child process must call `arena::register_shared_cpu_arena()` before any `Session::builder()` — supervisor's registration doesn't carry across fork. (Handled in `src/bin/worker.rs`.)
+- Per-request UDS conn (not persistent pool) — see `docs/architecture/multi-process.md` for cancel-safety rationale.

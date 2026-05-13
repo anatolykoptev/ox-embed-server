@@ -1,16 +1,54 @@
 # embed-server Runbook
 
-Unified Rust ONNX sidecar at `embed-server:8082` serving
-`multilingual-e5-large` (1024 dim) and `jina-code-v2` (768 dim).
+Unified Rust ONNX sidecar at `embed-server:8082` serving 4 models:
+- `multilingual-e5-large` (1024 dim, embed)
+- `jina-code-v2` (768 dim, embed)
+- `gte-multi-rerank` (cross-encoder, rerank)
+- `splade-v3-distilbert` (sparse, splade)
+
+Since 2026-05-12: **multi-process** via `EMBED_MULTI_PROCESS=1`. Supervisor (`embed-server` PID 1) spawns one `embed-worker` child per model. Workers communicate over UDS sockets in `/tmp/embed-workers/`. See `CLAUDE.md` process-model section.
 
 ## Normal state
 
 - `docker ps | grep embed-server` → `Up X (healthy)`.
-- Logs contain `batching_enabled=true` and `all models loaded models=2`.
-- `/metrics` has `embed_build_info{version=...}` and per-model
-  `embed_requests_total{model=...,status="ok"}` growing.
-- `embed_queue_rejected_total` ≈ 0.
-- `embed_queue_depth{model}` small (single-digit) under steady load.
+- `docker top embed-server` shows 5 processes: 1× `embed-server` (PID 1) + 4× `embed-worker` (one per model).
+- Logs contain `multi-process mode enabled — spawning worker pool` + 4× `worker handle ready`.
+- `/metrics` has `embed_build_info{version="phase-2-multi-process"}`, `embed_worker_restart_total{model=...} 0` (pre-touched), per-model `embed_requests_total{model=...,status="ok"}` growing.
+- `embed_queue_rejected_total` ≈ 0 (in-process queue still present; less relevant when worker_pool routes hot path).
+- No `worker_pool ... dispatch failed` errors in logs.
+
+## Multi-process specific symptoms
+
+### `embed_worker_restart_total{model=X}` > 0
+
+Worker crashed and watchdog respawned. Check exit reason in logs:
+```bash
+docker logs embed-server 2>&1 | grep "worker exited" | tail -5
+```
+Look for `code`, `signal` fields. `signal=Some(6)` = SIGABRT (panic in worker, `panic=abort` profile). `signal=Some(9)` or `code=None` with high RSS = OOM-kill. Counter > 5/hour for any model = systemic issue, escalate.
+
+### `worker_pool ... dispatch failed: response id X != request id Y`
+
+**Was the rerank regression fixed in PR #62** (per-request UDS conn, cancel-safe). If returns: rollback to image preceding PR #62 NOT possible — code path removed. Instead: check if downstream client (memdb-go) has aggressive request timeouts triggering cancellation cascade. Increase client timeout or reduce ONNX inference latency.
+
+### Worker startup timeout (60s `did not create socket within 60s`)
+
+Worker process started but failed to bind UDS. Likely causes:
+1. Missing model file at `EMBED_MODELS` path.
+2. ORT dylib mismatch (`ORT_DYLIB_PATH` wrong).
+3. Arena registration failed — check `shared arena registration failed` warn in logs.
+
+Watchdog will retry indefinitely with exponential backoff (2s→60s). Per CLAUDE.md "no silent errors" — failure is logged with full error context.
+
+### Rolling back multi-process
+
+```bash
+# In ~/deploy/krolik-server/compose/memdb.yml, set:
+EMBED_MULTI_PROCESS: "0"
+# Then:
+docker compose up -d --no-deps --force-recreate embed-server
+```
+Behaviour returns byte-identical to pre-2026-05-12 monolith path. Workers will not spawn; in-process `EmbedModel`/`RerankerModel`/`SpladeModel` handle inference.
 
 ## Symptom → response
 

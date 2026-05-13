@@ -10,6 +10,23 @@ Status of the multi-model Rust inference sidecar on the `krolik` server. Updated
 
 ## ✅ Shipped
 
+### Phase 2 multi-process refactor — 2026-05-12 (PR #56 / #57 / #58 + follow-ups #59-#63)
+
+Supervisor + N worker child processes (one per ONNX model). Each worker owns isolated BFCArena — resolves BUG-004 (jina-code-v2 92% error rate from arena fragmentation).
+
+- IPC: postcard tagged-enum frames over UDS (length-prefixed, 64 MiB cap). Cancel-safe per-request connection (PR #62).
+- WorkerSupervisor watchdog: auto-restart on exit (clean / SIGABRT 134 / SIGKILL 137 / OOM) with 2s→60s exponential backoff. `embed_worker_restart_total{model}` counter (pre-touched to 0).
+- Parallel worker spawn via `tokio::spawn` (PR #61) — startup 3-5× faster (workers warm up in ~3.4 s parallel vs sequential).
+- 3 routing paths: `/v1/embeddings` (PR #57), `/v1/rerank` + `/embed_sparse` (PR #58 Wave 2.4b). Legacy in-process path remains for `EMBED_MULTI_PROCESS=0` rollback.
+- bincode → postcard (RUSTSEC-2025-0141, upstream unmaintained).
+- Dockerfile ships both binaries (`embed-server` + `embed-worker`) via `cargo build --bins`.
+
+Architecture: `docs/architecture/multi-process.md`. Implementation log: `docs/superpowers/plans/2026-05-12-multi-process-refactor.md`.
+
+**Live**: prod compose has `EMBED_MULTI_PROCESS=1` since 2026-05-12. Disable: set to `"0"` + `docker compose up -d --no-deps --force-recreate embed-server` (byte-identical fallback).
+
+**Memory cost**: combined RSS ~5.1 GiB (was ~1.6 GiB monolith). Phase 3.2 (lazy-load / skip in-process when multi_process=1) deferred — requires handler refactor; current overhead acceptable on 24 GiB ARM host.
+
 ### Phase 0 — Model artifacts on disk
 
 | Model | Path | Size | Status |
