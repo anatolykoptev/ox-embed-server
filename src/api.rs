@@ -164,75 +164,45 @@ pub async fn embeddings(
         .into_response();
     }
 
-    // Only the unique miss texts are tokenized + embedded. `pending_texts`
-    // is the aligned key order we'll use to zip miss vectors back to
-    // original positions.
+    // Only the unique miss texts are embedded. `pending_texts` is the aligned
+    // key order we'll use to zip miss vectors back to original positions.
     let pending_texts: Vec<String> = pending.keys().cloned().collect();
-    let tokenize_input = pending_texts.clone();
-
-    // Tokenize only the unique miss texts. Runs on spawn_blocking because
-    // tokenization is CPU-bound and used to contend with the async runtime.
-    let model = entry.model.clone();
-    let token_ids = match tokio::task::spawn_blocking(move || model.tokenize(&tokenize_input)).await
-    {
-        Ok(Ok(ids)) => ids,
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "tokenize failed in /v1/embeddings");
-            crate::metrics::record_tokenize_fallback();
-            crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: ErrorDetail {
-                        message: e,
-                        error_type: "server_error",
-                    },
-                }),
-            )
-                .into_response();
-        }
-        Err(join_err) => {
-            tracing::warn!(error = %join_err, "tokenize task panicked in /v1/embeddings");
-            crate::metrics::record_tokenize_fallback();
-            crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: ErrorDetail {
-                        message: format!("tokenize task panicked: {join_err}"),
-                        error_type: "server_error",
-                    },
-                }),
-            )
-                .into_response();
-        }
-    };
-
-    // Count tokens for the fresh (miss) set only. Cache hits report 0 tokens
-    // (they were accounted in a prior request). Token count is the sum of
-    // non-padded token lengths across all unique miss texts.
-    let total_tokens: u32 = token_ids.iter().map(|v| v.len() as u32).sum();
+    let n_pending = pending_texts.len();
 
     // Run inference via worker pool (multi-process), batcher, or legacy spawn_blocking path.
     // Only the miss set flows through here.
-    //
-    // Worker pool path: dispatch raw pending_texts to the worker process; the
-    // worker handles its own tokenization + inference internally.
     //
     // Cache inserts happen AFTER successful inference — if any error path
     // below is taken, we never populate the cache with a partial result.
     //
     // Note: batcher already calls record_inference inside dispatch_batch — do not call it here.
-    let max_seq_len: u32 = token_ids.iter().map(|v| v.len() as u32).max().unwrap_or(1);
-    let miss_vectors = if let Some(pool) = state.worker_pool.as_ref() {
-        // Multi-process path: send raw texts to the worker; token_ids were
-        // already computed above for the total_tokens billing count only.
+    let (miss_vectors, total_tokens) = if let Some(pool) = state.worker_pool.as_ref() {
+        // Worker-path billing uses a char/4 estimate instead of running the tokenizer
+        // on the supervisor — the worker re-tokenizes authoritatively for inference,
+        // so the supervisor-side pass was pure waste (~1.5-3ms for batch=32).
+        // Off-by-one OK for billing — exact count requires tokenizer in supervisor.
+        let estimated_total_tokens: u32 = pending_texts
+            .iter()
+            .map(|t| ((t.chars().count() as f32 / 4.0).ceil() as u32).max(1))
+            .sum();
+        let estimated_max_seq_len: u32 = pending_texts
+            .iter()
+            .map(|t| ((t.chars().count() as f32 / 4.0).ceil() as u32).max(1))
+            .max()
+            .unwrap_or(1);
+
+        // Multi-process path: send raw texts to the worker; the worker handles
+        // tokenization + inference internally.
+        // `pending_texts` is cloned here because it is still needed below for
+        // the scatter zip (`pending_texts.iter().zip(miss_vectors)`).
+        // The first clone that existed before this commit (into `spawn_blocking(tokenize)`)
+        // has been removed — this is the only remaining clone on the worker path.
         let infer_start = std::time::Instant::now();
         let resp = pool
-            .dispatch_embed(&model_name, pending_texts.clone(), max_seq_len)
+            .dispatch_embed(&model_name, pending_texts.clone(), estimated_max_seq_len)
             .await;
         let infer_elapsed = infer_start.elapsed();
-        match resp {
+        let vectors = match resp {
             Ok(crate::ipc::protocol::WorkerResponse::Embed(ok)) => {
                 crate::metrics::record_inference(&model_name, infer_elapsed, ok.vectors.len());
                 ok.vectors
@@ -292,110 +262,161 @@ pub async fn embeddings(
                 )
                     .into_response();
             }
-        }
-    } else if let Some(b) = &entry.batcher {
-        match b.embed_tokens(token_ids).await {
-            Ok(v) => v,
-            Err(crate::batcher::BatchError::QueueFull(e)) => {
-                // E2: queue near capacity (≥80%) → fast-fail with 429
-                // Too Many Requests + Retry-After: 1. Clients (memdb-go
-                // commit 90b964f1) retry with exp backoff — closed
-                // loop. Previously returned 503, which conflated "queue
-                // full" (retryable) with shutdown (also retryable but
-                // usually transient differently).
-                tracing::warn!(error = %e, "queue full — returning 429");
-                crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
-                return (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    [("retry-after", "1")],
-                    Json(ErrorResponse {
-                        error: ErrorDetail {
-                            message: e.to_string(),
-                            error_type: "rate_limited",
-                        },
-                    }),
-                )
-                    .into_response();
-            }
-            Err(crate::batcher::BatchError::Inference(msg)) => {
-                tracing::error!(error = %msg, "embed failed");
-                crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: ErrorDetail {
-                            message: msg,
-                            error_type: "server_error",
-                        },
-                    }),
-                )
-                    .into_response();
-            }
-            Err(crate::batcher::BatchError::Shutdown) => {
-                tracing::error!("batcher shut down");
-                crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(ErrorResponse {
-                        error: ErrorDetail {
-                            message: "batcher shut down".to_string(),
-                            error_type: "server_error",
-                        },
-                    }),
-                )
-                    .into_response();
-            }
-        }
+        };
+        (vectors, estimated_total_tokens)
     } else {
-        // Legacy path: run in spawn_blocking to avoid holding the async executor on sync ort call.
+        // In-process paths (batcher and legacy spawn_blocking) need real token_ids
+        // for inference — tokenize the miss set here.
+        //
+        // Tokenize only the unique miss texts. Runs on spawn_blocking because
+        // tokenization is CPU-bound and would contend with the async runtime.
         let model = entry.model.clone();
-        let infer_start = std::time::Instant::now();
-        let result = tokio::task::spawn_blocking(move || model.embed_tokens(&token_ids))
-            .await
-            .map_err(|e| format!("spawn: {e}"));
-        let infer_elapsed = infer_start.elapsed();
+        let tokenize_input = pending_texts.clone();
+        let token_ids =
+            match tokio::task::spawn_blocking(move || model.tokenize(&tokenize_input)).await {
+                Ok(Ok(ids)) => ids,
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "tokenize failed in /v1/embeddings");
+                    crate::metrics::record_tokenize_fallback();
+                    crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: ErrorDetail {
+                                message: e,
+                                error_type: "server_error",
+                            },
+                        }),
+                    )
+                        .into_response();
+                }
+                Err(join_err) => {
+                    tracing::warn!(error = %join_err, "tokenize task panicked in /v1/embeddings");
+                    crate::metrics::record_tokenize_fallback();
+                    crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: ErrorDetail {
+                                message: format!("tokenize task panicked: {join_err}"),
+                                error_type: "server_error",
+                            },
+                        }),
+                    )
+                        .into_response();
+                }
+            };
 
-        match result {
-            Ok(Ok(v)) => {
-                crate::metrics::record_inference(&model_name, infer_elapsed, v.len());
-                v
+        // Count tokens for the fresh (miss) set only. Cache hits report 0 tokens
+        // (they were accounted in a prior request). Token count is the sum of
+        // non-padded token lengths across all unique miss texts.
+        let total_tokens: u32 = token_ids.iter().map(|v| v.len() as u32).sum();
+
+        let vectors = if let Some(b) = &entry.batcher {
+            match b.embed_tokens(token_ids).await {
+                Ok(v) => v,
+                Err(crate::batcher::BatchError::QueueFull(e)) => {
+                    // E2: queue near capacity (≥80%) → fast-fail with 429
+                    // Too Many Requests + Retry-After: 1. Clients (memdb-go
+                    // commit 90b964f1) retry with exp backoff — closed
+                    // loop. Previously returned 503, which conflated "queue
+                    // full" (retryable) with shutdown (also retryable but
+                    // usually transient differently).
+                    tracing::warn!(error = %e, "queue full — returning 429");
+                    crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
+                    return (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [("retry-after", "1")],
+                        Json(ErrorResponse {
+                            error: ErrorDetail {
+                                message: e.to_string(),
+                                error_type: "rate_limited",
+                            },
+                        }),
+                    )
+                        .into_response();
+                }
+                Err(crate::batcher::BatchError::Inference(msg)) => {
+                    tracing::error!(error = %msg, "embed failed");
+                    crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: ErrorDetail {
+                                message: msg,
+                                error_type: "server_error",
+                            },
+                        }),
+                    )
+                        .into_response();
+                }
+                Err(crate::batcher::BatchError::Shutdown) => {
+                    tracing::error!("batcher shut down");
+                    crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(ErrorResponse {
+                            error: ErrorDetail {
+                                message: "batcher shut down".to_string(),
+                                error_type: "server_error",
+                            },
+                        }),
+                    )
+                        .into_response();
+                }
             }
-            Ok(Err(e)) => {
-                tracing::error!(error = %e, "embed failed");
-                crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: ErrorDetail {
-                            message: e,
-                            error_type: "server_error",
-                        },
-                    }),
-                )
-                    .into_response();
+        } else {
+            // Legacy path: run in spawn_blocking to avoid holding the async executor on sync ort call.
+            let model = entry.model.clone();
+            let infer_start = std::time::Instant::now();
+            let result = tokio::task::spawn_blocking(move || model.embed_tokens(&token_ids))
+                .await
+                .map_err(|e| format!("spawn: {e}"));
+            let infer_elapsed = infer_start.elapsed();
+
+            match result {
+                Ok(Ok(v)) => {
+                    crate::metrics::record_inference(&model_name, infer_elapsed, v.len());
+                    v
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(error = %e, "embed failed");
+                    crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: ErrorDetail {
+                                message: e,
+                                error_type: "server_error",
+                            },
+                        }),
+                    )
+                        .into_response();
+                }
+                Err(e) => {
+                    crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: ErrorDetail {
+                                message: e,
+                                error_type: "server_error",
+                            },
+                        }),
+                    )
+                        .into_response();
+                }
             }
-            Err(e) => {
-                crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: ErrorDetail {
-                            message: e,
-                            error_type: "server_error",
-                        },
-                    }),
-                )
-                    .into_response();
-            }
-        }
+        };
+        (vectors, total_tokens)
     };
 
     // Sanity: inference returned exactly one vector per unique miss text.
     // A length mismatch would indicate a batcher bug; fail loudly rather
     // than silently producing a wrong response.
-    if miss_vectors.len() != pending_texts.len() {
+    if miss_vectors.len() != n_pending {
         tracing::error!(
-            expected = pending_texts.len(),
+            expected = n_pending,
             got = miss_vectors.len(),
             "miss vector count mismatch"
         );
