@@ -135,12 +135,23 @@ async fn main() -> anyhow::Result<()> {
                     Err(_) => break,
                 };
 
-                let _permit = match semaphore.clone().try_acquire_owned() {
+                // Bounded-queue admission: await permit instead of instant
+                // reject. With per-request UDS conn (PR #62), burst load
+                // would mass-trigger try_acquire failures + 500-spam to
+                // memdb-go, which retries → amplification cascade. acquire()
+                // queues requests at the worker; supervisor-side
+                // WorkerPool::dispatch_timeout (30s) caps the upper bound,
+                // so a stuck worker still surfaces as a real error after 30s.
+                // Acquired permit drops at end of iteration — automatic release.
+                let _permit = match semaphore.clone().acquire_owned().await {
                     Ok(p) => p,
                     Err(_) => {
+                        // Only fires if the semaphore was explicitly closed —
+                        // we never call close(), so this is unreachable in
+                        // current code. Future-proof: surface as a clear error.
                         let resp = WorkerResponse::Err {
                             request_id: req.request_id(),
-                            message: "worker saturated".into(),
+                            message: "worker semaphore closed".into(),
                         };
                         let _ = write_frame(&mut stream, &resp).await;
                         continue;
