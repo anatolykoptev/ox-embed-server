@@ -466,8 +466,14 @@ pub async fn rerank(
     }
 
     // ---- Phase: tokenize (with H.7 cache + timing) -----------------------
+    // entry.model is Option in multi-process mode; on this path worker_pool
+    // already returned above, so reaching here guarantees legacy mode where
+    // model is Some. Panic message is operator-actionable.
+    let entry_model = entry.model.as_ref().expect(
+        "in-process RerankerModel session required but not loaded (EMBED_MULTI_PROCESS=1?)",
+    );
     let token_ids =
-        match tokenize_with_cache(&state, &model_name, &entry.model, &query, &documents).await {
+        match tokenize_with_cache(&state, &model_name, entry_model, &query, &documents).await {
             Ok(ids) => ids,
             Err(TokenizeError::Failed(msg)) => {
                 tracing::error!(error = %msg, "rerank tokenize failed");
@@ -692,7 +698,13 @@ async fn dispatch_inference(
             Err(crate::batcher::BatchError::Shutdown) => Err(InferenceError::Shutdown),
         }
     } else {
-        let model_for_score = entry.model.clone();
+        let model_for_score = entry
+            .model
+            .as_ref()
+            .expect(
+                "in-process RerankerModel session required but not loaded (EMBED_MULTI_PROCESS=1?)",
+            )
+            .clone();
         match tokio::task::spawn_blocking(move || model_for_score.score_pairs(&token_ids)).await {
             Ok(Ok(s)) => Ok(s),
             Ok(Err(e)) => Err(InferenceError::Inference(e)),
