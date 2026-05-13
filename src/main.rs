@@ -509,49 +509,33 @@ async fn main() {
     };
 
     // Spawn worker pool if multi-process mode is enabled.
-    // Wave 2.4 wires /v1/embeddings through worker_pool. Reranker + SPLADE
-    // remain on the in-process path (Wave 2.4b will extend IPC protocol +
-    // route api_rerank.rs + api_splade.rs through workers).
-    // TODO(Wave 2.4b): spawn workers for reranker and splade models, extend
-    // WorkerRequest/WorkerResponse with rerank + splade variants.
+    // All workers (embed + rerank + splade) launch in parallel via tokio::spawn —
+    // each spawn awaits its UDS socket independently (cold model load ~5-15s per
+    // model). Sequential await would add 30-50s to startup and trip dozor's
+    // smoke-test deadline (canary_smoke_timeout=120s in deploy-repos.yaml).
     let worker_pool: Option<Arc<crate::supervisor::WorkerPool>> = if cfg.multi_process {
         tracing::info!("multi-process mode enabled — spawning worker pool");
         tracing::warn!(
-            "EMBED_MULTI_PROCESS=1 — embed models route through workers; rerank/splade remain in-process. \
-             In-process embed sessions also loaded (memory overhead until Phase 3 lazy-load lands)."
+            "EMBED_MULTI_PROCESS=1 — embed/rerank/splade models route through workers. \
+             In-process sessions also loaded (memory overhead until Phase 3 lazy-load lands)."
         );
         let pool = crate::supervisor::WorkerPool::new();
 
-        // Embed model workers
+        // Collect spawn specs for embed + rerank + splade.
+        let mut specs: Vec<crate::supervisor::SpawnSpec> = Vec::new();
         for model_def in &cfg.models {
-            // Inherit per-model session knobs from Config.
-            let pool_size = cfg.embed_pool_size;
-            let intra_threads = cfg.intra_threads;
-            let spec = crate::supervisor::SpawnSpec {
+            specs.push(crate::supervisor::SpawnSpec {
                 model: model_def.name.clone(),
                 kind: crate::supervisor::WorkerKind::Embed,
                 worker_bin: cfg.worker_bin_path.clone(),
                 socket_dir: cfg.worker_socket_dir.clone(),
-                pool_size,
-                intra_threads,
-                env_extra: Vec::new(), // parent env is inherited by tokio::process::Command
-            };
-            let supervisor = crate::supervisor::WorkerSupervisor::launch(spec)
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::error!(
-                        model = %model_def.name,
-                        error = ?e,
-                        "worker supervisor launch failed"
-                    );
-                    std::process::exit(1);
-                });
-            pool.add(supervisor).await;
+                pool_size: cfg.embed_pool_size,
+                intra_threads: cfg.intra_threads,
+                env_extra: Vec::new(),
+            });
         }
-
-        // Reranker workers (Wave 2.4b)
         for r_def in &cfg.rerankers {
-            let spec = crate::supervisor::SpawnSpec {
+            specs.push(crate::supervisor::SpawnSpec {
                 model: r_def.name.clone(),
                 kind: crate::supervisor::WorkerKind::Rerank,
                 worker_bin: cfg.worker_bin_path.clone(),
@@ -559,23 +543,10 @@ async fn main() {
                 pool_size: cfg.reranker_pool_size.max(1),
                 intra_threads: cfg.reranker_intra_threads.max(1),
                 env_extra: Vec::new(),
-            };
-            let supervisor = crate::supervisor::WorkerSupervisor::launch(spec)
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::error!(
-                        reranker = %r_def.name,
-                        error = ?e,
-                        "reranker worker supervisor launch failed"
-                    );
-                    std::process::exit(1);
-                });
-            pool.add(supervisor).await;
+            });
         }
-
-        // SPLADE workers (Wave 2.4b)
         for s_def in &cfg.splades {
-            let spec = crate::supervisor::SpawnSpec {
+            specs.push(crate::supervisor::SpawnSpec {
                 model: s_def.name.clone(),
                 kind: crate::supervisor::WorkerKind::Splade,
                 worker_bin: cfg.worker_bin_path.clone(),
@@ -583,18 +554,40 @@ async fn main() {
                 pool_size: cfg.splade_pool_size.max(1),
                 intra_threads: cfg.splade_intra_threads.max(1),
                 env_extra: Vec::new(),
-            };
-            let supervisor = crate::supervisor::WorkerSupervisor::launch(spec)
-                .await
-                .unwrap_or_else(|e| {
+            });
+        }
+
+        // Fan out spawn — each future independently awaits its worker's UDS socket.
+        let handles: Vec<_> = specs
+            .into_iter()
+            .map(|spec| {
+                let name = spec.model.clone();
+                let kind = spec.kind;
+                tokio::spawn(async move {
+                    let result = crate::supervisor::WorkerSupervisor::launch(spec).await;
+                    (name, kind, result)
+                })
+            })
+            .collect();
+
+        // Collect results — any failure aborts startup.
+        for h in handles {
+            let (name, kind, result) = h.await.unwrap_or_else(|e| {
+                tracing::error!(error = ?e, "join handle for worker supervisor panicked");
+                std::process::exit(1);
+            });
+            match result {
+                Ok(supervisor) => pool.add(supervisor).await,
+                Err(e) => {
                     tracing::error!(
-                        splade = %s_def.name,
+                        model = %name,
+                        kind = %kind.as_str(),
                         error = ?e,
-                        "splade worker supervisor launch failed"
+                        "worker supervisor launch failed"
                     );
                     std::process::exit(1);
-                });
-            pool.add(supervisor).await;
+                }
+            }
         }
 
         Some(Arc::new(pool))
