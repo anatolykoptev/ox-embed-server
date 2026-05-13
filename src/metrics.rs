@@ -865,6 +865,22 @@ pub fn worker_restart_inc(model: &str) {
     .increment(1);
 }
 
+/// Pre-touch the worker-restart counter to 0 on supervisor startup.
+///
+/// Prometheus counters only appear in `/metrics` after the first
+/// `increment`. Without this, "0 restarts since boot" is indistinguishable
+/// from "metric not wired" — operators get a false absence-of-signal.
+///
+/// Called by `WorkerSupervisor::launch` after the initial spawn succeeds,
+/// so every healthy worker has its restart counter visible at value 0.
+pub fn worker_restart_touch(model: &str) {
+    metrics::counter!(
+        "embed_worker_restart_total",
+        "model" => model.to_string()
+    )
+    .absolute(0);
+}
+
 /// Increment the rerank-documents-rejected counter. Called when a
 /// `/v1/rerank` request carries more documents than `rerank_max_input_docs`.
 /// The request is rejected with HTTP 400 before tokenization — the counter
