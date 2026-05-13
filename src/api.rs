@@ -211,12 +211,15 @@ pub async fn embeddings(
                 request_id,
                 message,
             }) => {
+                let reason = crate::metrics::classify_worker_error(&message);
                 tracing::error!(
                     model = %model_name,
                     request_id,
+                    reason,
                     worker_error = %message,
                     "worker returned inference error",
                 );
+                crate::metrics::record_inference_failure(&model_name, reason, 0);
                 crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
