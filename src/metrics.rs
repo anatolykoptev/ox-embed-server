@@ -633,10 +633,14 @@ pub fn record_arena_extend(model: &str, bin_num: u32) {
 ///
 /// `reason`: "arena_oom" when the error message contains
 /// "Available memory of X is smaller than requested bytes of Y";
-/// "other" for everything else.
+/// "other" for everything else. Use `classify_worker_error` to derive
+/// the reason label from a raw error string.
 ///
-/// `bin_num`: parsed from the OOM message when available (e.g. the
-/// BFCArena reports which bin triggered the failure); 0 when not parseable.
+/// `bin_num`: always 0 on the worker-pool path (post-Wave-2.4b) — the
+/// worker process surfaces a final error string, not the BFCArena bin.
+/// The legacy in-process path (EMBED_MULTI_PROCESS=0) may set non-zero
+/// when the OrtLogLayer intercepts a BFCArena extend event. Pass 0
+/// when calling from worker-pool error handling.
 pub fn record_inference_failure(model: &str, reason: &str, bin_num: u32) {
     metrics::counter!(
         "embed_inference_failures_total",
@@ -653,16 +657,27 @@ pub fn record_inference_failure(model: &str, reason: &str, bin_num: u32) {
 /// internal paths).
 ///
 /// Categories:
-/// - `worker_saturated` — semaphore full (try_acquire_owned returned Err)
+/// - `queue_overflow` — per-worker waiter cap exceeded (AtomicUsize gate)
+/// - `semaphore_closed` — semaphore explicitly closed (post-PR-#70 path)
+/// - `worker_saturated` — legacy bucket (pre-PR-#70 `try_acquire` path);
+///   kept for backward-compat during rolling deploys / image rollbacks
 /// - `arena_oom` — BFCArena allocation failed
 /// - `kind_mismatch` — supervisor sent wrong message variant to worker
 /// - `tokenize` — tokenizer error
 /// - `other` — fallback bucket for uncategorized errors (track via logs)
+///
+/// Ordering: longer/more-specific substrings first to prevent `"saturated"`
+/// matching inside longer messages. `"queue overflow"` before `"semaphore
+/// closed"` before `"saturated"` preserves most-specific-first semantics.
 pub fn classify_worker_error(message: &str) -> &'static str {
     let m = message.to_ascii_lowercase();
-    if m.contains("saturated") {
+    if m.contains("queue overflow") {
+        "queue_overflow"
+    } else if m.contains("semaphore closed") {
+        "semaphore_closed"
+    } else if m.contains("saturated") {
         "worker_saturated"
-    } else if m.contains("arena") || m.contains("bfcarena") || m.contains("oom") {
+    } else if m.contains("bfcarena") || m.contains("arena") || m.contains("oom") {
         "arena_oom"
     } else if m.contains("kind mismatch") {
         "kind_mismatch"
@@ -988,6 +1003,68 @@ pub fn test_prometheus_handle() -> &'static PrometheusHandle {
 }
 
 // ── unit tests for bucket-label logic ────────────────────────────────────────
+
+#[cfg(test)]
+mod classify_worker_error_tests {
+    use super::classify_worker_error;
+
+    #[test]
+    fn queue_overflow_detected() {
+        assert_eq!(
+            classify_worker_error("worker queue overflow"),
+            "queue_overflow"
+        );
+        assert_eq!(
+            classify_worker_error("WORKER QUEUE OVERFLOW"),
+            "queue_overflow"
+        );
+    }
+
+    #[test]
+    fn semaphore_closed_detected() {
+        assert_eq!(
+            classify_worker_error("worker semaphore closed"),
+            "semaphore_closed"
+        );
+        assert_eq!(
+            classify_worker_error("Semaphore Closed"),
+            "semaphore_closed"
+        );
+    }
+
+    #[test]
+    fn saturated_backward_compat() {
+        assert_eq!(
+            classify_worker_error("worker saturated"),
+            "worker_saturated"
+        );
+    }
+
+    #[test]
+    fn arena_oom_variants() {
+        assert_eq!(classify_worker_error("bfcarena out of memory"), "arena_oom");
+        assert_eq!(classify_worker_error("arena alloc failed"), "arena_oom");
+        assert_eq!(classify_worker_error("oom kill"), "arena_oom");
+    }
+
+    #[test]
+    fn kind_mismatch() {
+        assert_eq!(
+            classify_worker_error("kind mismatch: model is embed"),
+            "kind_mismatch"
+        );
+    }
+
+    #[test]
+    fn tokenize_error() {
+        assert_eq!(classify_worker_error("tokenizer failed"), "tokenize");
+    }
+
+    #[test]
+    fn other_fallback() {
+        assert_eq!(classify_worker_error("unexpected runtime panic"), "other");
+    }
+}
 
 #[cfg(test)]
 mod bucket_label_tests {
