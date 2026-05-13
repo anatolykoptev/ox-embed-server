@@ -1,22 +1,27 @@
 //! Supervisor-side client to one worker process.
 //!
-//! Holds N persistent UDS connections (matches worker's pool_size); each
-//! connection runs requests serially. Dispatch methods round-robin across pool.
+//! Per-request connection: each dispatch_* opens a fresh UDS connection,
+//! writes the request, reads the response, drops the connection. UDS
+//! local-domain connect is ~10-100µs — negligible vs ONNX inference (5-50ms).
+//!
+//! Why per-request: holding a persistent `Mutex<UnixStream>` across
+//! write_frame + read_frame is not cancel-safe. If the caller's future
+//! is cancelled (axum timeout, downstream client timeout) between write
+//! and read, the response stays buffered. Next caller gets the stale
+//! response. Per-request conn drops on cancellation — no stale buffer.
 
 use crate::ipc::frame::{read_frame, write_frame};
 use crate::ipc::protocol::{
     EmbedRequest, RerankRequest, SpladeRequest, WorkerRequest, WorkerResponse,
 };
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::net::UnixStream;
-use tokio::sync::Mutex;
 
 pub struct WorkerClient {
     socket_path: PathBuf,
-    pool: Vec<Arc<Mutex<UnixStream>>>,
-    next_idx: AtomicU64,
+    /// Semaphore caps concurrent in-flight connections. Capacity = `conns` arg to connect().
+    semaphore: tokio::sync::Semaphore,
     request_counter: AtomicU64,
 }
 
@@ -25,18 +30,17 @@ impl WorkerClient {
         if conns == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "WorkerClient pool size must be >= 1",
+                "WorkerClient concurrency must be >= 1",
             ));
         }
-        let mut pool = Vec::with_capacity(conns);
-        for _ in 0..conns {
-            let stream = UnixStream::connect(&socket_path).await?;
-            pool.push(Arc::new(Mutex::new(stream)));
-        }
+        // Probe that we can actually connect (one throwaway connection — verifies the
+        // socket is bound + the worker is accepting). Drops immediately. Avoids
+        // returning an apparently-healthy client whose first real request would 500.
+        let probe = UnixStream::connect(&socket_path).await?;
+        drop(probe);
         Ok(Self {
             socket_path,
-            pool,
-            next_idx: AtomicU64::new(0),
+            semaphore: tokio::sync::Semaphore::new(conns),
             request_counter: AtomicU64::new(0),
         })
     }
@@ -45,18 +49,14 @@ impl WorkerClient {
         &self.socket_path
     }
 
-    /// Send a request and receive a response, routing to a pool slot via
-    /// round-robin. Verifies request_id echo.
+    /// Send a request and receive a response over a fresh UDS connection.
+    /// The connection is dropped when this future completes or is cancelled.
     async fn send_request(&self, req: WorkerRequest) -> std::io::Result<WorkerResponse> {
-        let idx = (self.next_idx.fetch_add(1, Ordering::Relaxed) as usize) % self.pool.len();
+        let _permit = self.semaphore.acquire().await.expect("semaphore closed");
         let req_id = req.request_id();
-        let conn = self.pool[idx].clone();
-        let mut stream = conn.lock().await;
-        write_frame(&mut *stream, &req).await?;
-        let resp: WorkerResponse = read_frame(&mut *stream).await?;
-        // NOTE: on read_frame/write_frame error the stream is left in undefined state.
-        // This pool slot becomes effectively unusable until WorkerSupervisor (Wave 2.5)
-        // detects the worker death and reconnects all slots.
+        let mut stream = UnixStream::connect(&self.socket_path).await?;
+        write_frame(&mut stream, &req).await?;
+        let resp: WorkerResponse = read_frame(&mut stream).await?;
         if resp.request_id() != req_id {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -64,6 +64,7 @@ impl WorkerClient {
             ));
         }
         Ok(resp)
+        // stream drops here — closes UDS connection automatically
     }
 
     /// Dispatch an embed request. Verifies response cardinality matches input texts.
@@ -174,13 +175,12 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn connect_rejects_zero_pool_size() {
+    async fn connect_rejects_zero_concurrency() {
         let path: PathBuf = "/tmp/does-not-matter".into();
-        let result = WorkerClient::connect(path, 0).await;
-        assert!(result.is_err());
-        assert_eq!(
-            result.err().unwrap().kind(),
-            std::io::ErrorKind::InvalidInput
-        );
+        let res = WorkerClient::connect(path, 0).await;
+        match res {
+            Ok(_) => panic!("must error"),
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+        }
     }
 }
