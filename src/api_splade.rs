@@ -211,7 +211,13 @@ pub async fn sparse_embeddings(
     // makes the per-batch padding overhead worth amortising.
     let mut data: Vec<SparseEmbeddingItem> = Vec::with_capacity(req.input.len());
     for (index, text) in req.input.into_iter().enumerate() {
-        let model = entry.model.clone();
+        let model = entry
+            .model
+            .as_ref()
+            .expect(
+                "in-process SpladeModel session required but not loaded (EMBED_MULTI_PROCESS=1?)",
+            )
+            .clone();
         let result = tokio::task::spawn_blocking(move || {
             let ids = model.tokenize(&text)?;
             model.encode_sparse(ids, top_k, min_weight)

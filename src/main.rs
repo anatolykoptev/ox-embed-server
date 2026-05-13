@@ -224,210 +224,276 @@ async fn main() {
         std::process::exit(1);
     });
 
-    // First pass: load models, stash per-model knobs alongside the Arc.
-    // We can't merge the two loops because raw_models is iterated in
-    // arbitrary HashMap order in the second pass, but we need the
-    // per-model batch_max_seq and max_len from ModelDef. Collect into a
-    // Vec to preserve the association.
-    let mut loaded_models: Vec<(
-        String,
-        Arc<EmbedModel>,
-        usize, /* batch_max_seq */
-        usize, /* max_len (for effective_seq metric) */
-    )> = Vec::new();
-    for def in &cfg.models {
-        tracing::info!(
-            model = %def.name,
-            dir = %def.dir,
-            batch_max_seq = def.batch_max_seq,
-            warmup_seq_len = ?def.warmup_seq_len,
-            "loading model"
-        );
-        let m = EmbedModel::load(
-            def,
-            cfg.intra_threads,
-            cfg.auto_truncate,
-            cfg.embed_pool_size,
-            cfg.idle_evict_secs,
-        )
-        .unwrap_or_else(|e| {
-            eprintln!("failed to load model '{}': {e}", def.name);
-            std::process::exit(1);
-        });
-        // Pre-warm at every configured embed batch shape (default `[1, 8]`
-        // — covers trivial single-text callers AND memdb-go's
-        // texts_per_req=8 default). Best-effort: per-shape errors log a
-        // warn and the next shape proceeds. Override via
-        // `EMBED_WARMUP_BATCH_SIZES`.
-        //
-        // Use per-model warmup_seq_len (defaults to Some(max_len)) to
-        // ensure memory_pattern plans against the correct worst-case
-        // scratch tensor for this specific model.
-        if let Err(e) = m.warmup(&def.name, &cfg.embed_warmup_batch_sizes, def.warmup_seq_len) {
-            tracing::error!(model = %def.name, error = %e, "embed warmup failed (non-fatal)");
-        }
-        loaded_models.push((
-            def.name.clone(),
-            Arc::new(m),
-            def.batch_max_seq,
-            def.max_len,
-        ));
-    }
-
-    tracing::info!(
-        models = loaded_models.len(),
-        default = %cfg.default_model,
-        "all models loaded"
-    );
-
+    // When EMBED_MULTI_PROCESS=1 the supervisor must NOT load ONNX sessions —
+    // doing so duplicates ~2.4 GiB RSS that the workers already hold.
+    // ModelEntry.model is therefore Option<Arc<EmbedModel>>: Some in legacy
+    // single-process mode, None in multi-process mode (metadata-only entries).
     let mut model_entries: HashMap<String, ModelEntry> = HashMap::new();
-    for (name, model_arc, model_batch_max_seq, model_max_len) in loaded_models {
-        let batcher = if cfg.batching_enabled {
-            let m = model_arc.clone();
-            // ONNX BERT-style encoders always pad to max(seq_len), so
-            // padded_model=true is the right accounting for our stack.
-            // Kept as a batcher parameter so tests can exercise the
-            // non-padded branch directly.
-            let b = batcher::DynamicBatcher::with_tokens_and_max_len(
-                &name,
-                move |token_ids| m.embed_tokens(&token_ids),
-                cfg.batch_max_tokens,
-                cfg.batch_max,
-                model_batch_max_seq,
-                /*padded_model*/ true,
-                cfg.batch_wait_ms,
-                cfg.max_queue_size,
-                model_max_len,
+    if !cfg.multi_process {
+        // First pass: load models, stash per-model knobs alongside the Arc.
+        // We can't merge the two loops because raw_models is iterated in
+        // arbitrary HashMap order in the second pass, but we need the
+        // per-model batch_max_seq and max_len from ModelDef. Collect into a
+        // Vec to preserve the association.
+        let mut loaded_models: Vec<(
+            String,
+            Arc<EmbedModel>,
+            usize, /* batch_max_seq */
+            usize, /* max_len (for effective_seq metric) */
+        )> = Vec::new();
+        for def in &cfg.models {
+            tracing::info!(
+                model = %def.name,
+                dir = %def.dir,
+                batch_max_seq = def.batch_max_seq,
+                warmup_seq_len = ?def.warmup_seq_len,
+                "loading model"
             );
-            Some(Arc::new(b))
-        } else {
-            None
-        };
-        model_entries.insert(
-            name,
-            ModelEntry {
-                model: model_arc,
-                batcher,
-            },
+            let m = EmbedModel::load(
+                def,
+                cfg.intra_threads,
+                cfg.auto_truncate,
+                cfg.embed_pool_size,
+                cfg.idle_evict_secs,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("failed to load model '{}': {e}", def.name);
+                std::process::exit(1);
+            });
+            // Pre-warm at every configured embed batch shape (default `[1, 8]`
+            // — covers trivial single-text callers AND memdb-go's
+            // texts_per_req=8 default). Best-effort: per-shape errors log a
+            // warn and the next shape proceeds. Override via
+            // `EMBED_WARMUP_BATCH_SIZES`.
+            //
+            // Use per-model warmup_seq_len (defaults to Some(max_len)) to
+            // ensure memory_pattern plans against the correct worst-case
+            // scratch tensor for this specific model.
+            if let Err(e) = m.warmup(&def.name, &cfg.embed_warmup_batch_sizes, def.warmup_seq_len) {
+                tracing::error!(model = %def.name, error = %e, "embed warmup failed (non-fatal)");
+            }
+            loaded_models.push((
+                def.name.clone(),
+                Arc::new(m),
+                def.batch_max_seq,
+                def.max_len,
+            ));
+        }
+
+        tracing::info!(
+            models = loaded_models.len(),
+            default = %cfg.default_model,
+            "all models loaded"
         );
+
+        for (name, model_arc, model_batch_max_seq, model_max_len) in loaded_models {
+            let batcher = if cfg.batching_enabled {
+                let m = model_arc.clone();
+                // ONNX BERT-style encoders always pad to max(seq_len), so
+                // padded_model=true is the right accounting for our stack.
+                // Kept as a batcher parameter so tests can exercise the
+                // non-padded branch directly.
+                let b = batcher::DynamicBatcher::with_tokens_and_max_len(
+                    &name,
+                    move |token_ids| m.embed_tokens(&token_ids),
+                    cfg.batch_max_tokens,
+                    cfg.batch_max,
+                    model_batch_max_seq,
+                    /*padded_model*/ true,
+                    cfg.batch_wait_ms,
+                    cfg.max_queue_size,
+                    model_max_len,
+                );
+                Some(Arc::new(b))
+            } else {
+                None
+            };
+            model_entries.insert(
+                name,
+                ModelEntry {
+                    model: Some(model_arc),
+                    batcher,
+                },
+            );
+        }
+    } else {
+        // Multi-process mode: build metadata-only entries (no ONNX sessions).
+        // Inference is handled exclusively by the worker pool; the supervisor
+        // only needs to know which model names exist for request validation.
+        tracing::info!(
+            models = cfg.models.len(),
+            "multi-process mode: skipping in-process model loading (metadata-only entries)"
+        );
+        for def in &cfg.models {
+            model_entries.insert(
+                def.name.clone(),
+                ModelEntry {
+                    model: None,
+                    batcher: None,
+                },
+            );
+        }
     }
 
     // Load every configured reranker the same way embedding models are
     // loaded, before building AppState. An empty `cfg.rerankers` is a
     // valid no-op — the server boots serving only `/v1/embeddings`.
+    // When EMBED_MULTI_PROCESS=1, reranker sessions are skipped (worker
+    // handles inference); metadata-only entries keep the name lookup working.
     let mut reranker_entries: HashMap<String, RerankerEntry> = HashMap::new();
-    for def in &cfg.rerankers {
-        tracing::info!(reranker = %def.name, dir = %def.dir, "loading reranker");
-        let m = RerankerModel::load(
-            &def.name,
-            &def.dir,
-            def.max_len,
-            def.padded_model,
-            cfg.reranker_intra_threads,
-            cfg.reranker_pool_size,
-        )
-        .unwrap_or_else(|e| {
-            eprintln!("failed to load reranker '{}': {e}", def.name);
-            std::process::exit(1);
-        });
-        // Pre-warm every session in the pool at every configured batch
-        // shape so the FIRST production request at each shape doesn't
-        // pay graph compile + arena alloc cost (~3s observed on cold
-        // gte-multi-rerank vs ~1.5s steady state). Default shape list is
-        // `[1, 5]` — batch=1 covers the static fast-path single-pair
-        // calls, batch=5 covers memdb-go's D7 sub-query fanout default.
-        // Override via `RERANK_WARMUP_BATCH_SIZES`. Best-effort:
-        // warmup failure is logged but does not abort boot — the
-        // server still serves correctly without it.
-        if let Err(e) = m.warmup(&cfg.rerank_warmup_batch_sizes, cfg.embed_warmup_seq_len) {
-            tracing::error!(reranker = %def.name, error = %e, "reranker warmup failed (non-fatal)");
-        }
-        let model_arc = Arc::new(m);
-
-        // Adapter bridging `RerankerModel::score_pairs -> Vec<f32>` into
-        // `DynamicBatcher`'s `Fn(Vec<Vec<u32>>) -> Vec<Vec<f32>>` contract.
-        // We wrap each scalar score as a 1-element Vec so the batcher's
-        // per-item "one vector per text" semantics still holds (the E3
-        // handler unwraps each inner Vec and takes element 0). The
-        // `into_iter`/`.map` form avoids the pointless copy that
-        // `.iter().map(|&s| vec![s])` would produce.
-        let batcher = if cfg.batching_enabled {
-            let rr = model_arc.clone();
-            let b = batcher::DynamicBatcher::with_tokens(
+    if !cfg.multi_process {
+        for def in &cfg.rerankers {
+            tracing::info!(reranker = %def.name, dir = %def.dir, "loading reranker");
+            let m = RerankerModel::load(
                 &def.name,
-                move |token_ids| {
-                    rr.score_pairs(&token_ids)
-                        .map(|scores| scores.into_iter().map(|s| vec![s]).collect())
-                },
-                cfg.batch_max_tokens,
-                // Use reranker-specific cap (defaults to 4× batch_max).
-                // Embed batchers still use cfg.batch_max — see the embed
-                // model loop above.
-                cfg.reranker_batch_max,
-                cfg.batch_max_seq,
+                &def.dir,
+                def.max_len,
                 def.padded_model,
-                cfg.batch_wait_ms,
-                cfg.max_queue_size,
-            );
-            Some(Arc::new(b))
-        } else {
-            None
-        };
+                cfg.reranker_intra_threads,
+                cfg.reranker_pool_size,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("failed to load reranker '{}': {e}", def.name);
+                std::process::exit(1);
+            });
+            // Pre-warm every session in the pool at every configured batch
+            // shape so the FIRST production request at each shape doesn't
+            // pay graph compile + arena alloc cost (~3s observed on cold
+            // gte-multi-rerank vs ~1.5s steady state). Default shape list is
+            // `[1, 5]` — batch=1 covers the static fast-path single-pair
+            // calls, batch=5 covers memdb-go's D7 sub-query fanout default.
+            // Override via `RERANK_WARMUP_BATCH_SIZES`. Best-effort:
+            // warmup failure is logged but does not abort boot — the
+            // server still serves correctly without it.
+            if let Err(e) = m.warmup(&cfg.rerank_warmup_batch_sizes, cfg.embed_warmup_seq_len) {
+                tracing::error!(reranker = %def.name, error = %e, "reranker warmup failed (non-fatal)");
+            }
+            let model_arc = Arc::new(m);
 
-        reranker_entries.insert(
-            def.name.clone(),
-            RerankerEntry {
-                model: model_arc,
-                batcher,
-            },
-        );
+            // Adapter bridging `RerankerModel::score_pairs -> Vec<f32>` into
+            // `DynamicBatcher`'s `Fn(Vec<Vec<u32>>) -> Vec<Vec<f32>>` contract.
+            // We wrap each scalar score as a 1-element Vec so the batcher's
+            // per-item "one vector per text" semantics still holds (the E3
+            // handler unwraps each inner Vec and takes element 0). The
+            // `into_iter`/`.map` form avoids the pointless copy that
+            // `.iter().map(|&s| vec![s])` would produce.
+            let batcher = if cfg.batching_enabled {
+                let rr = model_arc.clone();
+                let b = batcher::DynamicBatcher::with_tokens(
+                    &def.name,
+                    move |token_ids| {
+                        rr.score_pairs(&token_ids)
+                            .map(|scores| scores.into_iter().map(|s| vec![s]).collect())
+                    },
+                    cfg.batch_max_tokens,
+                    // Use reranker-specific cap (defaults to 4× batch_max).
+                    // Embed batchers still use cfg.batch_max — see the embed
+                    // model loop above.
+                    cfg.reranker_batch_max,
+                    cfg.batch_max_seq,
+                    def.padded_model,
+                    cfg.batch_wait_ms,
+                    cfg.max_queue_size,
+                );
+                Some(Arc::new(b))
+            } else {
+                None
+            };
+
+            reranker_entries.insert(
+                def.name.clone(),
+                RerankerEntry {
+                    model: Some(model_arc),
+                    batcher,
+                },
+            );
+        }
+    } else {
+        // Multi-process: metadata-only reranker entries.
+        for def in &cfg.rerankers {
+            reranker_entries.insert(
+                def.name.clone(),
+                RerankerEntry {
+                    model: None,
+                    batcher: None,
+                },
+            );
+        }
     }
 
     // SPLADE loading loop. Mirrors the reranker block exactly except
     // there's no batcher integration in v1 — `SpladeEntry::batcher` is
     // always `None` for now. Fail loudly on load errors (same fail-at-
     // boot stance as the embedding/reranker loops).
+    // When EMBED_MULTI_PROCESS=1, SPLADE sessions are skipped; metadata-only
+    // entries keep name resolution working.
     let mut splade_entries: HashMap<String, SpladeEntry> = HashMap::new();
-    for def in &cfg.splades {
-        tracing::info!(splade = %def.name, dir = %def.dir, "loading splade");
-        let m = SpladeModel::load(
-            &def.name,
-            &def.dir,
-            def.max_len,
-            cfg.splade_intra_threads,
-            cfg.splade_pool_size,
-        )
-        .unwrap_or_else(|e| {
-            eprintln!("failed to load splade '{}': {e}", def.name);
-            std::process::exit(1);
-        });
-        // Pre-warm every SPLADE session. SPLADE inference is intrinsically
-        // batch=1 (single text in, sparse vector out — see model_splade.rs),
-        // so the shape list for SPLADE typically has one entry; default
-        // is `[1]`. Override via `SPLADE_WARMUP_BATCH_SIZES` only if a
-        // future SPLADE batched API lands.
-        if let Err(e) = m.warmup(&cfg.splade_warmup_batch_sizes) {
-            tracing::error!(splade = %def.name, error = %e, "splade warmup failed (non-fatal)");
+    if !cfg.multi_process {
+        for def in &cfg.splades {
+            tracing::info!(splade = %def.name, dir = %def.dir, "loading splade");
+            let m = SpladeModel::load(
+                &def.name,
+                &def.dir,
+                def.max_len,
+                cfg.splade_intra_threads,
+                cfg.splade_pool_size,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("failed to load splade '{}': {e}", def.name);
+                std::process::exit(1);
+            });
+            // Pre-warm every SPLADE session. SPLADE inference is intrinsically
+            // batch=1 (single text in, sparse vector out — see model_splade.rs),
+            // so the shape list for SPLADE typically has one entry; default
+            // is `[1]`. Override via `SPLADE_WARMUP_BATCH_SIZES` only if a
+            // future SPLADE batched API lands.
+            if let Err(e) = m.warmup(&cfg.splade_warmup_batch_sizes) {
+                tracing::error!(splade = %def.name, error = %e, "splade warmup failed (non-fatal)");
+            }
+            splade_entries.insert(
+                def.name.clone(),
+                SpladeEntry {
+                    model: Some(Arc::new(m)),
+                    // v1: no dynamic batcher. Follow-up will populate this
+                    // once we observe SPLADE traffic shape and decide
+                    // whether per-batch padding amortisation is worth the
+                    // adapter complexity.
+                    batcher: None,
+                },
+            );
         }
-        splade_entries.insert(
-            def.name.clone(),
-            SpladeEntry {
-                model: Arc::new(m),
-                // v1: no dynamic batcher. Follow-up will populate this
-                // once we observe SPLADE traffic shape and decide
-                // whether per-batch padding amortisation is worth the
-                // adapter complexity.
-                batcher: None,
-            },
-        );
+    } else {
+        // Multi-process: metadata-only SPLADE entries.
+        for def in &cfg.splades {
+            splade_entries.insert(
+                def.name.clone(),
+                SpladeEntry {
+                    model: None,
+                    batcher: None,
+                },
+            );
+        }
     }
 
+    let inproc_embed = model_entries.values().filter(|e| e.model.is_some()).count();
+    let inproc_rerank = reranker_entries
+        .values()
+        .filter(|e| e.model.is_some())
+        .count();
+    let inproc_splade = splade_entries
+        .values()
+        .filter(|e| e.model.is_some())
+        .count();
     tracing::info!(
+        multi_process = cfg.multi_process,
         batching_enabled = cfg.batching_enabled,
-        models = model_entries.len(),
-        rerankers = reranker_entries.len(),
-        splades = splade_entries.len(),
-        "app state ready"
+        metadata_models = model_entries.len(),
+        in_process_models = inproc_embed,
+        metadata_rerankers = reranker_entries.len(),
+        in_process_rerankers = inproc_rerank,
+        metadata_splades = splade_entries.len(),
+        in_process_splades = inproc_splade,
+        "model registry built"
     );
 
     let drain_timeout = Duration::from_secs(cfg.drain_timeout_s);
@@ -514,10 +580,8 @@ async fn main() {
     // model). Sequential await would add 30-50s to startup and trip dozor's
     // smoke-test deadline (canary_smoke_timeout=120s in deploy-repos.yaml).
     let worker_pool: Option<Arc<crate::supervisor::WorkerPool>> = if cfg.multi_process {
-        tracing::info!("multi-process mode enabled — spawning worker pool");
-        tracing::warn!(
-            "EMBED_MULTI_PROCESS=1 — embed/rerank/splade models route through workers. \
-             In-process sessions also loaded (memory overhead until Phase 3 lazy-load lands)."
+        tracing::info!(
+            "multi-process mode enabled — spawning worker pool (in-process sessions skipped)"
         );
         let pool = crate::supervisor::WorkerPool::new();
 

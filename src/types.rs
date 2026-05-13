@@ -17,19 +17,49 @@ use crate::token_cache::TokenCache;
 
 // --- State ---
 
-/// Entry for a single model: its inference handle and optional batcher.
+/// Entry for a single model: its inference handle (optional in multi-process
+/// mode) and optional batcher.
+///
+/// When `EMBED_MULTI_PROCESS=1` the supervisor never loads ONNX sessions;
+/// `model` is `None` and all inference routes through the worker pool.
+/// When `EMBED_MULTI_PROCESS=0` (default / legacy), `model` is `Some` and
+/// the batcher / direct `spawn_blocking` paths are used.
 pub struct ModelEntry {
-    pub model: Arc<EmbedModel>,
+    /// ONNX session. `None` when multi-process mode is active — inference
+    /// is handled exclusively by the worker pool in that case.
+    pub model: Option<Arc<EmbedModel>>,
     pub batcher: Option<Arc<DynamicBatcher>>,
 }
 
-/// Entry for a single cross-encoder reranker: its inference handle plus
-/// the batcher adapter wired in `main.rs`. The batcher's `Vec<Vec<f32>>`
-/// contract is bent to fit a scalar-per-pair model by returning
-/// 1-element inner vecs — see the adapter comment in `main.rs`.
+impl ModelEntry {
+    /// Returns the ONNX session for legacy in-process inference.
+    ///
+    /// Panics with a clear message if called on a metadata-only entry
+    /// (i.e. when `EMBED_MULTI_PROCESS=1`). Callers in `api.rs` only
+    /// reach this after the `worker_pool.is_none()` guard, so this is a
+    /// programming error, not a user error.
+    ///
+    /// Used in tests; production call sites use `.model.as_ref().expect(...)` inline
+    /// to satisfy Rust's type checker on reference depth.
+    #[allow(dead_code)]
+    pub fn require_model(&self) -> &Arc<EmbedModel> {
+        self.model.as_ref().expect(
+            "in-process EmbedModel session required but not loaded (EMBED_MULTI_PROCESS=1?)",
+        )
+    }
+}
+
+/// Entry for a single cross-encoder reranker: its inference handle (optional
+/// in multi-process mode) plus the batcher adapter wired in `main.rs`.
+///
+/// When multi-process mode is active, `model` is `None` and inference routes
+/// through the worker pool. The batcher's `Vec<Vec<f32>>` contract is bent
+/// to fit a scalar-per-pair model by returning 1-element inner vecs — see the
+/// adapter comment in `main.rs`.
 pub struct RerankerEntry {
     #[allow(dead_code)] // consumed by /v1/rerank handler (E3)
-    pub model: Arc<RerankerModel>,
+    /// ONNX session. `None` when multi-process mode is active.
+    pub model: Option<Arc<RerankerModel>>,
     /// Reranker batching reuses the same `BATCHING_ENABLED` switch as
     /// embeddings: when true the handler dispatches through this batcher,
     /// when false `main.rs` leaves it `None` and the handler (E3) falls
@@ -38,17 +68,40 @@ pub struct RerankerEntry {
     pub batcher: Option<Arc<DynamicBatcher>>,
 }
 
+impl RerankerEntry {
+    /// Returns the ONNX session for legacy in-process inference. Panics if
+    /// called on a metadata-only entry (multi-process mode).
+    #[allow(dead_code)]
+    pub fn require_model(&self) -> &Arc<RerankerModel> {
+        self.model.as_ref().expect(
+            "in-process RerankerModel session required but not loaded (EMBED_MULTI_PROCESS=1?)",
+        )
+    }
+}
+
 /// Entry for a single SPLADE sparse encoder. v1 is batcher-free —
 /// `/v1/sparse_embeddings` dispatches one `spawn_blocking` per text
 /// rather than queuing into `DynamicBatcher`. The field is reserved
 /// here so a follow-up batcher wiring can land without changing
 /// `AppState`'s shape.
 pub struct SpladeEntry {
-    pub model: Arc<SpladeModel>,
+    /// ONNX session. `None` when multi-process mode is active.
+    pub model: Option<Arc<SpladeModel>>,
     /// Reserved for batcher integration in a follow-up. Always `None`
     /// in v1 — present so the field exists when batching is wired up.
     #[allow(dead_code)]
     pub batcher: Option<Arc<DynamicBatcher>>,
+}
+
+impl SpladeEntry {
+    /// Returns the ONNX session for legacy in-process inference. Panics if
+    /// called on a metadata-only entry (multi-process mode).
+    #[allow(dead_code)]
+    pub fn require_model(&self) -> &Arc<SpladeModel> {
+        self.model.as_ref().expect(
+            "in-process SpladeModel session required but not loaded (EMBED_MULTI_PROCESS=1?)",
+        )
+    }
 }
 
 /// Shared application state.
@@ -235,4 +288,86 @@ pub fn error_json(msg: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
             },
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ModelEntry with model=None (metadata-only, multi-process mode) should
+    /// compile and its `model` field should be None.
+    #[test]
+    fn model_entry_metadata_only_has_no_session() {
+        let entry = ModelEntry {
+            model: None,
+            batcher: None,
+        };
+        assert!(
+            entry.model.is_none(),
+            "metadata-only entry must have no ONNX session"
+        );
+    }
+
+    /// RerankerEntry with model=None should compile and its `model` field
+    /// should be None.
+    #[test]
+    fn reranker_entry_metadata_only_has_no_session() {
+        let entry = RerankerEntry {
+            model: None,
+            batcher: None,
+        };
+        assert!(
+            entry.model.is_none(),
+            "metadata-only reranker entry must have no ONNX session"
+        );
+    }
+
+    /// SpladeEntry with model=None should compile and its `model` field
+    /// should be None.
+    #[test]
+    fn splade_entry_metadata_only_has_no_session() {
+        let entry = SpladeEntry {
+            model: None,
+            batcher: None,
+        };
+        assert!(
+            entry.model.is_none(),
+            "metadata-only splade entry must have no ONNX session"
+        );
+    }
+
+    /// require_model() on a metadata-only ModelEntry must panic with a clear
+    /// message so operators get an actionable error instead of a cryptic
+    /// null-deref.
+    #[test]
+    #[should_panic(expected = "in-process EmbedModel session required but not loaded")]
+    fn model_entry_require_model_panics_on_none() {
+        let entry = ModelEntry {
+            model: None,
+            batcher: None,
+        };
+        let _ = entry.require_model();
+    }
+
+    /// require_model() on a metadata-only RerankerEntry must panic.
+    #[test]
+    #[should_panic(expected = "in-process RerankerModel session required but not loaded")]
+    fn reranker_entry_require_model_panics_on_none() {
+        let entry = RerankerEntry {
+            model: None,
+            batcher: None,
+        };
+        let _ = entry.require_model();
+    }
+
+    /// require_model() on a metadata-only SpladeEntry must panic.
+    #[test]
+    #[should_panic(expected = "in-process SpladeModel session required but not loaded")]
+    fn splade_entry_require_model_panics_on_none() {
+        let entry = SpladeEntry {
+            model: None,
+            batcher: None,
+        };
+        let _ = entry.require_model();
+    }
 }

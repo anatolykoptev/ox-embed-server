@@ -270,7 +270,13 @@ pub async fn embeddings(
         //
         // Tokenize only the unique miss texts. Runs on spawn_blocking because
         // tokenization is CPU-bound and would contend with the async runtime.
-        let model = entry.model.clone();
+        let model = entry
+            .model
+            .as_ref()
+            .expect(
+                "in-process EmbedModel session required but not loaded (EMBED_MULTI_PROCESS=1?)",
+            )
+            .clone();
         let tokenize_input = pending_texts.clone();
         let token_ids =
             match tokio::task::spawn_blocking(move || model.tokenize(&tokenize_input)).await {
@@ -367,7 +373,13 @@ pub async fn embeddings(
             }
         } else {
             // Legacy path: run in spawn_blocking to avoid holding the async executor on sync ort call.
-            let model = entry.model.clone();
+            let model = entry
+                .model
+                .as_ref()
+                .expect(
+                    "in-process EmbedModel session required but not loaded (EMBED_MULTI_PROCESS=1?)",
+                )
+                .clone();
             let infer_start = std::time::Instant::now();
             let result = tokio::task::spawn_blocking(move || model.embed_tokens(&token_ids))
                 .await
