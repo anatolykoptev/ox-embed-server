@@ -190,8 +190,10 @@ pub async fn sparse_embeddings(
                 .into_response();
             }
             Ok(crate::ipc::protocol::WorkerResponse::Err { message, .. }) => {
-                tracing::error!(model = %model_name, worker_error = %message, "worker splade returned error");
-                return server_error(message);
+                let reason = crate::metrics::classify_worker_error(&message);
+                tracing::error!(model = %model_name, reason, worker_error = %message, "worker splade returned error");
+                crate::metrics::record_inference_failure(&model_name, reason, 0);
+                return server_error("splade failed".to_string());
             }
             Ok(_unexpected) => {
                 tracing::error!(model = %model_name, "worker returned unexpected variant for splade request");

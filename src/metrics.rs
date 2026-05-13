@@ -647,6 +647,32 @@ pub fn record_inference_failure(model: &str, reason: &str, bin_num: u32) {
     .increment(1);
 }
 
+/// Classify a worker-side error message into a bounded-cardinality `reason`
+/// label for `embed_inference_failures_total`. Avoids letting raw worker
+/// strings into Prometheus labels (would explode cardinality and leak
+/// internal paths).
+///
+/// Categories:
+/// - `worker_saturated` — semaphore full (try_acquire_owned returned Err)
+/// - `arena_oom` — BFCArena allocation failed
+/// - `kind_mismatch` — supervisor sent wrong message variant to worker
+/// - `tokenize` — tokenizer error
+/// - `other` — fallback bucket for uncategorized errors (track via logs)
+pub fn classify_worker_error(message: &str) -> &'static str {
+    let m = message.to_ascii_lowercase();
+    if m.contains("saturated") {
+        "worker_saturated"
+    } else if m.contains("arena") || m.contains("bfcarena") || m.contains("oom") {
+        "arena_oom"
+    } else if m.contains("kind mismatch") {
+        "kind_mismatch"
+    } else if m.contains("tokeniz") {
+        "tokenize"
+    } else {
+        "other"
+    }
+}
+
 // ---------------------------------------------------------------------
 // Rerank-specific instrumentation (Phase 1A — 2026-05-01).
 //

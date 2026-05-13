@@ -440,12 +440,15 @@ pub async fn rerank(
                 request_id,
                 message,
             }) => {
+                let reason = crate::metrics::classify_worker_error(&message);
                 tracing::error!(
                     model = %model_name,
                     request_id,
+                    reason,
                     worker_error = %message,
                     "worker rerank returned error"
                 );
+                crate::metrics::record_inference_failure(&model_name, reason, 0);
                 finish!("server_error", server_error("rerank failed".to_string()));
             }
             Ok(_unexpected) => {
