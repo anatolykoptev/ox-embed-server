@@ -18,8 +18,19 @@ use embed_server::ipc::protocol::{
 use embed_server::model::{StandaloneEmbedder, StandaloneReranker, StandaloneSplade};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::net::UnixListener;
 use tokio::sync::Semaphore;
+
+// Counter for tasks waiting to acquire the per-worker semaphore.
+// When this exceeds MAX_WAITERS, new requests get an immediate
+// "worker queue overflow" error instead of joining an unbounded
+// wait list. MAX_WAITERS = 8 × pool_size (minimum 16) gives
+// breathing room for short-burst convoys without runaway memory.
+// tokio::sync::Semaphore has no built-in max-waiter cap, so
+// acquire_owned().await would otherwise queue requests without
+// bound under pathological bursts.
+static WAITERS: AtomicUsize = AtomicUsize::new(0);
 
 fn require_env(var: &str) -> anyhow::Result<String> {
     std::env::var(var).map_err(|_e| {
@@ -142,13 +153,41 @@ async fn main() -> anyhow::Result<()> {
                 // queues requests at the worker; supervisor-side
                 // WorkerPool::dispatch_timeout (30s) caps the upper bound,
                 // so a stuck worker still surfaces as a real error after 30s.
+                //
+                // Waiter cap: tokio::Semaphore has no built-in max-waiter
+                // limit. Under pathological bursts, unbounded acquire_owned
+                // futures queue memory without bound. WAITERS tracks in-flight
+                // waiters; once > 8×pool_size (floor 16), new requests fail
+                // fast with "worker queue overflow" so callers get an
+                // immediate error instead of accumulating silently.
+                let max_waiters = pool_size.saturating_mul(8).max(16);
+                let waiters_now = WAITERS.fetch_add(1, Ordering::Relaxed);
+                if waiters_now >= max_waiters {
+                    WAITERS.fetch_sub(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        waiters = waiters_now,
+                        max_waiters,
+                        "worker queue overflow — rejecting request"
+                    );
+                    let resp = WorkerResponse::Err {
+                        request_id: req.request_id(),
+                        message: "worker queue overflow".into(),
+                    };
+                    let _ = write_frame(&mut stream, &resp).await;
+                    continue;
+                }
+
                 // Acquired permit drops at end of iteration — automatic release.
                 let _permit = match semaphore.clone().acquire_owned().await {
-                    Ok(p) => p,
+                    Ok(p) => {
+                        WAITERS.fetch_sub(1, Ordering::Relaxed);
+                        p
+                    }
                     Err(_) => {
                         // Only fires if the semaphore was explicitly closed —
                         // we never call close(), so this is unreachable in
                         // current code. Future-proof: surface as a clear error.
+                        WAITERS.fetch_sub(1, Ordering::Relaxed);
                         let resp = WorkerResponse::Err {
                             request_id: req.request_id(),
                             message: "worker semaphore closed".into(),
