@@ -38,10 +38,23 @@
 //! in parallel, at N× the per-session memory cost).
 #![allow(dead_code)]
 
+use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
+
+// Thread-local accumulator for the [vocab] sparse pool buffer
+// (~122 KiB at vocab=30522). Reused across `encode_sparse` calls on
+// the same tokio worker thread — saves a per-request heap alloc +
+// zero-fill. `clear() + resize()` guarantees a fresh-zeroed buffer
+// while preserving capacity. Per-thread isolation is safe: each
+// `encode_sparse` call holds the `RefCell` mutably for the duration
+// of its sweep + top-k extraction; no nested calls possible (sync
+// code, no `.await` inside the `with` closure).
+thread_local! {
+    static SPARSE_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+}
 
 use ndarray::Array2;
 use ort::session::Session;
@@ -352,48 +365,61 @@ impl SpladeModel {
         // Allocating `[seq, vocab]` intermediate would waste memory
         // (~512 * 30522 * 4 bytes = 62 MB per request). Instead we keep
         // a running `[vocab]` max as we sweep seq positions.
+        //
+        // The `[vocab]` accumulator buffer (~122 KiB at vocab=30522) is
+        // reused via `thread_local!` across requests on the same tokio
+        // worker thread — avoids per-request heap alloc + zero-fill.
         let vocab = self.vocab_size;
-        let mut sparse = vec![0.0f32; vocab];
-        for j in 0..seq_len {
-            // Mask is all-ones in single-text mode (built above), but we
-            // honour it for parity with the formula. A 0 mask would zero
-            // the contribution from this seq position.
-            let m = mask_i64[j] as f32;
-            if m == 0.0 {
-                continue;
-            }
-            for k in 0..vocab {
-                let lo = raw[[0, j, k]];
-                if lo > 0.0 {
-                    // log1p(x) = ln(1 + x); SPLADE uses natural log.
-                    let w = (1.0 + lo).ln() * m;
-                    if w > sparse[k] {
-                        sparse[k] = w;
+        SPARSE_BUF.with(|cell| -> Result<Vec<(u32, f32)>, String> {
+            let mut sparse = cell.borrow_mut();
+            sparse.clear();
+            sparse.resize(vocab, 0.0);
+
+            for j in 0..seq_len {
+                // Mask is all-ones in single-text mode (built above), but we
+                // honour it for parity with the formula. A 0 mask would zero
+                // the contribution from this seq position.
+                let m = mask_i64[j] as f32;
+                if m == 0.0 {
+                    continue;
+                }
+                for k in 0..vocab {
+                    let lo = raw[[0, j, k]];
+                    if lo > 0.0 {
+                        // log1p(x) = ln(1 + x); SPLADE uses natural log.
+                        let w = (1.0 + lo).ln() * m;
+                        if w > sparse[k] {
+                            sparse[k] = w;
+                        }
                     }
                 }
             }
-        }
 
-        // Collect indices/weights above the min_weight threshold and
-        // partial-sort by weight desc, taking only top_k. For top_k <<
-        // vocab we could use a binary heap; the straightforward sort
-        // is fast enough at top_k=256, vocab=30522 (one Vec, one sort)
-        // and keeps the code simple.
-        let mut entries: Vec<(u32, f32)> = sparse
-            .into_iter()
-            .enumerate()
-            .filter_map(|(idx, w)| {
-                if w > min_weight {
-                    Some((idx as u32, w))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        // Descending by weight; `total_cmp` for total order over f32.
-        entries.sort_by(|a, b| b.1.total_cmp(&a.1));
-        entries.truncate(top_k);
-        Ok(entries)
+            // Collect indices/weights above min_weight, then take top_k via
+            // `select_nth_unstable_by` (O(n) partial-sort) instead of full
+            // O(n log n) sort. For n~800 active terms and top_k=256, that's
+            // 800 + 256·log(256) = ~2850 ops vs 7700 for full sort — ~2.7× win.
+            let mut entries: Vec<(u32, f32)> = sparse
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, &w)| {
+                    if w > min_weight {
+                        Some((idx as u32, w))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if entries.len() > top_k {
+                // Partition: first `top_k` entries are the top-k by weight desc
+                // (unordered among themselves).
+                entries.select_nth_unstable_by(top_k - 1, |a, b| b.1.total_cmp(&a.1));
+                entries.truncate(top_k);
+            }
+            // Final sort of the (now small) top-k slice.
+            entries.sort_by(|a, b| b.1.total_cmp(&a.1));
+            Ok(entries)
+        })
     }
 
     /// Pre-warm every session in the pool by running one dummy
