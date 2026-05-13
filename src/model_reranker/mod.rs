@@ -224,11 +224,11 @@ impl RerankerModel {
         // sequence contributes `min(len, max_len)` tokens of actual compute;
         // the rest of the `[batch, max_seq]` tensor is padding.
         let real_tokens: usize = token_ids.iter().map(|v| v.len().min(self.max_len)).sum();
-        // Reuse `pool::build_tensors_from_ids` — the `tti` output slot is
-        // intentionally discarded because the reranker ONNX graph has no
-        // `token_type_ids` input (confirmed via `Session::inputs()` at load).
+        // Reuse `pool::build_tensors_from_ids` with `with_tti = false` — the
+        // reranker ONNX graph has no `token_type_ids` input (confirmed via
+        // `Session::inputs()` at load), so we skip the allocation entirely.
         let (ids, mask_i64, _tti) =
-            pool::build_tensors_from_ids(token_ids, batch, max_seq, self.pad_id);
+            pool::build_tensors_from_ids(token_ids, batch, max_seq, self.pad_id, false);
 
         let ids_arr =
             Array2::from_shape_vec([batch, max_seq], ids).map_err(|e| format!("ids shape: {e}"))?;
@@ -317,7 +317,7 @@ impl RerankerModel {
         let real_tokens: usize = token_ids.iter().map(|v| v.len().min(static_seq)).sum();
 
         let (ids, mask_i64, _tti) =
-            pool::build_tensors_from_ids(token_ids, batch, static_seq, self.pad_id);
+            pool::build_tensors_from_ids(token_ids, batch, static_seq, self.pad_id, false);
 
         let ids_arr = Array2::from_shape_vec([batch, static_seq], ids)
             .map_err(|e| format!("static ids shape: {e}"))?;
@@ -454,7 +454,7 @@ impl RerankerModel {
             Some(n) => n.min(self.max_len).max(1),
         };
         let (ids, mask_i64, _tti) =
-            pool::build_tensors_from_ids(&token_ids, batch, max_seq, self.pad_id);
+            pool::build_tensors_from_ids(&token_ids, batch, max_seq, self.pad_id, false);
 
         // Warm EACH session in the pool — without this, only the first
         // session served by round-robin would be hot; the second would

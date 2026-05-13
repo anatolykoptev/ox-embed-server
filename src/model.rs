@@ -390,8 +390,13 @@ impl EmbedModel {
         // Snapshot RSS before inference for peak-bytes delta.
         let rss_before = read_rss_bytes();
 
-        let (ids, mask_i64, tti) =
-            pool::build_tensors_from_ids(token_ids, batch, max_seq, self.pad_id);
+        let (ids, mask_i64, tti_opt) = pool::build_tensors_from_ids(
+            token_ids,
+            batch,
+            max_seq,
+            self.pad_id,
+            self.has_token_type_ids,
+        );
 
         let ids_arr =
             Array2::from_shape_vec([batch, max_seq], ids).map_err(|e| format!("ids shape: {e}"))?;
@@ -400,6 +405,18 @@ impl EmbedModel {
 
         let ids_tensor = Tensor::from_array(ids_arr).map_err(|e| format!("ids tensor: {e}"))?;
         let mask_tensor = Tensor::from_array(mask_arr).map_err(|e| format!("mask tensor: {e}"))?;
+
+        // Build tti tensor only when the model uses it (Some branch).
+        // XLM-RoBERTa / RoBERTa / DistilBERT don't have a token_type_ids input,
+        // so tti_opt is None for those models and we skip the tensor entirely.
+        let tti_tensor_opt = match tti_opt {
+            Some(tti_vec) => {
+                let tti_arr = Array2::from_shape_vec([batch, max_seq], tti_vec)
+                    .map_err(|e| format!("tti shape: {e}"))?;
+                Some(Tensor::from_array(tti_arr).map_err(|e| format!("tti tensor: {e}"))?)
+            }
+            None => None,
+        };
 
         // Acquire a free session from the pool. With pool_size==1 this always
         // picks the single slot — identical to the legacy single-Mutex<Session>
@@ -416,11 +433,7 @@ impl EmbedModel {
         let run_result = match &self.run_options {
             Some(opts) => {
                 crate::metrics::record_arena_shrink_call(&self.name);
-                if self.has_token_type_ids {
-                    let tti_arr = Array2::from_shape_vec([batch, max_seq], tti)
-                        .map_err(|e| format!("tti shape: {e}"))?;
-                    let tti_tensor =
-                        Tensor::from_array(tti_arr).map_err(|e| format!("tti tensor: {e}"))?;
+                if let Some(tti_tensor) = tti_tensor_opt {
                     session.run_with_options(
                         ort::inputs! {
                             "input_ids" => ids_tensor,
@@ -440,11 +453,7 @@ impl EmbedModel {
                 }
             }
             None => {
-                if self.has_token_type_ids {
-                    let tti_arr = Array2::from_shape_vec([batch, max_seq], tti)
-                        .map_err(|e| format!("tti shape: {e}"))?;
-                    let tti_tensor =
-                        Tensor::from_array(tti_arr).map_err(|e| format!("tti tensor: {e}"))?;
+                if let Some(tti_tensor) = tti_tensor_opt {
                     session.run(ort::inputs! {
                         "input_ids" => ids_tensor,
                         "attention_mask" => mask_tensor,
@@ -566,8 +575,13 @@ impl EmbedModel {
             None => self.max_len,
             Some(n) => n.min(self.max_len).max(1),
         };
-        let (ids, mask_i64, tti) =
-            pool::build_tensors_from_ids(&token_ids, batch, max_seq, self.pad_id);
+        let (ids, mask_i64, tti_opt) = pool::build_tensors_from_ids(
+            &token_ids,
+            batch,
+            max_seq,
+            self.pad_id,
+            self.has_token_type_ids,
+        );
 
         // Warm EVERY session in the pool — without this, only the first
         // session served would be hot; the rest pay the cold-start cost
@@ -603,6 +617,19 @@ impl EmbedModel {
             let mask_tensor =
                 Tensor::from_array(mask_arr).map_err(|e| format!("warmup mask tensor: {e}"))?;
 
+            // Build tti tensor once per loop iteration when the model uses it.
+            let tti_tensor_opt = match &tti_opt {
+                Some(tti_vec) => {
+                    let tti_arr = Array2::from_shape_vec([batch, max_seq], tti_vec.clone())
+                        .map_err(|e| format!("warmup tti shape (batch={batch}): {e}"))?;
+                    Some(
+                        Tensor::from_array(tti_arr)
+                            .map_err(|e| format!("warmup tti tensor: {e}"))?,
+                    )
+                }
+                None => None,
+            };
+
             let start = Instant::now();
 
             // Mirror the production path: use run_with_options when shrinkage
@@ -610,11 +637,7 @@ impl EmbedModel {
             // verifies the RunOptions are valid before the first real request.
             let run_result = match &self.run_options {
                 Some(opts) => {
-                    if self.has_token_type_ids {
-                        let tti_arr = Array2::from_shape_vec([batch, max_seq], tti.clone())
-                            .map_err(|e| format!("warmup tti shape (batch={batch}): {e}"))?;
-                        let tti_tensor = Tensor::from_array(tti_arr)
-                            .map_err(|e| format!("warmup tti tensor: {e}"))?;
+                    if let Some(tti_tensor) = tti_tensor_opt {
                         session.run_with_options(
                             ort::inputs! {
                                 "input_ids" => ids_tensor,
@@ -634,11 +657,7 @@ impl EmbedModel {
                     }
                 }
                 None => {
-                    if self.has_token_type_ids {
-                        let tti_arr = Array2::from_shape_vec([batch, max_seq], tti.clone())
-                            .map_err(|e| format!("warmup tti shape (batch={batch}): {e}"))?;
-                        let tti_tensor = Tensor::from_array(tti_arr)
-                            .map_err(|e| format!("warmup tti tensor: {e}"))?;
+                    if let Some(tti_tensor) = tti_tensor_opt {
                         session.run(ort::inputs! {
                             "input_ids" => ids_tensor,
                             "attention_mask" => mask_tensor,
