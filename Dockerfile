@@ -3,8 +3,26 @@
 FROM rust:1.93-slim AS builder
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends pkg-config libssl-dev && \
+    apt-get install -y --no-install-recommends pkg-config libssl-dev curl && \
     rm -rf /var/lib/apt/lists/*
+
+# sccache 0.10: content-addressed compiler cache. Adds value over target/ mount alone
+# in three scenarios: (1) target/ pruned between builds, (2) parallel branches sharing
+# dep code, (3) comment-only source changes that change target/ layer hash but not
+# compiled object content. Paths inside docker are stable (/app) so no --remap-path-prefix
+# needed — cache keys are deterministic and hit rate is high.
+# Download aarch64 or x86_64 musl binary based on build host architecture.
+ENV SCCACHE_VERSION=0.10.0
+RUN ARCH=$(uname -m) && \
+    curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-${ARCH}-unknown-linux-musl.tar.gz" \
+    | tar xz --strip-components=1 -C /usr/local/bin "sccache-v${SCCACHE_VERSION}-${ARCH}-unknown-linux-musl/sccache" && \
+    chmod +x /usr/local/bin/sccache
+
+ENV RUSTC_WRAPPER=/usr/local/bin/sccache
+ENV SCCACHE_DIR=/root/.cache/sccache
+# sccache does not cache incremental build artifacts; disabling avoids wasted work
+# writing incremental state that sccache will never read.
+ENV CARGO_INCREMENTAL=0
 
 WORKDIR /app
 
@@ -22,6 +40,7 @@ RUN mkdir -p src/bin && \
     : > src/lib.rs
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/app/target,sharing=locked \
+    --mount=type=cache,target=/root/.cache/sccache,sharing=locked \
     cargo build --release --locked --bins && \
     rm -rf src
 
@@ -32,11 +51,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 COPY src ./src
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/app/target,sharing=locked \
+    --mount=type=cache,target=/root/.cache/sccache,sharing=locked \
     touch src/main.rs src/bin/worker.rs src/lib.rs && \
     cargo build --release --locked --bins && \
     mkdir -p /binaries && \
     cp target/release/embed-server /binaries/embed-server && \
-    cp target/release/embed-worker /binaries/embed-worker
+    cp target/release/embed-worker /binaries/embed-worker && \
+    sccache --show-stats || true
 
 # --- Runtime stage ---
 FROM debian:trixie-slim
