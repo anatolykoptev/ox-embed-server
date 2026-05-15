@@ -23,14 +23,24 @@ use tokio::net::UnixListener;
 use tokio::sync::Semaphore;
 
 // Counter for tasks waiting to acquire the per-worker semaphore.
-// When this exceeds MAX_WAITERS, new requests get an immediate
+// When this exceeds max_waiters, new requests get an immediate
 // "worker queue overflow" error instead of joining an unbounded
-// wait list. MAX_WAITERS = 8 × pool_size (minimum 16) gives
+// wait list. The limit is configurable via MAX_WAITERS env; the
+// default formula is 8 × pool_size (minimum 16), which gives
 // breathing room for short-burst convoys without runaway memory.
 // tokio::sync::Semaphore has no built-in max-waiter cap, so
 // acquire_owned().await would otherwise queue requests without
 // bound under pathological bursts.
 static WAITERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Resolve the max-waiters limit once at startup.
+/// Reads `MAX_WAITERS` env; falls back to `pool_size × 8` (floor 16).
+fn resolve_max_waiters(pool_size: usize) -> usize {
+    std::env::var("MAX_WAITERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| pool_size.saturating_mul(8).max(16))
+}
 
 fn require_env(var: &str) -> anyhow::Result<String> {
     std::env::var(var).map_err(|_e| {
@@ -70,12 +80,17 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "1".into())
         .parse()?;
 
+    // Resolve max_waiters once at startup -- cheaper than re-reading env
+    // on every request, and captured by copy into the spawned async tasks.
+    let max_waiters = resolve_max_waiters(pool_size);
+
     tracing::info!(
         kind = %kind,
         model = %model_name,
         ?socket_path,
         intra_threads,
         pool_size,
+        max_waiters,
         "worker starting"
     );
 
@@ -157,10 +172,10 @@ async fn main() -> anyhow::Result<()> {
                 // Waiter cap: tokio::Semaphore has no built-in max-waiter
                 // limit. Under pathological bursts, unbounded acquire_owned
                 // futures queue memory without bound. WAITERS tracks in-flight
-                // waiters; once > 8×pool_size (floor 16), new requests fail
-                // fast with "worker queue overflow" so callers get an
+                // waiters; once > max_waiters (resolved at startup from
+                // MAX_WAITERS env, default 8xpool_size floor 16), new requests
+                // fail fast with "worker queue overflow" so callers get an
                 // immediate error instead of accumulating silently.
-                let max_waiters = pool_size.saturating_mul(8).max(16);
                 let waiters_now = WAITERS.fetch_add(1, Ordering::Relaxed);
                 if waiters_now >= max_waiters {
                     WAITERS.fetch_sub(1, Ordering::Relaxed);
@@ -259,5 +274,75 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_max_waiters;
+
+    #[test]
+    fn resolve_max_waiters_default_formula() {
+        // Without MAX_WAITERS set, formula = pool_size x 8, floor 16.
+        let val = {
+            let prev = std::env::var("MAX_WAITERS").ok();
+            // SAFETY: tests run single-threaded (--test-threads=1 not required
+            // for this fn alone, but env mutation is contained: we restore
+            // immediately after the call).
+            unsafe { std::env::remove_var("MAX_WAITERS") };
+            let v = resolve_max_waiters(4);
+            if let Some(p) = prev {
+                unsafe { std::env::set_var("MAX_WAITERS", p) };
+            }
+            v
+        };
+        assert_eq!(val, 32, "4 x 8 = 32");
+    }
+
+    #[test]
+    fn resolve_max_waiters_floor() {
+        // pool_size=1 -> 1x8=8 < 16 -> floor kicks in.
+        let val = {
+            let prev = std::env::var("MAX_WAITERS").ok();
+            unsafe { std::env::remove_var("MAX_WAITERS") };
+            let v = resolve_max_waiters(1);
+            if let Some(p) = prev {
+                unsafe { std::env::set_var("MAX_WAITERS", p) };
+            }
+            v
+        };
+        assert_eq!(val, 16, "floor = 16");
+    }
+
+    #[test]
+    fn resolve_max_waiters_env_override() {
+        // MAX_WAITERS=64 overrides formula regardless of pool_size.
+        let val = {
+            let prev = std::env::var("MAX_WAITERS").ok();
+            unsafe { std::env::set_var("MAX_WAITERS", "64") };
+            let v = resolve_max_waiters(2);
+            match prev {
+                Some(p) => unsafe { std::env::set_var("MAX_WAITERS", p) },
+                None => unsafe { std::env::remove_var("MAX_WAITERS") },
+            }
+            v
+        };
+        assert_eq!(val, 64);
+    }
+
+    #[test]
+    fn resolve_max_waiters_env_invalid_falls_back() {
+        // Non-numeric MAX_WAITERS falls back silently to formula.
+        let val = {
+            let prev = std::env::var("MAX_WAITERS").ok();
+            unsafe { std::env::set_var("MAX_WAITERS", "not-a-number") };
+            let v = resolve_max_waiters(3);
+            match prev {
+                Some(p) => unsafe { std::env::set_var("MAX_WAITERS", p) },
+                None => unsafe { std::env::remove_var("MAX_WAITERS") },
+            }
+            v
+        };
+        assert_eq!(val, 24, "3 x 8 = 24");
     }
 }
