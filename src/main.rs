@@ -722,18 +722,46 @@ async fn main() {
             });
         }
 
+        // Resolve inter-worker spawn stagger to smooth cold-load I/O peak.
+        //
+        // EMBED_WORKER_SPAWN_DELAY_MS (default 2000):
+        //   milliseconds to wait *between* successive tokio::spawn calls.
+        //   First worker spawns immediately; each subsequent worker waits this
+        //   long before its spawn, giving the previous worker's ONNX read a
+        //   head-start on pagecache warm-up.
+        //   Set to 0 to disable (parallel cold-load, original behaviour).
+        //   dozor smoke timeout is 120s; 4 workers × 2s = 6s overhead — well within budget.
+        let spawn_stagger =
+            crate::supervisor::util::resolve_spawn_stagger_ms("EMBED_WORKER_SPAWN_DELAY_MS", 2000);
+        let total_workers = specs.len();
+
         // Fan out spawn — each future independently awaits its worker's UDS socket.
-        let handles: Vec<_> = specs
-            .into_iter()
-            .map(|spec| {
-                let name = spec.model.clone();
-                let kind = spec.kind;
-                tokio::spawn(async move {
-                    let result = crate::supervisor::WorkerSupervisor::launch(spec).await;
-                    (name, kind, result)
-                })
-            })
-            .collect();
+        // Workers are staggered by spawn_stagger to prevent simultaneous ONNX
+        // cold-reads from causing an I/O storm under host RAM pressure.
+        let mut handles: Vec<_> = Vec::with_capacity(total_workers);
+        for (position, spec) in specs.into_iter().enumerate() {
+            if position > 0 {
+                if let Some(delay) = spawn_stagger {
+                    tokio::time::sleep(delay).await;
+                }
+            }
+            let name = spec.model.clone();
+            let kind = spec.kind;
+            let pos_display = position + 1;
+            let delay_ms_display = spawn_stagger.map(|d| d.as_millis()).unwrap_or(0);
+            tracing::info!(
+                model = %name,
+                kind = %kind.as_str(),
+                position = pos_display,
+                total = total_workers,
+                delay_ms = delay_ms_display,
+                "spawning worker"
+            );
+            handles.push(tokio::spawn(async move {
+                let result = crate::supervisor::WorkerSupervisor::launch(spec).await;
+                (name, kind, result)
+            }));
+        }
 
         // Collect results — any failure aborts startup.
         for h in handles {
