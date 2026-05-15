@@ -4,7 +4,7 @@
 
 ### Features
 
-* **worker:** `MAX_WAITERS` env var makes waiter-queue cap configurable (default: `8×pool_size`, floor 16). Resolves queue-overflow errors under large bulk-indexing bursts without requiring a pool_size bump.
+* **worker:** `EMBED_MAX_WAITERS` env var makes waiter-queue cap configurable (default: `8×pool_size`, floor 16). Resolves queue-overflow errors under large bulk-indexing bursts without requiring a pool_size bump.
 
 
 ## [0.6.0](https://github.com/anatolykoptev/ox-embed-server/compare/embed-server-v0.5.0...embed-server-v0.6.0) (2026-05-02)
