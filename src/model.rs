@@ -1474,6 +1474,10 @@ impl StandaloneReranker {
             "reranker loaded; max_seq_len from IPC is advisory (tokenizer truncates at load-time max_len)"
         );
         // Warmup -- mirrors main.rs:393 single-process path (omitted in PR #68).
+        // Note: reuses cfg.embed_warmup_seq_len because no separate RERANK_WARMUP_SEQ_LEN
+        // knob exists yet (matches single-process behaviour). If operator tunes EMBED_WARMUP_SEQ_LEN
+        // for embedder memory, reranker warmup coverage shrinks proportionally. Follow-up:
+        // expose a dedicated rerank_warmup_seq_len if this becomes load-bearing.
         if let Err(e) = inner.warmup(&cfg.rerank_warmup_batch_sizes, cfg.embed_warmup_seq_len) {
             tracing::error!(model = %model_name, error = %e, "reranker worker warmup failed (non-fatal)");
         }

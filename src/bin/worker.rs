@@ -110,9 +110,9 @@ fn resolve_max_waiters(pool_size: usize) -> usize {
 /// that exposes `/metrics` for Prometheus scraping.
 ///
 /// Port assignment: the supervisor sets `EMBED_WORKER_METRICS_PORT` to
-/// `EMBED_WORKER_METRICS_PORT_BASE + <worker-index>` (default base 19200).
+/// `EMBED_WORKER_METRICS_PORT_BASE + <worker-index>` (default base 8200).
 /// Workers are indexed in spawn order across embed + rerank + splade pools.
-/// Example with two embed models: jina-code-v2 → 19200, e5-large → 19201.
+/// Example with two embed models: jina-code-v2 → 8200, e5-large → 8201.
 ///
 /// If the env var is unset, the recorder is still installed (so arena /
 /// batcher counters accumulate) but no HTTP port is opened — back-compat
