@@ -75,7 +75,7 @@ impl CacheDir {
     ///   - directory does not exist and cannot be created
     ///   - directory is not writable (read-only FS, permission denied)
     pub fn from_env_for_model(model_key: &str) -> Option<Self> {
-        let suffix = model_key.to_uppercase().replace('-', "_");
+        let suffix = crate::config::model_env_key(model_key);
         let per_model_key = format!("ONNX_OPT_CACHE_DIR_{suffix}");
 
         // Per-model env takes precedence over global.

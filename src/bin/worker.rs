@@ -211,6 +211,8 @@ async fn main() -> anyhow::Result<()> {
     // Install Prometheus recorder. If EMBED_WORKER_METRICS_PORT is set, also
     // spawns a lightweight HTTP /metrics server for per-worker scraping.
     // Must happen before arena registration (which emits gauges).
+    // Held for process lifetime: dropping this handle shuts down the metrics
+    // HTTP server, making /metrics unreachable for the rest of the worker life.
     let _metrics_handle = install_worker_metrics(&model_name);
 
     // Register the shared CPU arena BEFORE any Session::builder() call.

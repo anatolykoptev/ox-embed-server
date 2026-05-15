@@ -138,7 +138,7 @@ impl SpladeModel {
         // Per-model override: ONNX_OPT_CACHE_DIR_<MODEL_KEY_UPPER> takes
         // precedence over the global ONNX_OPT_CACHE_DIR.
         let cache = CacheDir::from_env_for_model(name);
-        let key = name.to_uppercase().replace('-', "_");
+        let key = crate::config::model_env_key(&name);
         let memory_pattern = crate::config::parse_memory_pattern(
             std::env::var(format!("EMBED_MEMORY_PATTERN_{key}"))
                 .ok()

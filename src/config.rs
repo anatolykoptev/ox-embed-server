@@ -434,7 +434,7 @@ impl Config {
         };
 
         let embed_pool_size =
-            parse_embed_pool_size(env::var("EMBED_SESSION_POOL_SIZE").ok().as_deref());
+            parse_embed_pool_size(env::var("EMBED_SESSION_POOL_SIZE").ok().as_deref(), None);
 
         let reranker_pool_size =
             parse_reranker_pool_size(env::var("RERANKER_SESSION_POOL_SIZE").ok().as_deref());
@@ -787,14 +787,20 @@ fn parse_embed_warmup_seq_len(raw: Option<&str>) -> Option<usize> {
 /// has no shared-weights mode, so each pool member duplicates the
 /// ~400 MiB weight buffer — operators opt in only when they have the
 /// memory headroom AND want concurrency. Exposed for testing.
-fn parse_embed_pool_size(raw: Option<&str>) -> usize {
+///
+/// `source_key` is the exact env var name that provided `raw`, used in
+/// warn messages so operators see `EMBED_SESSION_POOL_SIZE_JINA_CODE_V2=0`
+/// rather than the generic `EMBED_SESSION_POOL_SIZE=0`. Pass `None` when
+/// the key is not known (falls back to the generic message).
+fn parse_embed_pool_size(raw: Option<&str>, source_key: Option<&str>) -> usize {
     const DEFAULT: usize = 1;
+    let key = source_key.unwrap_or("EMBED_SESSION_POOL_SIZE");
     match raw {
         None => DEFAULT,
         Some(s) => match s.trim().parse::<usize>() {
             Ok(0) => {
                 tracing::warn!(
-                    "EMBED_SESSION_POOL_SIZE=0 is invalid; falling back to default {DEFAULT}"
+                    "{key}=0 is invalid; falling back to default {DEFAULT}"
                 );
                 DEFAULT
             }
@@ -834,7 +840,7 @@ pub(crate) fn resolve_embed_pool_size_for_model(
     if let Some(ref raw) = per_model_raw {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
-            let parsed = parse_embed_pool_size(Some(trimmed));
+            let parsed = parse_embed_pool_size(Some(trimmed), Some(per_model_key.as_str()));
             tracing::info!(
                 model = %model_key,
                 env = %per_model_key,
@@ -844,7 +850,7 @@ pub(crate) fn resolve_embed_pool_size_for_model(
             return parsed;
         }
     }
-    parse_embed_pool_size(global_raw)
+    parse_embed_pool_size(global_raw, None)
 }
 
 /// Parse `EMBED_MULTI_PROCESS` env value.
@@ -977,7 +983,7 @@ fn parse_one_model(
     let name = parts[0].to_string();
 
     // Per-model env var key: uppercase name, '-' → '_'.
-    let key = name.to_uppercase().replace('-', "_");
+    let key = model_env_key(&name);
 
     // Per-model batch_max_seq: BATCH_MAX_SEQ_<KEY>. Falls back to global.
     let batch_max_seq = env::var(format!("BATCH_MAX_SEQ_{key}"))
@@ -1472,30 +1478,45 @@ mod tests {
 
     #[test]
     fn embed_pool_size_default_is_1_when_unset() {
-        assert_eq!(parse_embed_pool_size(None), 1);
+        assert_eq!(parse_embed_pool_size(None, None), 1);
     }
 
     #[test]
     fn embed_pool_size_parses_valid_positive_integer() {
-        assert_eq!(parse_embed_pool_size(Some("1")), 1);
-        assert_eq!(parse_embed_pool_size(Some("2")), 2);
-        assert_eq!(parse_embed_pool_size(Some("4")), 4);
+        assert_eq!(parse_embed_pool_size(Some("1"), None), 1);
+        assert_eq!(parse_embed_pool_size(Some("2"), None), 2);
+        assert_eq!(parse_embed_pool_size(Some("4"), None), 4);
         // Trim whitespace, same as reranker parser.
-        assert_eq!(parse_embed_pool_size(Some("  3  ")), 3);
+        assert_eq!(parse_embed_pool_size(Some("  3  "), None), 3);
     }
 
     #[test]
     fn embed_pool_size_rejects_zero() {
         // `0` would `% 0` panic in `embed_tokens`.
-        assert_eq!(parse_embed_pool_size(Some("0")), 1);
-        assert_eq!(parse_embed_pool_size(Some("  0  ")), 1);
+        assert_eq!(parse_embed_pool_size(Some("0"), None), 1);
+        assert_eq!(parse_embed_pool_size(Some("  0  "), None), 1);
     }
 
     #[test]
     fn embed_pool_size_falls_back_on_garbage() {
-        assert_eq!(parse_embed_pool_size(Some("nope")), 1);
-        assert_eq!(parse_embed_pool_size(Some("")), 1);
-        assert_eq!(parse_embed_pool_size(Some("-1")), 1);
+        assert_eq!(parse_embed_pool_size(Some("nope"), None), 1);
+        assert_eq!(parse_embed_pool_size(Some(""), None), 1);
+        assert_eq!(parse_embed_pool_size(Some("-1"), None), 1);
+    }
+
+    #[test]
+    fn parse_embed_pool_size_source_key_does_not_affect_return_value() {
+        // source_key only affects the warn message; return value must be
+        // identical regardless of what key is provided.
+        assert_eq!(
+            parse_embed_pool_size(Some("3"), Some("EMBED_SESSION_POOL_SIZE_JINA_CODE_V2")),
+            3
+        );
+        // Zero rejected → default=1, regardless of source_key.
+        assert_eq!(
+            parse_embed_pool_size(Some("0"), Some("EMBED_SESSION_POOL_SIZE_JINA_CODE_V2")),
+            1
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1981,6 +2002,23 @@ mod tests {
             "MULTILINGUAL_E5_LARGE"
         );
         assert_eq!(super::model_env_key("e5"), "E5");
+    }
+
+    /// Regression: all sites that previously used inline
+    /// `to_uppercase().replace('-', "_")` must produce the same result as
+    /// `model_env_key()` for an edge-case model name with multiple dashes.
+    /// This guards against future callers accidentally reimplementing the
+    /// transform with different semantics.
+    #[test]
+    fn model_env_key_consistent_for_edge_case_model_name() {
+        let name = "gte-multi-rerank";
+        let via_fn = super::model_env_key(name);
+        // Verify it matches the transform that pool-size and arena env vars use.
+        let pool_key = format!("EMBED_SESSION_POOL_SIZE_{via_fn}");
+        let arena_key = format!("EMBED_MEMORY_PATTERN_{via_fn}");
+        assert_eq!(via_fn, "GTE_MULTI_RERANK");
+        assert_eq!(pool_key, "EMBED_SESSION_POOL_SIZE_GTE_MULTI_RERANK");
+        assert_eq!(arena_key, "EMBED_MEMORY_PATTERN_GTE_MULTI_RERANK");
     }
 
     // -----------------------------------------------------------------

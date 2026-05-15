@@ -887,7 +887,7 @@ mod seq_pad_tests {
 /// key is derived by uppercasing and replacing `-` with `_` — mirroring the
 /// `EMBED_MEMORY_PATTERN_<MODEL>` convention.
 pub(crate) fn arena_shrink_enabled_for_model(model_name: &str, memory_pattern: bool) -> bool {
-    let key = model_name.to_uppercase().replace('-', "_");
+    let key = crate::config::model_env_key(model_name);
     let env_val = std::env::var(format!("EMBED_ARENA_SHRINK_{key}")).ok();
     match env_val.as_deref() {
         Some("true") | Some("1") => {

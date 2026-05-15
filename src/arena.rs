@@ -33,6 +33,11 @@
 //! | `EMBED_ARENA_MAX_DEAD_BYTES`   | 67 108 864 (64 MiB) | Dead-bytes threshold for chunk reuse |
 //! | `EMBED_ARENA_EXTEND_STRATEGY`  | 1 (`kSameAsRequested`) | 0=kNextPowerOfTwo, 1=kSameAsRequested |
 //!
+//! Size values (`MAX_MEM_BYTES`, `INITIAL_CHUNK_BYTES`, `MAX_DEAD_BYTES`) accept
+//! human-readable suffixes in addition to raw bytes:
+//! `B`, `K`/`KiB` (×1024), `M`/`MiB` (×1048576), `G`/`GiB` (×1073741824).
+//! Example: `EMBED_ARENA_MAX_MEM_BYTES=2GiB` is equivalent to `=2147483648`.
+//!
 //! The service refuses to start (`panic!`) if `MAX_MEM < INITIAL_CHUNK` or
 //! `EXTEND_STRATEGY` is not 0 or 1.
 
@@ -168,26 +173,19 @@ pub fn init_arena_config_for_model(model_key: &str) -> ArenaCfg {
         let suffix = crate::config::model_env_key(model_key);
         let per_model_key = format!("EMBED_ARENA_MAX_MEM_BYTES_{suffix}");
         match std::env::var(&per_model_key) {
-            Ok(raw) => match raw.trim().parse::<usize>() {
-                Ok(n) => {
-                    tracing::info!(
-                        model = %model_key,
-                        env = %per_model_key,
-                        max_mem_bytes = n,
-                        "per-model EMBED_ARENA_MAX_MEM_BYTES override"
-                    );
-                    n
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        model = %model_key,
-                        env = %per_model_key,
-                        raw = %raw.trim(),
-                        "per-model EMBED_ARENA_MAX_MEM_BYTES is not a valid usize; falling back to global"
-                    );
-                    parse_usize_env("EMBED_ARENA_MAX_MEM_BYTES", DEFAULT_MAX_MEM_BYTES)
-                }
-            },
+            Ok(raw) => {
+                let trimmed = raw.trim();
+                // Use the same suffix-aware parser as the global path so
+                // operators can use "2GiB" in per-model vars too.
+                let n = parse_bytes_with_suffix(&per_model_key, trimmed);
+                tracing::info!(
+                    model = %model_key,
+                    env = %per_model_key,
+                    max_mem_bytes = n,
+                    "per-model EMBED_ARENA_MAX_MEM_BYTES override"
+                );
+                n
+            }
             Err(_) => parse_usize_env("EMBED_ARENA_MAX_MEM_BYTES", DEFAULT_MAX_MEM_BYTES),
         }
     } else {
@@ -226,13 +224,57 @@ pub fn init_arena_config_for_model(model_key: &str) -> ArenaCfg {
     }
 }
 
+/// Parse a `usize` from an environment variable, accepting both raw bytes
+/// and human-readable suffixes.
+///
+/// Accepted suffixes (case-insensitive, binary multipliers):
+/// - `B` → ×1
+/// - `K` or `KiB` → ×1 024
+/// - `M` or `MiB` → ×1 048 576
+/// - `G` or `GiB` → ×1 073 741 824
+///
+/// Examples: `"2GiB"`, `"64M"`, `"1048576"` all accepted.
+/// Bare digits with no suffix are treated as raw bytes (backward-compatible).
+///
+/// Panics if the variable is set but cannot be parsed.
 fn parse_usize_env(key: &str, default: usize) -> usize {
     match std::env::var(key) {
-        Ok(v) => v.trim().parse::<usize>().unwrap_or_else(|_| {
-            panic!("{key} must be a non-negative integer, got {v:?}");
-        }),
+        Ok(v) => parse_bytes_with_suffix(key, v.trim()),
         Err(_) => default,
     }
+}
+
+/// Parse a byte-count string that may carry a human-readable suffix.
+///
+/// Called by `parse_usize_env` and by the per-model arena override path
+/// so both use identical parsing rules.
+///
+/// Panics (with `env_key` in the message) on parse failure.
+pub(crate) fn parse_bytes_with_suffix(env_key: &str, s: &str) -> usize {
+    // Split at the first non-digit character to separate mantissa from suffix.
+    let split_pos = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (digits, suffix_raw) = s.split_at(split_pos);
+    let suffix = suffix_raw.trim().to_uppercase();
+
+    let mantissa: u64 = digits.parse().unwrap_or_else(|_| {
+        panic!("{env_key} must be a non-negative integer with optional suffix (B/K/KiB/M/MiB/G/GiB), got {s:?}");
+    });
+
+    let multiplier: u64 = match suffix.as_str() {
+        "" | "B" => 1,
+        "K" | "KIB" => 1024,
+        "M" | "MIB" => 1024 * 1024,
+        "G" | "GIB" => 1024 * 1024 * 1024,
+        _ => panic!("{env_key}: unrecognised size suffix {suffix_raw:?}; accepted: B, K, KiB, M, MiB, G, GiB"),
+    };
+
+    let result = mantissa.checked_mul(multiplier).unwrap_or_else(|| {
+        panic!("{env_key}: value {s:?} overflows usize");
+    });
+
+    usize::try_from(result).unwrap_or_else(|_| {
+        panic!("{env_key}: value {s:?} overflows usize on this platform");
+    })
 }
 
 fn parse_i32_env(key: &str, default: i32) -> i32 {
@@ -645,5 +687,83 @@ mod tests {
         let cfg = init_arena_config_for_model("");
         drop(guard);
         assert_eq!(cfg.max_mem_bytes, 4 * 1024 * 1024 * 1024);
+    }
+
+    // -----------------------------------------------------------------
+    // parse_usize_env / parse_bytes_with_suffix — suffix parsing.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_bytes_with_suffix_raw_bytes() {
+        assert_eq!(parse_bytes_with_suffix("TEST", "0"), 0);
+        assert_eq!(parse_bytes_with_suffix("TEST", "1024"), 1024);
+        assert_eq!(parse_bytes_with_suffix("TEST", "2147483648"), 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_bytes_with_suffix_b_suffix() {
+        assert_eq!(parse_bytes_with_suffix("TEST", "1B"), 1);
+        assert_eq!(parse_bytes_with_suffix("TEST", "1024B"), 1024);
+    }
+
+    #[test]
+    fn parse_bytes_with_suffix_k_and_kib() {
+        assert_eq!(parse_bytes_with_suffix("TEST", "1K"), 1024);
+        assert_eq!(parse_bytes_with_suffix("TEST", "1KiB"), 1024);
+        assert_eq!(parse_bytes_with_suffix("TEST", "64K"), 64 * 1024);
+    }
+
+    #[test]
+    fn parse_bytes_with_suffix_m_and_mib() {
+        assert_eq!(parse_bytes_with_suffix("TEST", "1M"), 1024 * 1024);
+        assert_eq!(parse_bytes_with_suffix("TEST", "1MiB"), 1024 * 1024);
+        assert_eq!(parse_bytes_with_suffix("TEST", "64M"), 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_bytes_with_suffix_g_and_gib() {
+        assert_eq!(parse_bytes_with_suffix("TEST", "2G"), 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_bytes_with_suffix("TEST", "2GiB"), 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_bytes_with_suffix("TEST", "6GiB"), 6 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_bytes_with_suffix_case_insensitive() {
+        assert_eq!(parse_bytes_with_suffix("TEST", "1gib"), 1024 * 1024 * 1024);
+        assert_eq!(parse_bytes_with_suffix("TEST", "1Gib"), 1024 * 1024 * 1024);
+        assert_eq!(parse_bytes_with_suffix("TEST", "1mib"), 1024 * 1024);
+    }
+
+    #[test]
+    #[should_panic(expected = "unrecognised size suffix")]
+    fn parse_bytes_with_suffix_invalid_suffix_panics() {
+        parse_bytes_with_suffix("TEST", "2KB"); // KB not in accepted list
+    }
+
+    #[test]
+    #[should_panic(expected = "non-negative integer")]
+    fn parse_bytes_with_suffix_invalid_digits_panics() {
+        parse_bytes_with_suffix("TEST", "notanumber");
+    }
+
+    /// Suffix parser also accepted via env var round-trip (parse_usize_env).
+    #[test]
+    #[serial]
+    fn parse_usize_env_accepts_suffix_gib() {
+        let guard = EnvGuard::new(ALL_VARS);
+        guard.set("EMBED_ARENA_MAX_MEM_BYTES", "2GiB");
+        let cfg = init_arena_config();
+        drop(guard);
+        assert_eq!(cfg.max_mem_bytes, 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    #[serial]
+    fn parse_usize_env_accepts_suffix_m() {
+        let guard = EnvGuard::new(ALL_VARS);
+        guard.set("EMBED_ARENA_MAX_DEAD_BYTES", "64M");
+        let cfg = init_arena_config();
+        drop(guard);
+        assert_eq!(cfg.max_dead_bytes, 64 * 1024 * 1024);
     }
 }
