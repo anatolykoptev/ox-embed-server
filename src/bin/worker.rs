@@ -22,26 +22,62 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::net::UnixListener;
 use tokio::sync::Semaphore;
 
+// ── per-worker defaults ────────────────────────────────────────────────────────
+
+/// Default number of ONNX intra-op threads per session.
+///
+/// 2 is the empirically-tuned value for ARM cores on the krolik host
+/// (24 vCPU / 3 models × pool_size sessions). Increasing beyond 2 stalls
+/// other sessions under concurrent inference. Overridable via
+/// `EMBED_WORKER_INTRA_THREADS`.
+const INTRA_THREADS: usize = 2;
+
+/// Default ONNX session pool size per worker (i.e. max concurrent inferences).
+///
+/// 1 session is the safe baseline — each session holds ~650 MiB of model
+/// weights in the shared BFCArena. Increase only when a model fits within
+/// the arena budget with headroom. Overridable via `EMBED_WORKER_POOL_SIZE`.
+const POOL_SIZE: usize = 1;
+
+/// Multiplier applied to pool_size when computing the default max-waiters cap.
+///
+/// 8× gives ample burst headroom while keeping the waiter queue bounded.
+/// The formula is `pool_size × WAITERS_POOL_MULTIPLIER`, floored at
+/// `WAITERS_FLOOR`.
+const WAITERS_POOL_MULTIPLIER: usize = 8;
+
+/// Minimum max-waiters cap regardless of pool_size.
+///
+/// Prevents `pool_size=1` (or very small) from producing a cap so low (8)
+/// that brief single-connection bursts trigger "worker queue overflow".
+/// 16 ensures at least one full round of requests per ONNX-inference batch
+/// can queue without rejection.
+const WAITERS_FLOOR: usize = 16;
+
 // Counter for tasks waiting to acquire the per-worker semaphore.
 // When this exceeds max_waiters, new requests get an immediate
 // "worker queue overflow" error instead of joining an unbounded
 // wait list. The limit is configurable via EMBED_MAX_WAITERS env;
-// the default formula is 8 × pool_size (minimum 16), which gives
-// breathing room for short-burst convoys without runaway memory.
-// tokio::sync::Semaphore has no built-in max-waiter cap, so
-// acquire_owned().await would otherwise queue requests without
-// bound under pathological bursts.
+// the default formula is WAITERS_POOL_MULTIPLIER × pool_size
+// (minimum WAITERS_FLOOR), which gives breathing room for short-burst
+// convoys without runaway memory. tokio::sync::Semaphore has no built-in
+// max-waiter cap, so acquire_owned().await would otherwise queue requests
+// without bound under pathological bursts.
 static WAITERS: AtomicUsize = AtomicUsize::new(0);
 
 /// Resolve the max-waiters limit once at startup.
 ///
 /// Reads `EMBED_MAX_WAITERS` env:
-/// - If unset: falls back to `pool_size × 8` (floor 16).
+/// - If unset: falls back to `pool_size × WAITERS_POOL_MULTIPLIER` (floor WAITERS_FLOOR).
 /// - If set but unparseable or zero: warns and falls back to the formula.
 ///   A zero value would cause 100% rejection of all incoming requests, so it
 ///   is treated as a misconfiguration rather than an intentional setting.
 fn resolve_max_waiters(pool_size: usize) -> usize {
-    let default = || pool_size.saturating_mul(8).max(16);
+    let default = || {
+        pool_size
+            .saturating_mul(WAITERS_POOL_MULTIPLIER)
+            .max(WAITERS_FLOOR)
+    };
     match std::env::var("EMBED_MAX_WAITERS") {
         Err(_) => default(),
         Ok(raw) => match raw.parse::<usize>() {
@@ -99,10 +135,10 @@ async fn main() -> anyhow::Result<()> {
     let model_name = require_env("EMBED_WORKER_MODEL")?;
     let socket_path: PathBuf = require_env("EMBED_WORKER_SOCKET")?.into();
     let intra_threads: usize = std::env::var("EMBED_WORKER_INTRA_THREADS")
-        .unwrap_or_else(|_| "2".into())
+        .unwrap_or_else(|_| INTRA_THREADS.to_string())
         .parse()?;
     let pool_size: usize = std::env::var("EMBED_WORKER_POOL_SIZE")
-        .unwrap_or_else(|_| "1".into())
+        .unwrap_or_else(|_| POOL_SIZE.to_string())
         .parse()?;
 
     // Resolve max_waiters once at startup -- cheaper than re-reading env
@@ -191,16 +227,18 @@ async fn main() -> anyhow::Result<()> {
                 // would mass-trigger try_acquire failures + 500-spam to
                 // memdb-go, which retries → amplification cascade. acquire()
                 // queues requests at the worker; supervisor-side
-                // WorkerPool::dispatch_timeout (30s) caps the upper bound,
-                // so a stuck worker still surfaces as a real error after 30s.
+                // WorkerPool::dispatch_timeout (EMBED_DISPATCH_TIMEOUT_SECS)
+                // caps the upper bound, so a stuck worker still surfaces as
+                // a real error after the configured timeout.
                 //
                 // Waiter cap: tokio::Semaphore has no built-in max-waiter
                 // limit. Under pathological bursts, unbounded acquire_owned
                 // futures queue memory without bound. WAITERS tracks in-flight
                 // waiters; once > max_waiters (resolved at startup from
-                // EMBED_MAX_WAITERS env, default 8xpool_size floor 16), new
-                // requests fail fast with "worker queue overflow" so callers
-                // get an immediate error instead of accumulating silently.
+                // EMBED_MAX_WAITERS env, default WAITERS_POOL_MULTIPLIER×pool_size
+                // floor WAITERS_FLOOR), new requests fail fast with "worker
+                // queue overflow" so callers get an immediate error instead
+                // of accumulating silently.
                 let waiters_now = WAITERS.fetch_add(1, Ordering::Relaxed);
                 if waiters_now >= max_waiters {
                     WAITERS.fetch_sub(1, Ordering::Relaxed);
@@ -304,7 +342,10 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_max_waiters;
+    use super::{
+        resolve_max_waiters, INTRA_THREADS, POOL_SIZE, WAITERS_FLOOR,
+        WAITERS_POOL_MULTIPLIER,
+    };
     use serial_test::serial;
 
     // All tests in this module mutate EMBED_MAX_WAITERS via
@@ -314,9 +355,24 @@ mod tests {
     // ensures these tests never run concurrently, making the mutations safe.
 
     #[test]
+    fn constants_have_sane_values() {
+        // Guard against accidentally editing constants to nonsense values.
+        assert!(INTRA_THREADS >= 1, "intra_threads must be ≥1");
+        assert!(POOL_SIZE >= 1, "pool_size must be ≥1");
+        assert!(
+            WAITERS_POOL_MULTIPLIER >= 1,
+            "waiters multiplier must be ≥1"
+        );
+        assert!(
+            WAITERS_FLOOR >= WAITERS_POOL_MULTIPLIER,
+            "floor should be at least as large as one pool's worth of waiters"
+        );
+    }
+
+    #[test]
     #[serial]
     fn resolve_max_waiters_default_formula() {
-        // Without EMBED_MAX_WAITERS set, formula = pool_size x 8, floor 16.
+        // Without EMBED_MAX_WAITERS set, formula = pool_size × WAITERS_POOL_MULTIPLIER, floor WAITERS_FLOOR.
         let prev = std::env::var("EMBED_MAX_WAITERS").ok();
         unsafe { std::env::remove_var("EMBED_MAX_WAITERS") };
         let val = resolve_max_waiters(4);
@@ -324,13 +380,13 @@ mod tests {
             Some(p) => unsafe { std::env::set_var("EMBED_MAX_WAITERS", p) },
             None => unsafe { std::env::remove_var("EMBED_MAX_WAITERS") },
         }
-        assert_eq!(val, 32, "4 x 8 = 32");
+        assert_eq!(val, 4 * WAITERS_POOL_MULTIPLIER, "4 × multiplier");
     }
 
     #[test]
     #[serial]
     fn resolve_max_waiters_floor() {
-        // pool_size=1 -> 1x8=8 < 16 -> floor kicks in.
+        // pool_size=1 -> 1×8=8 < 16 -> floor kicks in.
         let prev = std::env::var("EMBED_MAX_WAITERS").ok();
         unsafe { std::env::remove_var("EMBED_MAX_WAITERS") };
         let val = resolve_max_waiters(1);
@@ -338,7 +394,7 @@ mod tests {
             Some(p) => unsafe { std::env::set_var("EMBED_MAX_WAITERS", p) },
             None => unsafe { std::env::remove_var("EMBED_MAX_WAITERS") },
         }
-        assert_eq!(val, 16, "floor = 16");
+        assert_eq!(val, WAITERS_FLOOR, "floor = WAITERS_FLOOR");
     }
 
     #[test]
@@ -366,7 +422,7 @@ mod tests {
             Some(p) => unsafe { std::env::set_var("EMBED_MAX_WAITERS", p) },
             None => unsafe { std::env::remove_var("EMBED_MAX_WAITERS") },
         }
-        assert_eq!(val, 24, "3 x 8 = 24");
+        assert_eq!(val, 3 * WAITERS_POOL_MULTIPLIER, "3 × multiplier");
     }
 
     #[test]
@@ -380,7 +436,10 @@ mod tests {
             Some(p) => unsafe { std::env::set_var("EMBED_MAX_WAITERS", p) },
             None => unsafe { std::env::remove_var("EMBED_MAX_WAITERS") },
         }
-        // 2 x 8 = 16, which also hits the floor(16), so either way 16.
-        assert_eq!(val, 16, "zero falls back to formula (2x8=16, floor=16)");
+        // 2 × 8 = 16, which also hits the floor(16), so either way WAITERS_FLOOR.
+        assert_eq!(
+            val, WAITERS_FLOOR,
+            "zero falls back to formula (2×mult=16, floor=16)"
+        );
     }
 }

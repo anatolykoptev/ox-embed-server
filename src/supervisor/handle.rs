@@ -4,12 +4,12 @@
 //! pattern. The supervisor:
 //!   - owns the Child in a dedicated tokio task (watchdog_loop)
 //!   - clears the client slot on worker exit so dispatchers see "unavailable"
-//!   - automatically respawns with exponential backoff (2s → 60s cap)
+//!   - automatically respawns with exponential backoff (INITIAL_BACKOFF → MAX_BACKOFF)
 //!   - increments restart_count on each successful respawn
 //!
-//! Backoff schedule: 2s → 4s → 8s → … → 60s (capped). Backoff advances
-//! exactly once per failed spawn attempt and resets to INITIAL_BACKOFF on
-//! the first successful respawn.
+//! Backoff schedule: INITIAL_BACKOFF → 2× → … → MAX_BACKOFF (capped). Backoff
+//! advances exactly once per failed spawn attempt and resets to INITIAL_BACKOFF
+//! on the first successful respawn.
 //!
 //! SpawnSpec is unchanged from Wave 2.3 (no .kind field yet; that lands in
 //! Wave 2.4b when reranker/splade IPC variants are added).
@@ -18,20 +18,52 @@
 //! - Connection-error != worker-death detection (latent slot poisoning when
 //!   worker listener dies but process alive). Wave 2.5b heartbeat or
 //!   detection ping needed.
-//! - dispatch_timeout env-gate (currently hardcoded 30s).
 //! - Watchdog circuit-breaker: stop respawning after N consecutive failures
 //!   with no success in between (currently retries forever).
 //! - Graceful shutdown via ControlMessage::Shutdown before kill_on_drop SIGKILL.
 
 use crate::ipc::client::WorkerClient;
+use crate::supervisor::util::resolve_duration_secs_env;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::process::{Child, Command};
 use tokio::sync::RwLock;
 
+// ── supervisor timing constants ────────────────────────────────────────────────
+
+/// Initial respawn backoff delay after a worker crash.
+///
+/// 2 s gives the OS time to release the socket file and release process
+/// resources before we attempt to fork again. Not operator-tunable: the
+/// watchdog handles crashes asynchronously and callers already see
+/// "unavailable" via the client_slot; adjusting this doesn't affect
+/// caller-visible latency.
 const INITIAL_BACKOFF: Duration = Duration::from_secs(2);
+
+/// Maximum respawn backoff (exponential doubling caps here).
+///
+/// 60 s prevents permanent crash-loops from consuming CPU without bound.
+/// Operators can observe restart_count via /metrics to detect flapping
+/// workers.
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Default timeout for waiting for a freshly-spawned worker's socket to appear.
+///
+/// Model load times:
+///   - e5-large INT8: ~3–5 s on ARM
+///   - jina-code-v2: ~8–12 s (large BERT variant)
+///   - SPLADE: ~2–4 s
+/// 60 s provides 4–5× headroom on the slowest model. Overridable via
+/// `EMBED_WORKER_SOCKET_WAIT_SECS`. Captured at startup; restart the
+/// container to change.
+const SOCKET_WAIT_SECS: u64 = 60;
+
+/// Poll granularity for the socket-file existence check during worker startup.
+///
+/// 200 ms is fine-grained enough that the per-model startup delay is within
+/// one poll interval of the actual socket appearance time. Not operator-tunable.
+const SOCKET_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Advance exponential backoff by doubling, capped at MAX_BACKOFF.
 fn next_backoff(current: Duration) -> Duration {
@@ -84,6 +116,11 @@ pub struct WorkerSupervisor {
     client_slot: Arc<RwLock<Option<Arc<WorkerClient>>>>,
     /// Monotonically increasing count of successful respawns for observability.
     restart_count: Arc<std::sync::atomic::AtomicU64>,
+    /// How long to wait for a freshly-spawned worker's socket to appear.
+    ///
+    /// Resolved once from `EMBED_WORKER_SOCKET_WAIT_SECS` at [`launch`] time;
+    /// restart the container to pick up a changed value.
+    socket_wait: Duration,
 }
 
 impl WorkerSupervisor {
@@ -91,14 +128,23 @@ impl WorkerSupervisor {
     /// failure (startup errors are not retried; only post-startup crashes
     /// trigger the watchdog respawn loop).
     pub async fn launch(spec: SpawnSpec) -> anyhow::Result<Arc<Self>> {
+        // Resolve env-tunable values once here so every respawn uses the same
+        // values captured at startup. Restart the container to change them.
+        let socket_wait = resolve_duration_secs_env(
+            "EMBED_WORKER_SOCKET_WAIT_SECS",
+            Duration::from_secs(SOCKET_WAIT_SECS),
+            &format!("SOCKET_WAIT_SECS ({SOCKET_WAIT_SECS})"),
+        );
+
         let supervisor = Arc::new(Self {
             spec: spec.clone(),
             client_slot: Arc::new(RwLock::new(None)),
             restart_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            socket_wait,
         });
 
         // Initial spawn — fail loudly so the server startup loop can exit(1).
-        let (child, client) = Self::spawn_one(&supervisor.spec).await?;
+        let (child, client) = Self::spawn_one(&supervisor.spec, supervisor.socket_wait).await?;
         *supervisor.client_slot.write().await = Some(client);
 
         // Pre-touch the restart counter to 0 — makes "healthy / no restarts"
@@ -120,7 +166,7 @@ impl WorkerSupervisor {
     ///
     /// Returns `(Child, Arc<WorkerClient>)` on success. Fails if the process
     /// dies before the socket appears or if the initial connect fails.
-    async fn spawn_one(spec: &SpawnSpec) -> anyhow::Result<(Child, Arc<WorkerClient>)> {
+    async fn spawn_one(spec: &SpawnSpec, socket_wait: Duration) -> anyhow::Result<(Child, Arc<WorkerClient>)> {
         if let Err(e) = std::fs::create_dir_all(&spec.socket_dir) {
             tracing::warn!(dir = ?spec.socket_dir, error = %e, "create_dir_all failed; subsequent bind may fail");
         }
@@ -146,11 +192,15 @@ impl WorkerSupervisor {
             e
         })?;
 
-        // Poll up to 60s for socket, with early-exit if child dies first.
-        let deadline = Instant::now() + Duration::from_secs(60);
+        // Poll up to socket_wait for socket, with early-exit if child dies first.
+        let deadline = Instant::now() + socket_wait;
         loop {
             if Instant::now() >= deadline {
-                anyhow::bail!("worker {} did not create socket within 60s", spec.model);
+                anyhow::bail!(
+                    "worker {} did not create socket within {}s",
+                    spec.model,
+                    socket_wait.as_secs()
+                );
             }
             if tokio::fs::try_exists(&socket_path).await.unwrap_or(false) {
                 break;
@@ -162,7 +212,7 @@ impl WorkerSupervisor {
                     status
                 );
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(SOCKET_WAIT_POLL_INTERVAL).await;
         }
 
         let client = Arc::new(
@@ -219,7 +269,7 @@ impl WorkerSupervisor {
             // Respawn loop — each failed attempt advances backoff exactly once.
             loop {
                 tokio::time::sleep(backoff).await;
-                match Self::spawn_one(&self.spec).await {
+                match Self::spawn_one(&self.spec, self.socket_wait).await {
                     Ok((new_child, new_client)) => {
                         *self.client_slot.write().await = Some(new_client);
                         self.restart_count
@@ -264,6 +314,88 @@ impl WorkerSupervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::supervisor::util::resolve_duration_secs_env;
+    use serial_test::serial;
+    use std::time::Duration;
+
+    fn resolve_socket_wait() -> Duration {
+        resolve_duration_secs_env(
+            "EMBED_WORKER_SOCKET_WAIT_SECS",
+            Duration::from_secs(SOCKET_WAIT_SECS),
+            &format!("SOCKET_WAIT_SECS ({SOCKET_WAIT_SECS})"),
+        )
+    }
+
+    #[test]
+    #[serial]
+    fn socket_wait_default() {
+        let prev = std::env::var("EMBED_WORKER_SOCKET_WAIT_SECS").ok();
+        unsafe { std::env::remove_var("EMBED_WORKER_SOCKET_WAIT_SECS") };
+        let d = resolve_socket_wait();
+        match prev {
+            Some(p) => unsafe { std::env::set_var("EMBED_WORKER_SOCKET_WAIT_SECS", p) },
+            None => unsafe { std::env::remove_var("EMBED_WORKER_SOCKET_WAIT_SECS") },
+        }
+        assert_eq!(d.as_secs(), SOCKET_WAIT_SECS);
+    }
+
+    #[test]
+    #[serial]
+    fn socket_wait_env_override() {
+        let prev = std::env::var("EMBED_WORKER_SOCKET_WAIT_SECS").ok();
+        unsafe { std::env::set_var("EMBED_WORKER_SOCKET_WAIT_SECS", "120") };
+        let d = resolve_socket_wait();
+        match prev {
+            Some(p) => unsafe { std::env::set_var("EMBED_WORKER_SOCKET_WAIT_SECS", p) },
+            None => unsafe { std::env::remove_var("EMBED_WORKER_SOCKET_WAIT_SECS") },
+        }
+        assert_eq!(d.as_secs(), 120);
+    }
+
+    #[test]
+    #[serial]
+    fn socket_wait_zero_falls_back() {
+        let prev = std::env::var("EMBED_WORKER_SOCKET_WAIT_SECS").ok();
+        unsafe { std::env::set_var("EMBED_WORKER_SOCKET_WAIT_SECS", "0") };
+        let d = resolve_socket_wait();
+        match prev {
+            Some(p) => unsafe { std::env::set_var("EMBED_WORKER_SOCKET_WAIT_SECS", p) },
+            None => unsafe { std::env::remove_var("EMBED_WORKER_SOCKET_WAIT_SECS") },
+        }
+        assert_eq!(d.as_secs(), SOCKET_WAIT_SECS, "zero falls back to default");
+    }
+
+    #[test]
+    #[serial]
+    fn socket_wait_invalid_falls_back() {
+        let prev = std::env::var("EMBED_WORKER_SOCKET_WAIT_SECS").ok();
+        unsafe { std::env::set_var("EMBED_WORKER_SOCKET_WAIT_SECS", "bad") };
+        let d = resolve_socket_wait();
+        match prev {
+            Some(p) => unsafe { std::env::set_var("EMBED_WORKER_SOCKET_WAIT_SECS", p) },
+            None => unsafe { std::env::remove_var("EMBED_WORKER_SOCKET_WAIT_SECS") },
+        }
+        assert_eq!(d.as_secs(), SOCKET_WAIT_SECS, "invalid falls back to default");
+    }
+
+    #[test]
+    fn backoff_doubles_and_caps() {
+        let b1 = next_backoff(INITIAL_BACKOFF);
+        assert_eq!(b1, Duration::from_secs(4));
+        let b2 = next_backoff(b1);
+        assert_eq!(b2, Duration::from_secs(8));
+
+        // Boundary: 32 s × 2 = 64 s → clamped to MAX_BACKOFF (60 s).
+        assert_eq!(
+            next_backoff(Duration::from_secs(32)),
+            Duration::from_secs(60),
+            "32s doubles to 64s which must clamp to MAX_BACKOFF=60s"
+        );
+
+        // Ensure cap is respected for values already beyond MAX_BACKOFF.
+        let huge = Duration::from_secs(1000);
+        assert_eq!(next_backoff(huge), MAX_BACKOFF);
+    }
 
     /// Verifies that `launch()` surfaces a clear error when the fake worker
     /// creates the socket file but doesn't actually listen on it (connect

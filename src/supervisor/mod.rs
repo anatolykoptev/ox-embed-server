@@ -4,6 +4,7 @@
 
 pub mod handle;
 pub mod pool;
+mod util;
 
 pub use handle::{SpawnSpec, WorkerKind, WorkerSupervisor};
 pub use pool::WorkerPool;
