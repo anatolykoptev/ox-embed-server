@@ -224,6 +224,31 @@ async fn main() {
         std::process::exit(1);
     });
 
+    // Warn operators about per-model env vars that are silently unsupported.
+    // RERANKER_SESSION_POOL_SIZE_* and SPLADE_SESSION_POOL_SIZE_* patterns look
+    // analogous to EMBED_SESSION_POOL_SIZE_* but are not yet wired — see PR #74
+    // follow-up. Scanning at startup surfaces the mistake before the operator
+    // wastes time debugging why the pool size didn't change.
+    {
+        let ignored: Vec<String> = std::env::vars()
+            .filter_map(|(k, _)| {
+                if k.starts_with("RERANKER_SESSION_POOL_SIZE_")
+                    || k.starts_with("SPLADE_SESSION_POOL_SIZE_")
+                {
+                    Some(k)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !ignored.is_empty() {
+            tracing::warn!(
+                vars = %ignored.join(", "),
+                "per-model overrides not yet supported for reranker/splade — see PR #74 follow-up; these env vars have no effect"
+            );
+        }
+    }
+
     // When EMBED_MULTI_PROCESS=1 the supervisor must NOT load ONNX sessions —
     // doing so duplicates ~2.4 GiB RSS that the workers already hold.
     // ModelEntry.model is therefore Option<Arc<EmbedModel>>: Some in legacy
@@ -586,19 +611,53 @@ async fn main() {
         let pool = crate::supervisor::WorkerPool::new();
 
         // Collect spawn specs for embed + rerank + splade.
+        //
+        // Per-worker metrics port scheme:
+        //   Base port from EMBED_WORKER_METRICS_PORT_BASE (default 19200).
+        //   Each worker gets base + index (across embed+rerank+splade in
+        //   declaration order). Unset EMBED_WORKER_METRICS_PORT_BASE → metrics
+        //   HTTP disabled for all workers (back-compat).
+        let metrics_port_base: Option<u16> = std::env::var("EMBED_WORKER_METRICS_PORT_BASE")
+            .ok()
+            .and_then(|s| s.trim().parse::<u16>().ok());
+
+        // Read global pool size raw value once so per-model resolver can fall
+        // back to it without re-reading the env var inside the loop.
+        let global_embed_pool_raw = std::env::var("EMBED_SESSION_POOL_SIZE").ok();
         let mut specs: Vec<crate::supervisor::SpawnSpec> = Vec::new();
+        let mut worker_index: u16 = 0;
         for model_def in &cfg.models {
+            let pool_size = crate::config::resolve_embed_pool_size_for_model(
+                &model_def.name,
+                global_embed_pool_raw.as_deref(),
+            );
+            let mut env_extra: Vec<(String, String)> = Vec::new();
+            if let Some(port) = worker_metrics_port(metrics_port_base, worker_index) {
+                env_extra.push((
+                    "EMBED_WORKER_METRICS_PORT".into(),
+                    port.to_string(),
+                ));
+            }
+            worker_index = worker_index.saturating_add(1);
             specs.push(crate::supervisor::SpawnSpec {
                 model: model_def.name.clone(),
                 kind: crate::supervisor::WorkerKind::Embed,
                 worker_bin: cfg.worker_bin_path.clone(),
                 socket_dir: cfg.worker_socket_dir.clone(),
-                pool_size: cfg.embed_pool_size,
+                pool_size,
                 intra_threads: cfg.intra_threads,
-                env_extra: Vec::new(),
+                env_extra,
             });
         }
         for r_def in &cfg.rerankers {
+            let mut env_extra: Vec<(String, String)> = Vec::new();
+            if let Some(port) = worker_metrics_port(metrics_port_base, worker_index) {
+                env_extra.push((
+                    "EMBED_WORKER_METRICS_PORT".into(),
+                    port.to_string(),
+                ));
+            }
+            worker_index = worker_index.saturating_add(1);
             specs.push(crate::supervisor::SpawnSpec {
                 model: r_def.name.clone(),
                 kind: crate::supervisor::WorkerKind::Rerank,
@@ -606,10 +665,18 @@ async fn main() {
                 socket_dir: cfg.worker_socket_dir.clone(),
                 pool_size: cfg.reranker_pool_size.max(1),
                 intra_threads: cfg.reranker_intra_threads.max(1),
-                env_extra: Vec::new(),
+                env_extra,
             });
         }
         for s_def in &cfg.splades {
+            let mut env_extra: Vec<(String, String)> = Vec::new();
+            if let Some(port) = worker_metrics_port(metrics_port_base, worker_index) {
+                env_extra.push((
+                    "EMBED_WORKER_METRICS_PORT".into(),
+                    port.to_string(),
+                ));
+            }
+            worker_index = worker_index.saturating_add(1);
             specs.push(crate::supervisor::SpawnSpec {
                 model: s_def.name.clone(),
                 kind: crate::supervisor::WorkerKind::Splade,
@@ -617,7 +684,7 @@ async fn main() {
                 socket_dir: cfg.worker_socket_dir.clone(),
                 pool_size: cfg.splade_pool_size.max(1),
                 intra_threads: cfg.splade_intra_threads.max(1),
-                env_extra: Vec::new(),
+                env_extra,
             });
         }
 
@@ -732,5 +799,60 @@ async fn main() {
     // dropping with the process. No-op when OTEL was disabled at boot.
     if let Some(p) = otel_provider {
         otel::shutdown(p);
+    }
+}
+
+/// Compute the metrics port for a worker at `index` given an optional `base`
+/// port.
+///
+/// Returns `None` in two cases:
+/// - `base` is `None` (feature disabled — `EMBED_WORKER_METRICS_PORT_BASE`
+///   not set).
+/// - `base + index` would overflow `u16` (port number > 65535). Logs an
+///   error so operators can detect misconfiguration at startup rather than
+///   at scrape time.
+fn worker_metrics_port(base: Option<u16>, index: u16) -> Option<u16> {
+    let b = base?;
+    match b.checked_add(index) {
+        Some(port) => Some(port),
+        None => {
+            tracing::error!(
+                base,
+                index,
+                "EMBED_WORKER_METRICS_PORT_BASE + worker index overflows u16 (max port 65535); metrics port disabled for this worker"
+            );
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::worker_metrics_port;
+
+    #[test]
+    fn worker_metrics_port_none_base_returns_none() {
+        assert_eq!(worker_metrics_port(None, 0), None);
+        assert_eq!(worker_metrics_port(None, 40), None);
+    }
+
+    #[test]
+    fn worker_metrics_port_normal_range() {
+        assert_eq!(worker_metrics_port(Some(19200), 0), Some(19200));
+        assert_eq!(worker_metrics_port(Some(19200), 3), Some(19203));
+    }
+
+    #[test]
+    fn worker_metrics_port_exact_max_u16() {
+        assert_eq!(worker_metrics_port(Some(65535), 0), Some(65535));
+        assert_eq!(worker_metrics_port(Some(65534), 1), Some(65535));
+    }
+
+    #[test]
+    fn worker_metrics_port_overflow_returns_none() {
+        // base=65500, index=40 overflows: 65540 > 65535
+        assert_eq!(worker_metrics_port(Some(65500), 40), None);
+        // base=65535, index=1: 65536 overflows
+        assert_eq!(worker_metrics_port(Some(65535), 1), None);
     }
 }

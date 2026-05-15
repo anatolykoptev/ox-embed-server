@@ -10,12 +10,14 @@
 //! connections and serving WorkerRequest frames. Each request must match the
 //! worker's loaded kind; a kind mismatch returns WorkerResponse::Err.
 
+use axum::Router;
 use embed_server::config::Config;
 use embed_server::ipc::frame::{read_frame, write_frame};
 use embed_server::ipc::protocol::{
     EmbedResponseOk, RerankResponseOk, SpladeResponseOk, WorkerRequest, WorkerResponse,
 };
 use embed_server::model::{StandaloneEmbedder, StandaloneReranker, StandaloneSplade};
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -103,6 +105,88 @@ fn resolve_max_waiters(pool_size: usize) -> usize {
     }
 }
 
+/// Install a Prometheus metrics recorder in the worker process and, if
+/// `EMBED_WORKER_METRICS_PORT` is set, spawn a lightweight HTTP server
+/// that exposes `/metrics` for Prometheus scraping.
+///
+/// Port assignment: the supervisor sets `EMBED_WORKER_METRICS_PORT` to
+/// `EMBED_WORKER_METRICS_PORT_BASE + <worker-index>` (default base 19200).
+/// Workers are indexed in spawn order across embed + rerank + splade pools.
+/// Example with two embed models: jina-code-v2 → 19200, e5-large → 19201.
+///
+/// If the env var is unset, the recorder is still installed (so arena /
+/// batcher counters accumulate) but no HTTP port is opened — back-compat
+/// for existing deploys.
+fn install_worker_metrics(model_name: &str) -> PrometheusHandle {
+    let handle = PrometheusBuilder::new()
+        .install_recorder()
+        .expect("install Prometheus recorder in worker");
+
+    let port_str = std::env::var("EMBED_WORKER_METRICS_PORT").ok();
+    if let Some(raw) = port_str {
+        match raw.trim().parse::<u16>() {
+            Ok(port) => {
+                let handle_clone = handle.clone();
+                let addr: std::net::SocketAddr =
+                    ([127, 0, 0, 1], port).into();
+                let model = model_name.to_string();
+                tokio::spawn(async move {
+                    let app = Router::new().route(
+                        "/metrics",
+                        axum::routing::get(move || {
+                            let h = handle_clone.clone();
+                            async move {
+                                let body = h.render();
+                                (
+                                    [(
+                                        axum::http::header::CONTENT_TYPE,
+                                        "text/plain; version=0.0.4",
+                                    )],
+                                    body,
+                                )
+                            }
+                        }),
+                    );
+                    let listener = match tokio::net::TcpListener::bind(addr).await {
+                        Ok(l) => {
+                            tracing::info!(
+                                model = %model,
+                                port,
+                                "worker metrics HTTP server started"
+                            );
+                            l
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                model = %model,
+                                port,
+                                error = %e,
+                                "worker metrics HTTP server bind failed; metrics will not be scraped"
+                            );
+                            return;
+                        }
+                    };
+                    if let Err(e) = axum::serve(listener, app).await {
+                        tracing::warn!(
+                            model = %model,
+                            error = %e,
+                            "worker metrics HTTP server exited"
+                        );
+                    }
+                });
+            }
+            Err(_) => {
+                tracing::warn!(
+                    EMBED_WORKER_METRICS_PORT = %raw.trim(),
+                    "EMBED_WORKER_METRICS_PORT is not a valid port; metrics HTTP server disabled"
+                );
+            }
+        }
+    }
+
+    handle
+}
+
 fn require_env(var: &str) -> anyhow::Result<String> {
     std::env::var(var).map_err(|_e| {
         tracing::error!(var, "required environment variable missing");
@@ -160,12 +244,20 @@ async fn main() -> anyhow::Result<()> {
         anyhow::anyhow!("config: {e}")
     })?;
 
+    // Install Prometheus recorder. If EMBED_WORKER_METRICS_PORT is set, also
+    // spawns a lightweight HTTP /metrics server for per-worker scraping.
+    // Must happen before arena registration (which emits gauges).
+    // Held for process lifetime: dropping this handle shuts down the metrics
+    // HTTP server, making /metrics unreachable for the rest of the worker life.
+    let _metrics_handle = install_worker_metrics(&model_name);
+
     // Register the shared CPU arena BEFORE any Session::builder() call.
     // Each worker is a fresh process — the parent supervisor's registration
     // doesn't carry over. RerankerModel::load and SpladeModel::load both
     // assert this; EmbedModel::load silently falls back to per-session
     // BFCArena without it (less efficient).
-    if let Err(e) = embed_server::arena::register_shared_cpu_arena() {
+    // Uses per-model EMBED_ARENA_MAX_MEM_BYTES_<KEY> override if set.
+    if let Err(e) = embed_server::arena::register_shared_cpu_arena_for_model(&model_name) {
         tracing::warn!(error = %e, "shared arena registration failed; sessions will use per-session BFCArena");
     } else {
         tracing::info!("shared CPU arena registered (worker)");
