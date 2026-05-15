@@ -23,14 +23,49 @@ use tokio::net::UnixListener;
 use tokio::sync::Semaphore;
 
 // Counter for tasks waiting to acquire the per-worker semaphore.
-// When this exceeds MAX_WAITERS, new requests get an immediate
+// When this exceeds max_waiters, new requests get an immediate
 // "worker queue overflow" error instead of joining an unbounded
-// wait list. MAX_WAITERS = 8 × pool_size (minimum 16) gives
+// wait list. The limit is configurable via EMBED_MAX_WAITERS env;
+// the default formula is 8 × pool_size (minimum 16), which gives
 // breathing room for short-burst convoys without runaway memory.
 // tokio::sync::Semaphore has no built-in max-waiter cap, so
 // acquire_owned().await would otherwise queue requests without
 // bound under pathological bursts.
 static WAITERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Resolve the max-waiters limit once at startup.
+///
+/// Reads `EMBED_MAX_WAITERS` env:
+/// - If unset: falls back to `pool_size × 8` (floor 16).
+/// - If set but unparseable or zero: warns and falls back to the formula.
+///   A zero value would cause 100% rejection of all incoming requests, so it
+///   is treated as a misconfiguration rather than an intentional setting.
+fn resolve_max_waiters(pool_size: usize) -> usize {
+    let default = || pool_size.saturating_mul(8).max(16);
+    match std::env::var("EMBED_MAX_WAITERS") {
+        Err(_) => default(),
+        Ok(raw) => match raw.parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            Ok(_) => {
+                // Parsed as zero — would silently reject every request.
+                tracing::warn!(
+                    EMBED_MAX_WAITERS = %raw,
+                    fallback = default(),
+                    "EMBED_MAX_WAITERS=0 would reject all requests; using formula fallback"
+                );
+                default()
+            }
+            Err(_) => {
+                tracing::warn!(
+                    EMBED_MAX_WAITERS = %raw,
+                    fallback = default(),
+                    "EMBED_MAX_WAITERS is not a valid usize; using formula fallback"
+                );
+                default()
+            }
+        },
+    }
+}
 
 fn require_env(var: &str) -> anyhow::Result<String> {
     std::env::var(var).map_err(|_e| {
@@ -70,12 +105,17 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "1".into())
         .parse()?;
 
+    // Resolve max_waiters once at startup -- cheaper than re-reading env
+    // on every request, and captured by copy into the spawned async tasks.
+    let max_waiters = resolve_max_waiters(pool_size);
+
     tracing::info!(
         kind = %kind,
         model = %model_name,
         ?socket_path,
         intra_threads,
         pool_size,
+        max_waiters,
         "worker starting"
     );
 
@@ -157,10 +197,10 @@ async fn main() -> anyhow::Result<()> {
                 // Waiter cap: tokio::Semaphore has no built-in max-waiter
                 // limit. Under pathological bursts, unbounded acquire_owned
                 // futures queue memory without bound. WAITERS tracks in-flight
-                // waiters; once > 8×pool_size (floor 16), new requests fail
-                // fast with "worker queue overflow" so callers get an
-                // immediate error instead of accumulating silently.
-                let max_waiters = pool_size.saturating_mul(8).max(16);
+                // waiters; once > max_waiters (resolved at startup from
+                // EMBED_MAX_WAITERS env, default 8xpool_size floor 16), new
+                // requests fail fast with "worker queue overflow" so callers
+                // get an immediate error instead of accumulating silently.
                 let waiters_now = WAITERS.fetch_add(1, Ordering::Relaxed);
                 if waiters_now >= max_waiters {
                     WAITERS.fetch_sub(1, Ordering::Relaxed);
@@ -259,5 +299,88 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_max_waiters;
+    use serial_test::serial;
+
+    // All tests in this module mutate EMBED_MAX_WAITERS via
+    // std::env::set_var / remove_var, which is process-global state.
+    // std::env::set_var is non-reentrant (glibc setenv) and officially
+    // unsafe since Rust 1.82. The #[serial] attribute (serial_test crate)
+    // ensures these tests never run concurrently, making the mutations safe.
+
+    #[test]
+    #[serial]
+    fn resolve_max_waiters_default_formula() {
+        // Without EMBED_MAX_WAITERS set, formula = pool_size x 8, floor 16.
+        let prev = std::env::var("EMBED_MAX_WAITERS").ok();
+        unsafe { std::env::remove_var("EMBED_MAX_WAITERS") };
+        let val = resolve_max_waiters(4);
+        match prev {
+            Some(p) => unsafe { std::env::set_var("EMBED_MAX_WAITERS", p) },
+            None => unsafe { std::env::remove_var("EMBED_MAX_WAITERS") },
+        }
+        assert_eq!(val, 32, "4 x 8 = 32");
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_max_waiters_floor() {
+        // pool_size=1 -> 1x8=8 < 16 -> floor kicks in.
+        let prev = std::env::var("EMBED_MAX_WAITERS").ok();
+        unsafe { std::env::remove_var("EMBED_MAX_WAITERS") };
+        let val = resolve_max_waiters(1);
+        match prev {
+            Some(p) => unsafe { std::env::set_var("EMBED_MAX_WAITERS", p) },
+            None => unsafe { std::env::remove_var("EMBED_MAX_WAITERS") },
+        }
+        assert_eq!(val, 16, "floor = 16");
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_max_waiters_env_override() {
+        // EMBED_MAX_WAITERS=64 overrides formula regardless of pool_size.
+        let prev = std::env::var("EMBED_MAX_WAITERS").ok();
+        unsafe { std::env::set_var("EMBED_MAX_WAITERS", "64") };
+        let val = resolve_max_waiters(2);
+        match prev {
+            Some(p) => unsafe { std::env::set_var("EMBED_MAX_WAITERS", p) },
+            None => unsafe { std::env::remove_var("EMBED_MAX_WAITERS") },
+        }
+        assert_eq!(val, 64);
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_max_waiters_env_invalid_falls_back() {
+        // Non-numeric EMBED_MAX_WAITERS warns and falls back to formula.
+        let prev = std::env::var("EMBED_MAX_WAITERS").ok();
+        unsafe { std::env::set_var("EMBED_MAX_WAITERS", "not-a-number") };
+        let val = resolve_max_waiters(3);
+        match prev {
+            Some(p) => unsafe { std::env::set_var("EMBED_MAX_WAITERS", p) },
+            None => unsafe { std::env::remove_var("EMBED_MAX_WAITERS") },
+        }
+        assert_eq!(val, 24, "3 x 8 = 24");
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_max_waiters_zero_falls_back() {
+        // EMBED_MAX_WAITERS=0 would reject every request; must fall back to formula.
+        let prev = std::env::var("EMBED_MAX_WAITERS").ok();
+        unsafe { std::env::set_var("EMBED_MAX_WAITERS", "0") };
+        let val = resolve_max_waiters(2);
+        match prev {
+            Some(p) => unsafe { std::env::set_var("EMBED_MAX_WAITERS", p) },
+            None => unsafe { std::env::remove_var("EMBED_MAX_WAITERS") },
+        }
+        // 2 x 8 = 16, which also hits the floor(16), so either way 16.
+        assert_eq!(val, 16, "zero falls back to formula (2x8=16, floor=16)");
     }
 }

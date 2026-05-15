@@ -109,6 +109,7 @@ Environment variables (parsed in `src/config.rs`):
 | `BATCH_MAX` | `32` | Max coalesced texts per ONNX call. |
 | `BATCH_WAIT_MS` | `10` | Coalesce window. |
 | `MAX_QUEUE_SIZE` | `256` | Queue cap → 503. |
+| `EMBED_MAX_WAITERS` | `8×pool_size` (floor 16) | Worker waiter-queue cap per worker. Set higher (e.g. `64`) to absorb bulk-indexing bursts without touching `EMBED_SESSION_POOL_SIZE`. |
 | `DRAIN_TIMEOUT_S` | `10` | SIGTERM drain window. |
 | `ORT_DYLIB_PATH` | `/usr/lib/libonnxruntime.so` | Required with `load-dynamic`. |
 | `EMBED_VERSION` | `dev` | Stamped into `embed_build_info`. |
