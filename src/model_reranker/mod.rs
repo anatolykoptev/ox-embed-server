@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use ndarray::Array2;
-use ort::session::Session;
+use crate::mlock::MlockedSession;
 use ort::value::Tensor;
 use tokenizers::Tokenizer;
 
@@ -61,7 +61,7 @@ pub struct RerankerModel {
     /// inference in parallel — each session keeps its own `intra_threads`
     /// pool inside ORT, so `pool_size * intra_threads` is the upper
     /// bound on physical threads spent on one model.
-    pub(super) sessions: Vec<Mutex<Session>>,
+    pub(super) sessions: Vec<Mutex<MlockedSession>>,
     /// Round-robin cursor for selecting the next session. `Relaxed` is
     /// fine: no other state is synchronised against this counter, and
     /// the per-session `Mutex` provides any required ordering for the
@@ -82,7 +82,7 @@ pub struct RerankerModel {
     /// Phase H.20 + 2026-05-02 multi-shape extension — optional
     /// fast-path session pools, one per supported batch size, each with
     /// FIXED static shape `[N, max_len]`. The map key is the batch size
-    /// `N`; the value is a `Vec<Mutex<Session>>` (pool-of-2 by default).
+    /// `N`; the value is a `Vec<Mutex<MlockedSession>>` (pool-of-2 by default).
     ///
     /// Loaded only if `<dir>/model_quantized_static_b<N>.onnx` files
     /// exist alongside the dynamic file. The legacy unsuffixed
@@ -101,7 +101,7 @@ pub struct RerankerModel {
     /// because that's a different optimization with a different
     /// padding-waste trade-off. See
     /// `docs/plans/2026-05-02-multi-shape-static-export.md`.
-    pub(super) static_session_pools: BTreeMap<usize, Vec<Mutex<Session>>>,
+    pub(super) static_session_pools: BTreeMap<usize, Vec<Mutex<MlockedSession>>>,
     /// Per-shape round-robin cursors. Each batch size gets its own
     /// `AtomicUsize` so a busy `b=5` pool can't stall the `b=1` pool
     /// (and neither can stall the dynamic `next` cursor).
@@ -303,7 +303,7 @@ impl RerankerModel {
     fn score_pairs_static(
         &self,
         token_ids: &[Vec<u32>],
-        static_pool: &[Mutex<Session>],
+        static_pool: &[Mutex<MlockedSession>],
         cursor: &AtomicUsize,
     ) -> Result<Vec<f32>, String> {
         let batch = token_ids.len();

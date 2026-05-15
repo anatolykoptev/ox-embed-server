@@ -24,6 +24,7 @@ use tokenizers::Tokenizer;
 
 use super::RerankerModel;
 use crate::model::configure_truncation;
+use crate::mlock::{MlockedSession, read_and_mlock};
 use crate::onnx_cache::{self, CacheDir, LoadPlan};
 
 /// Parse `ORT_OPT_LEVEL` the same way `EmbedModel` does (shared env var —
@@ -323,7 +324,7 @@ fn load_static_session_pools(
     intra_threads: usize,
     allow_spinning: bool,
     memory_pattern: bool,
-) -> BTreeMap<usize, Vec<Mutex<Session>>> {
+) -> BTreeMap<usize, Vec<Mutex<MlockedSession>>> {
     crate::arena::assert_arena_registered_before_session();
     let discovered = discover_static_shape_files(name, dir_p);
     if discovered.is_empty() {
@@ -334,7 +335,7 @@ fn load_static_session_pools(
         return BTreeMap::new();
     }
 
-    let mut pools: BTreeMap<usize, Vec<Mutex<Session>>> = BTreeMap::new();
+    let mut pools: BTreeMap<usize, Vec<Mutex<MlockedSession>>> = BTreeMap::new();
     for (batch, path) in discovered {
         tracing::info!(
             model = %name,
@@ -397,7 +398,7 @@ fn build_session_pool(
     pool_size: usize,
     allow_spinning: bool,
     memory_pattern: bool,
-) -> Result<Vec<Mutex<Session>>, String> {
+) -> Result<Vec<Mutex<MlockedSession>>, String> {
     crate::arena::assert_arena_registered_before_session();
     // Resolve the cache dir once per pool. The decision (hit / miss) is
     // re-evaluated *per session* inside the loop: session 0 sees a miss
@@ -406,7 +407,7 @@ fn build_session_pool(
     // Per-model override: ONNX_OPT_CACHE_DIR_<MODEL_KEY_UPPER> takes
     // precedence over the global ONNX_OPT_CACHE_DIR.
     let cache = CacheDir::from_env_for_model(name);
-    let mut sessions: Vec<Mutex<Session>> = Vec::with_capacity(pool_size);
+    let mut sessions: Vec<Mutex<MlockedSession>> = Vec::with_capacity(pool_size);
     for i in 0..pool_size {
         // Re-check inside the loop — see comment above. The first
         // iteration almost always misses; subsequent iterations hit.
@@ -421,7 +422,7 @@ fn build_session_pool(
         let builder = Session::builder().map_err(|e| format!("session builder #{i}: {e}"))?;
         let builder = onnx_cache::apply_plan(builder, &plan, opt_level)
             .map_err(|e| format!("apply cache plan #{i}: {e}"))?;
-        let session = builder
+        let mut builder = builder
             .with_intra_threads(intra_threads)
             .map_err(|e| format!("set threads #{i}: {e}"))?
             // Phase 3B (Plan 2026-05-01) — gate ORT's intra-op spin via env.
@@ -438,11 +439,14 @@ fn build_session_pool(
             .map_err(|e| format!("enable env allocators #{i}: {e}"))?
             // Disable per-session CPU mem arena (see model.rs for detail).
             .with_execution_providers([ort::ep::CPU::default().with_arena_allocator(false).build()])
-            .map_err(|e| format!("disable per-session cpu mem arena #{i}: {e}"))?
-            .commit_from_file(&load_path)
+            .map_err(|e| format!("disable per-session cpu mem arena #{i}: {e}"))?;
+        let mlocked = read_and_mlock(&load_path)
+            .map_err(|e| format!("read ONNX bytes #{i} {}: {e}", load_path.display()))?;
+        let session = builder
+            .commit_from_memory(mlocked.as_slice())
             .map_err(|e| format!("load ONNX #{i} {}: {e}", load_path.display()))?;
         onnx_cache::observe_post_commit(&plan, t_commit.elapsed().as_millis());
-        sessions.push(Mutex::new(session));
+        sessions.push(Mutex::new(MlockedSession::new(session, mlocked)));
     }
     tracing::info!(count = sessions.len(), "reranker ONNX session(s) created");
     Ok(sessions)
@@ -456,7 +460,7 @@ fn build_session_pool(
 /// (`token_type_ids`, `position_ids`) would otherwise surface only as an
 /// inference-time cryptic error. We warn and let the server come up —
 /// ORT will fail loudly itself if the graph genuinely cannot run.
-fn introspect_graph_inputs(name: &str, sessions: &[Mutex<Session>]) -> Result<(), String> {
+fn introspect_graph_inputs(name: &str, sessions: &[Mutex<MlockedSession>]) -> Result<(), String> {
     let session = sessions[0]
         .lock()
         .map_err(|e| format!("introspect session #0: {e}"))?;

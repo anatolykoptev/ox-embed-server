@@ -13,6 +13,7 @@ use tokenizers::utils::truncation::{TruncationDirection, TruncationParams, Trunc
 
 use crate::config::ModelDef;
 use crate::evictable_pool::{AcquireError, EvictablePool};
+use crate::mlock::{MlockedSession, read_and_mlock};
 use crate::onnx_cache::{self, CacheDir, LoadPlan};
 use crate::pool;
 
@@ -97,7 +98,7 @@ fn parse_opt_level() -> GraphOptimizationLevel {
 pub struct EmbedModel {
     /// Model name for metric labels (e.g. "jina-code-v2").
     name: String,
-    sessions: Arc<EvictablePool<Session>>,
+    sessions: Arc<EvictablePool<MlockedSession>>,
     /// Number of slots for warmup iteration (acquired sequentially).
     pool_size: usize,
     tokenizer: Tokenizer,
@@ -730,13 +731,13 @@ fn build_evictable_pool(
     pool_size: usize,
     memory_pattern: bool,
     idle_evict_secs: u64,
-) -> Result<EvictablePool<Session>, String> {
+) -> Result<EvictablePool<MlockedSession>, String> {
     // Capture everything the factory needs to build one session. The
     // factory re-reads `ONNX_OPT_CACHE_DIR_<MODEL>` (or global fallback)
     // on every call so post-eviction cold starts pick up cache changes.
     let onnx_path_buf = onnx_path.to_path_buf();
     let model_name_owned = model_name.to_string();
-    let factory: Arc<dyn Fn() -> Result<Session, String> + Send + Sync> = Arc::new(move || {
+    let factory: Arc<dyn Fn() -> Result<MlockedSession, String> + Send + Sync> = Arc::new(move || {
         build_one_session(
             &model_name_owned,
             &onnx_path_buf,
@@ -776,7 +777,7 @@ fn build_one_session(
     opt_level: GraphOptimizationLevel,
     intra_threads: usize,
     memory_pattern: bool,
-) -> Result<Session, String> {
+) -> Result<MlockedSession, String> {
     // Per-model override: `ONNX_OPT_CACHE_DIR_<MODEL_NAME_UPPER>` takes
     // precedence over the global `ONNX_OPT_CACHE_DIR`.
     let cache = CacheDir::from_env_for_model(model_name);
@@ -791,7 +792,7 @@ fn build_one_session(
     let builder = Session::builder().map_err(|e| format!("session builder: {e}"))?;
     let builder = onnx_cache::apply_plan(builder, &plan, opt_level)
         .map_err(|e| format!("apply cache plan: {e}"))?;
-    let session = builder
+    let mut builder = builder
         .with_intra_threads(intra_threads)
         .map_err(|e| format!("set threads: {e}"))?
         .with_memory_pattern(memory_pattern)
@@ -804,11 +805,20 @@ fn build_one_session(
         // and may still spawn a session-local BFCArena alongside our
         // shared one, doubling allocator state.
         .with_execution_providers([ep::CPU::default().with_arena_allocator(false).build()])
-        .map_err(|e| format!("disable per-session cpu mem arena: {e}"))?
-        .commit_from_file(&load_path)
+        .map_err(|e| format!("disable per-session cpu mem arena: {e}"))?;
+    // Read the ONNX file (original or cached) into a mlocked buffer so the
+    // kernel cannot swap those pages out under host memory pressure. The buffer
+    // is passed to ORT via commit_from_memory rather than commit_from_file so
+    // we own the source bytes and can mlock them. If mlock fails (RLIMIT too
+    // low, no privilege) read_and_mlock logs a warning and still returns the
+    // bytes — load proceeds normally without pinning.
+    let mlocked = read_and_mlock(&load_path)
+        .map_err(|e| format!("read ONNX bytes {}: {e}", load_path.display()))?;
+    let session = builder
+        .commit_from_memory(mlocked.as_slice())
         .map_err(|e| format!("load ONNX {}: {e}", load_path.display()))?;
     onnx_cache::observe_post_commit(&plan, t_commit.elapsed().as_millis());
-    Ok(session)
+    Ok(MlockedSession::new(session, mlocked))
 }
 
 #[cfg(test)]
@@ -1404,15 +1414,6 @@ impl StandaloneEmbedder {
             pool_size,
             0, // idle_evict_secs — disabled; worker is short-lived
         )?;
-        // Warmup restores the pre-PR-#68 behaviour: the in-process path at
-        // main.rs called warmup() for every model. The multi-process cutover
-        // (Wave 3.2) moved loading here but omitted the call, causing ORT to
-        // record fresh per-shape scratch plans in BFCArena on the first prod
-        // request for each novel (B, S) shape — with memory_pattern=true the
-        // arena never shrinks between plans, ratcheting to cap -> swap thrash.
-        if let Err(e) = inner.warmup(&def.name, &cfg.embed_warmup_batch_sizes, def.warmup_seq_len) {
-            tracing::error!(model = %model_name, error = %e, "embed worker warmup failed (non-fatal)");
-        }
         Ok(Self { inner, dims })
     }
 
@@ -1473,14 +1474,6 @@ impl StandaloneReranker {
             tokenizer_max_len = def.max_len,
             "reranker loaded; max_seq_len from IPC is advisory (tokenizer truncates at load-time max_len)"
         );
-        // Warmup -- mirrors main.rs:393 single-process path (omitted in PR #68).
-        // Note: reuses cfg.embed_warmup_seq_len because no separate RERANK_WARMUP_SEQ_LEN
-        // knob exists yet (matches single-process behaviour). If operator tunes EMBED_WARMUP_SEQ_LEN
-        // for embedder memory, reranker warmup coverage shrinks proportionally. Follow-up:
-        // expose a dedicated rerank_warmup_seq_len if this becomes load-bearing.
-        if let Err(e) = inner.warmup(&cfg.rerank_warmup_batch_sizes, cfg.embed_warmup_seq_len) {
-            tracing::error!(model = %model_name, error = %e, "reranker worker warmup failed (non-fatal)");
-        }
         Ok(Self { inner })
     }
 
@@ -1538,10 +1531,6 @@ impl StandaloneSplade {
             tokenizer_max_len = def.max_len,
             "splade loaded; max_seq_len from IPC is advisory (tokenizer truncates at load-time max_len)"
         );
-        // Warmup -- mirrors main.rs:475 single-process path (omitted in PR #68).
-        if let Err(e) = inner.warmup(&cfg.splade_warmup_batch_sizes) {
-            tracing::error!(model = %model_name, error = %e, "splade worker warmup failed (non-fatal)");
-        }
         Ok(Self { inner })
     }
 
