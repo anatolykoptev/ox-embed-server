@@ -2,7 +2,8 @@
 //!
 //! Wave 2.5: pool now holds `Arc<WorkerSupervisor>` (not `Arc<WorkerHandle>`).
 //! Dispatch methods poll for a live client during respawn, returning an error
-//! after `dispatch_timeout` (default 30s).
+//! after `dispatch_timeout` (default `DISPATCH_TIMEOUT_SECS`, overridable via
+//! `EMBED_DISPATCH_TIMEOUT_SECS`).
 
 use crate::ipc::protocol::WorkerResponse;
 use crate::supervisor::WorkerSupervisor;
@@ -10,6 +11,53 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
+
+// ── pool tuning defaults ───────────────────────────────────────────────────────
+
+/// Default maximum time to wait for a respawning worker to become available.
+///
+/// 30 s is chosen as the worst-case bound for a model reload:
+///   - ONNX graph load: ~5–15 s on ARM for the largest models (jina-code-v2).
+///   - Socket wait poll: up to SOCKET_WAIT_POLL_INTERVAL × 300 iterations.
+/// Callers (memdb-go) retry on error, so a bounded 30 s timeout surfaces a
+/// clear error rather than queuing silently forever.
+/// Overridable via `EMBED_DISPATCH_TIMEOUT_SECS`.
+const DISPATCH_TIMEOUT_SECS: u64 = 30;
+
+/// How often to poll for a live client while a worker is respawning.
+///
+/// 200 ms is fine-grained enough to detect recovery within one round-trip
+/// (model reload ≈ 5–15 s) without burning CPU. Not operator-tunable:
+/// changing the poll granularity doesn't meaningfully affect P99 latency.
+const DISPATCH_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Parse `EMBED_DISPATCH_TIMEOUT_SECS` from the environment, falling back to
+/// `DISPATCH_TIMEOUT_SECS`. Warns and falls back on parse failure or zero.
+fn resolve_dispatch_timeout() -> Duration {
+    let default = Duration::from_secs(DISPATCH_TIMEOUT_SECS);
+    match std::env::var("EMBED_DISPATCH_TIMEOUT_SECS") {
+        Err(_) => default,
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(n) if n > 0 => Duration::from_secs(n),
+            Ok(_) => {
+                tracing::warn!(
+                    EMBED_DISPATCH_TIMEOUT_SECS = %raw,
+                    fallback_secs = DISPATCH_TIMEOUT_SECS,
+                    "EMBED_DISPATCH_TIMEOUT_SECS=0 is invalid; using default"
+                );
+                default
+            }
+            Err(_) => {
+                tracing::warn!(
+                    EMBED_DISPATCH_TIMEOUT_SECS = %raw,
+                    fallback_secs = DISPATCH_TIMEOUT_SECS,
+                    "EMBED_DISPATCH_TIMEOUT_SECS is not a valid u64; using default"
+                );
+                default
+            }
+        },
+    }
+}
 
 pub struct WorkerPool {
     workers: Arc<RwLock<HashMap<String, Arc<WorkerSupervisor>>>>,
@@ -21,7 +69,7 @@ impl WorkerPool {
     pub fn new() -> Self {
         Self {
             workers: Arc::new(RwLock::new(HashMap::new())),
-            dispatch_timeout: Duration::from_secs(30),
+            dispatch_timeout: resolve_dispatch_timeout(),
         }
     }
 
@@ -54,7 +102,7 @@ impl WorkerPool {
                     self.dispatch_timeout.as_secs()
                 );
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(DISPATCH_POLL_INTERVAL).await;
         }
     }
 
@@ -110,5 +158,63 @@ impl WorkerPool {
 impl Default for WorkerPool {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_dispatch_timeout, DISPATCH_TIMEOUT_SECS};
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn dispatch_timeout_default() {
+        let prev = std::env::var("EMBED_DISPATCH_TIMEOUT_SECS").ok();
+        unsafe { std::env::remove_var("EMBED_DISPATCH_TIMEOUT_SECS") };
+        let d = resolve_dispatch_timeout();
+        match prev {
+            Some(p) => unsafe { std::env::set_var("EMBED_DISPATCH_TIMEOUT_SECS", p) },
+            None => unsafe { std::env::remove_var("EMBED_DISPATCH_TIMEOUT_SECS") },
+        }
+        assert_eq!(d.as_secs(), DISPATCH_TIMEOUT_SECS);
+    }
+
+    #[test]
+    #[serial]
+    fn dispatch_timeout_env_override() {
+        let prev = std::env::var("EMBED_DISPATCH_TIMEOUT_SECS").ok();
+        unsafe { std::env::set_var("EMBED_DISPATCH_TIMEOUT_SECS", "120") };
+        let d = resolve_dispatch_timeout();
+        match prev {
+            Some(p) => unsafe { std::env::set_var("EMBED_DISPATCH_TIMEOUT_SECS", p) },
+            None => unsafe { std::env::remove_var("EMBED_DISPATCH_TIMEOUT_SECS") },
+        }
+        assert_eq!(d.as_secs(), 120);
+    }
+
+    #[test]
+    #[serial]
+    fn dispatch_timeout_zero_falls_back() {
+        let prev = std::env::var("EMBED_DISPATCH_TIMEOUT_SECS").ok();
+        unsafe { std::env::set_var("EMBED_DISPATCH_TIMEOUT_SECS", "0") };
+        let d = resolve_dispatch_timeout();
+        match prev {
+            Some(p) => unsafe { std::env::set_var("EMBED_DISPATCH_TIMEOUT_SECS", p) },
+            None => unsafe { std::env::remove_var("EMBED_DISPATCH_TIMEOUT_SECS") },
+        }
+        assert_eq!(d.as_secs(), DISPATCH_TIMEOUT_SECS, "zero falls back to default");
+    }
+
+    #[test]
+    #[serial]
+    fn dispatch_timeout_invalid_falls_back() {
+        let prev = std::env::var("EMBED_DISPATCH_TIMEOUT_SECS").ok();
+        unsafe { std::env::set_var("EMBED_DISPATCH_TIMEOUT_SECS", "not-a-number") };
+        let d = resolve_dispatch_timeout();
+        match prev {
+            Some(p) => unsafe { std::env::set_var("EMBED_DISPATCH_TIMEOUT_SECS", p) },
+            None => unsafe { std::env::remove_var("EMBED_DISPATCH_TIMEOUT_SECS") },
+        }
+        assert_eq!(d.as_secs(), DISPATCH_TIMEOUT_SECS, "invalid falls back to default");
     }
 }
