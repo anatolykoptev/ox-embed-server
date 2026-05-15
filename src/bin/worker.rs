@@ -127,8 +127,23 @@ fn install_worker_metrics(model_name: &str) -> PrometheusHandle {
         match raw.trim().parse::<u16>() {
             Ok(port) => {
                 let handle_clone = handle.clone();
-                let addr: std::net::SocketAddr =
-                    ([127, 0, 0, 1], port).into();
+                // Bind address — env-overridable, defaults to all interfaces
+                // (0.0.0.0) so Prometheus from sibling Docker container can
+                // scrape. Operator may set EMBED_WORKER_METRICS_BIND to
+                // "127.0.0.1" for host-only / single-process dev where
+                // exposure is undesired.
+                let bind = std::env::var("EMBED_WORKER_METRICS_BIND")
+                    .unwrap_or_else(|_| "0.0.0.0".to_string());
+                let addr: std::net::SocketAddr = match format!("{}:{}", bind, port).parse() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tracing::error!(
+                            model = %model_name, port, bind = %bind, error = %e,
+                            "EMBED_WORKER_METRICS_BIND invalid; falling back to 0.0.0.0"
+                        );
+                        ([0u8, 0, 0, 0], port).into()
+                    }
+                };
                 let model = model_name.to_string();
                 tokio::spawn(async move {
                     let app = Router::new().route(
