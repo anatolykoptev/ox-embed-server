@@ -17,3 +17,6 @@ pub mod pool;
 
 // arena is required transitively by model_reranker and model_splade at load time.
 pub mod arena;
+
+// mlock helper — pin ONNX weight bytes into RAM to prevent swap-out.
+pub mod mlock;

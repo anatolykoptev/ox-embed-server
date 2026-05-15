@@ -10,6 +10,7 @@ mod evictable_pool;
 #[allow(dead_code)] // ipc items used by supervisor submodule; unused from main.rs directly
 mod ipc;
 mod metrics;
+mod mlock;
 mod model;
 mod model_reranker;
 mod model_splade;
@@ -613,16 +614,13 @@ async fn main() {
         // Collect spawn specs for embed + rerank + splade.
         //
         // Per-worker metrics port scheme:
-        //   Base port from EMBED_WORKER_METRICS_PORT_BASE (default 8200).
+        //   Base port from EMBED_WORKER_METRICS_PORT_BASE (default 19200).
         //   Each worker gets base + index (across embed+rerank+splade in
-        //   declaration order). Workers bind /metrics unconditionally so
-        //   per-worker arena/shrink counters are always observable.
-        //   Set EMBED_WORKER_METRICS_PORT_BASE=0 to map to ports 0..N
-        //   (bind will fail and log a warning — effective disable).
-        let metrics_port_base: u16 = std::env::var("EMBED_WORKER_METRICS_PORT_BASE")
+        //   declaration order). Unset EMBED_WORKER_METRICS_PORT_BASE → metrics
+        //   HTTP disabled for all workers (back-compat).
+        let metrics_port_base: Option<u16> = std::env::var("EMBED_WORKER_METRICS_PORT_BASE")
             .ok()
-            .and_then(|s| s.trim().parse::<u16>().ok())
-            .unwrap_or(8200);
+            .and_then(|s| s.trim().parse::<u16>().ok());
 
         // Read global pool size raw value once so per-model resolver can fall
         // back to it without re-reading the env var inside the loop.
@@ -805,14 +803,18 @@ async fn main() {
     }
 }
 
-/// Compute the metrics port for a worker at `index` given a `base` port.
+/// Compute the metrics port for a worker at `index` given an optional `base`
+/// port.
 ///
-/// Returns `Some(port)` normally. Returns `None` only when `base + index`
-/// overflows `u16` (> 65535) — logs an error in that case.
-///
-/// Default base is 8200 (applied when `EMBED_WORKER_METRICS_PORT_BASE` is unset).
-fn worker_metrics_port(base: u16, index: u16) -> Option<u16> {
-    match base.checked_add(index) {
+/// Returns `None` in two cases:
+/// - `base` is `None` (feature disabled — `EMBED_WORKER_METRICS_PORT_BASE`
+///   not set).
+/// - `base + index` would overflow `u16` (port number > 65535). Logs an
+///   error so operators can detect misconfiguration at startup rather than
+///   at scrape time.
+fn worker_metrics_port(base: Option<u16>, index: u16) -> Option<u16> {
+    let b = base?;
+    match b.checked_add(index) {
         Some(port) => Some(port),
         None => {
             tracing::error!(
@@ -830,30 +832,28 @@ mod tests {
     use super::worker_metrics_port;
 
     #[test]
-    fn worker_metrics_port_default_base_8200() {
-        // Default base 8200; index 0..3 maps to 8200..8203.
-        assert_eq!(worker_metrics_port(8200, 0), Some(8200));
-        assert_eq!(worker_metrics_port(8200, 1), Some(8201));
-        assert_eq!(worker_metrics_port(8200, 3), Some(8203));
+    fn worker_metrics_port_none_base_returns_none() {
+        assert_eq!(worker_metrics_port(None, 0), None);
+        assert_eq!(worker_metrics_port(None, 40), None);
     }
 
     #[test]
-    fn worker_metrics_port_custom_base() {
-        assert_eq!(worker_metrics_port(9000, 0), Some(9000));
-        assert_eq!(worker_metrics_port(9000, 4), Some(9004));
+    fn worker_metrics_port_normal_range() {
+        assert_eq!(worker_metrics_port(Some(19200), 0), Some(19200));
+        assert_eq!(worker_metrics_port(Some(19200), 3), Some(19203));
     }
 
     #[test]
     fn worker_metrics_port_exact_max_u16() {
-        assert_eq!(worker_metrics_port(65535, 0), Some(65535));
-        assert_eq!(worker_metrics_port(65534, 1), Some(65535));
+        assert_eq!(worker_metrics_port(Some(65535), 0), Some(65535));
+        assert_eq!(worker_metrics_port(Some(65534), 1), Some(65535));
     }
 
     #[test]
     fn worker_metrics_port_overflow_returns_none() {
         // base=65500, index=40 overflows: 65540 > 65535
-        assert_eq!(worker_metrics_port(65500, 40), None);
+        assert_eq!(worker_metrics_port(Some(65500), 40), None);
         // base=65535, index=1: 65536 overflows
-        assert_eq!(worker_metrics_port(65535, 1), None);
+        assert_eq!(worker_metrics_port(Some(65535), 1), None);
     }
 }

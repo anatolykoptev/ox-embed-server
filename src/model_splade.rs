@@ -32,7 +32,7 @@
 //! # Concurrency
 //!
 //! Loaded as a pool of N independent `Session` instances behind
-//! `Vec<Mutex<Session>>`, with an `AtomicUsize` round-robin selector.
+//! `Vec<Mutex<MlockedSession>>`, with an `AtomicUsize` round-robin selector.
 //! Mirrors `RerankerModel` exactly — see that module for the full
 //! rationale (TL;DR: pool_size>1 lets concurrent requests run inference
 //! in parallel, at N× the per-session memory cost).
@@ -60,6 +60,8 @@ use ndarray::Array2;
 use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::value::Tensor;
+
+use crate::mlock::{MlockedSession, read_and_mlock};
 use tokenizers::Tokenizer;
 
 use crate::model::configure_truncation;
@@ -90,7 +92,7 @@ pub struct SpladeModel {
     /// Pool of ONNX sessions — round-robined per inference call. With
     /// pool_size==1 this behaves exactly like a single-Mutex<Session>
     /// model. See `RerankerModel` for the design rationale.
-    sessions: Vec<Mutex<Session>>,
+    sessions: Vec<Mutex<MlockedSession>>,
     next: AtomicUsize,
     tokenizer: Tokenizer,
     max_len: usize,
@@ -152,7 +154,7 @@ impl SpladeModel {
             memory_pattern,
             "creating splade ONNX session(s)"
         );
-        let mut sessions: Vec<Mutex<Session>> = Vec::with_capacity(pool_size);
+        let mut sessions: Vec<Mutex<MlockedSession>> = Vec::with_capacity(pool_size);
         for i in 0..pool_size {
             // Re-check cache state per iteration: session 0 misses and
             // writes, sessions 1..N hit on the file written by session 0.
@@ -164,7 +166,7 @@ impl SpladeModel {
             let builder = Session::builder().map_err(|e| format!("session builder #{i}: {e}"))?;
             let builder = onnx_cache::apply_plan(builder, &plan, opt_level)
                 .map_err(|e| format!("apply cache plan #{i}: {e}"))?;
-            let session = builder
+            let mut builder = builder
                 .with_intra_threads(intra_threads)
                 .map_err(|e| format!("set threads #{i}: {e}"))?
                 // memory_pattern: per-model knob parsed from env at load time.
@@ -176,11 +178,14 @@ impl SpladeModel {
                 .with_execution_providers([ort::ep::CPU::default()
                     .with_arena_allocator(false)
                     .build()])
-                .map_err(|e| format!("disable per-session cpu mem arena #{i}: {e}"))?
-                .commit_from_file(&load_path)
+                .map_err(|e| format!("disable per-session cpu mem arena #{i}: {e}"))?;
+            let mlocked = read_and_mlock(&load_path)
+                .map_err(|e| format!("read ONNX bytes #{i} {}: {e}", load_path.display()))?;
+            let session = builder
+                .commit_from_memory(mlocked.as_slice())
                 .map_err(|e| format!("load ONNX #{i} {}: {e}", load_path.display()))?;
             onnx_cache::observe_post_commit(&plan, t_commit.elapsed().as_millis());
-            sessions.push(Mutex::new(session));
+            sessions.push(Mutex::new(MlockedSession::new(session, mlocked)));
         }
         tracing::info!(count = sessions.len(), "splade ONNX session(s) created");
 
