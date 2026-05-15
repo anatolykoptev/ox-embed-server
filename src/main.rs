@@ -244,7 +244,7 @@ async fn main() {
         if !ignored.is_empty() {
             tracing::warn!(
                 vars = %ignored.join(", "),
-                "per-model overrides not yet supported for reranker/splade                  — see PR #74 follow-up; these env vars have no effect"
+                "per-model overrides not yet supported for reranker/splade — see PR #74 follow-up; these env vars have no effect"
             );
         }
     }
@@ -638,7 +638,7 @@ async fn main() {
                     port.to_string(),
                 ));
             }
-            worker_index += 1;
+            worker_index = worker_index.saturating_add(1);
             specs.push(crate::supervisor::SpawnSpec {
                 model: model_def.name.clone(),
                 kind: crate::supervisor::WorkerKind::Embed,
@@ -657,7 +657,7 @@ async fn main() {
                     port.to_string(),
                 ));
             }
-            worker_index += 1;
+            worker_index = worker_index.saturating_add(1);
             specs.push(crate::supervisor::SpawnSpec {
                 model: r_def.name.clone(),
                 kind: crate::supervisor::WorkerKind::Rerank,
@@ -676,7 +676,7 @@ async fn main() {
                     port.to_string(),
                 ));
             }
-            worker_index += 1;
+            worker_index = worker_index.saturating_add(1);
             specs.push(crate::supervisor::SpawnSpec {
                 model: s_def.name.clone(),
                 kind: crate::supervisor::WorkerKind::Splade,
@@ -819,7 +819,7 @@ fn worker_metrics_port(base: Option<u16>, index: u16) -> Option<u16> {
             tracing::error!(
                 base,
                 index,
-                "EMBED_WORKER_METRICS_PORT_BASE + worker index overflows u16                  (max port 65535); metrics port disabled for this worker"
+                "EMBED_WORKER_METRICS_PORT_BASE + worker index overflows u16 (max port 65535); metrics port disabled for this worker"
             );
             None
         }
