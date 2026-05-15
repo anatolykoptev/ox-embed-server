@@ -140,8 +140,60 @@ pub struct ArenaCfg {
 /// compiled defaults. Panics on invalid combinations:
 ///   - `MAX_MEM < INITIAL_CHUNK` (arena would fail its first allocation)
 ///   - `EXTEND_STRATEGY` not in `{0, 1}`
+///
+/// Global-only variant — checks no per-model env. Calls
+/// `init_arena_config_for_model("")` internally.
 pub fn init_arena_config() -> ArenaCfg {
-    let max_mem_bytes = parse_usize_env("EMBED_ARENA_MAX_MEM_BYTES", DEFAULT_MAX_MEM_BYTES);
+    init_arena_config_for_model("")
+}
+
+/// Parse arena configuration with per-model override support for
+/// `EMBED_ARENA_MAX_MEM_BYTES`.
+///
+/// Lookup order for `max_mem_bytes`:
+///   1. `EMBED_ARENA_MAX_MEM_BYTES_<MODEL_KEY_UPPER>` — per-worker override,
+///      where `<MODEL_KEY_UPPER>` is `model_key` uppercased with `-` → `_`.
+///      Example: `"jina-code-v2"` → `EMBED_ARENA_MAX_MEM_BYTES_JINA_CODE_V2`.
+///   2. `EMBED_ARENA_MAX_MEM_BYTES` — global (original behaviour).
+///   3. Compiled default: 6 GiB.
+///
+/// All other arena parameters (`INITIAL_CHUNK_BYTES`, `MAX_DEAD_BYTES`,
+/// `EXTEND_STRATEGY`) remain global-only — per-model arena tuning in
+/// production only requires adjusting the memory ceiling.
+///
+/// When `model_key` is empty, the per-model lookup is skipped.
+pub fn init_arena_config_for_model(model_key: &str) -> ArenaCfg {
+    // Per-model max_mem override: EMBED_ARENA_MAX_MEM_BYTES_<KEY>.
+    let max_mem_bytes = if !model_key.is_empty() {
+        let suffix = crate::config::model_env_key(model_key);
+        let per_model_key = format!("EMBED_ARENA_MAX_MEM_BYTES_{suffix}");
+        match std::env::var(&per_model_key) {
+            Ok(raw) => match raw.trim().parse::<usize>() {
+                Ok(n) => {
+                    tracing::info!(
+                        model = %model_key,
+                        env = %per_model_key,
+                        max_mem_bytes = n,
+                        "per-model EMBED_ARENA_MAX_MEM_BYTES override"
+                    );
+                    n
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        model = %model_key,
+                        env = %per_model_key,
+                        raw = %raw.trim(),
+                        "per-model EMBED_ARENA_MAX_MEM_BYTES is not a valid usize; falling back to global"
+                    );
+                    parse_usize_env("EMBED_ARENA_MAX_MEM_BYTES", DEFAULT_MAX_MEM_BYTES)
+                }
+            },
+            Err(_) => parse_usize_env("EMBED_ARENA_MAX_MEM_BYTES", DEFAULT_MAX_MEM_BYTES),
+        }
+    } else {
+        parse_usize_env("EMBED_ARENA_MAX_MEM_BYTES", DEFAULT_MAX_MEM_BYTES)
+    };
+
     let initial_chunk_bytes = parse_usize_env(
         "EMBED_ARENA_INITIAL_CHUNK_BYTES",
         DEFAULT_INITIAL_CHUNK_BYTES,
@@ -201,10 +253,25 @@ fn parse_i32_env(key: &str, default: i32) -> i32 {
 /// MUST be called after `ort::init().commit()` and BEFORE any
 /// `Session::builder()`. Sessions then opt in via `.with_env_allocators()`.
 ///
-/// Reads configuration from `init_arena_config()` (env vars with safe
-/// defaults) and records Prometheus gauges for runtime visibility.
+/// `model_key` — the model this worker serves (e.g. `"jina-code-v2"`).
+/// When non-empty, `EMBED_ARENA_MAX_MEM_BYTES_<MODEL_KEY_UPPER>` is checked
+/// before the global. Call from embed-worker after learning `EMBED_WORKER_MODEL`.
+/// Pass `""` from the supervisor (global-only, no ONNX sessions in-process).
+///
+/// Reads configuration from `init_arena_config_for_model()` (env vars with
+/// safe defaults) and records Prometheus gauges for runtime visibility.
+pub fn register_shared_cpu_arena_for_model(model_key: &str) -> Result<(), String> {
+    let cfg = init_arena_config_for_model(model_key);
+    register_shared_cpu_arena_with_cfg(cfg)
+}
+
+/// Supervisor-process variant: reads only the global `EMBED_ARENA_MAX_MEM_BYTES`.
+/// Delegates to `register_shared_cpu_arena_for_model("")`.
 pub fn register_shared_cpu_arena() -> Result<(), String> {
-    let cfg = init_arena_config();
+    register_shared_cpu_arena_for_model("")
+}
+
+fn register_shared_cpu_arena_with_cfg(cfg: ArenaCfg) -> Result<(), String> {
 
     tracing::info!(
         max_mem_bytes = cfg.max_mem_bytes,
@@ -511,5 +578,72 @@ mod tests {
         drop(guard);
         assert_eq!(cfg.initial_chunk_bytes, i32::MAX as usize + 1);
         assert_eq!(cfg.max_dead_bytes, i32::MAX as usize + 1);
+    }
+
+    // -----------------------------------------------------------------
+    // EMBED_ARENA_MAX_MEM_BYTES_<MODEL_KEY_UPPER> per-model override.
+    // -----------------------------------------------------------------
+
+    const ALL_VARS_WITH_PER_MODEL: &[&str] = &[
+        "EMBED_ARENA_MAX_MEM_BYTES",
+        "EMBED_ARENA_INITIAL_CHUNK_BYTES",
+        "EMBED_ARENA_MAX_DEAD_BYTES",
+        "EMBED_ARENA_EXTEND_STRATEGY",
+        "EMBED_ARENA_MAX_MEM_BYTES_JINA_CODE_V2",
+        "EMBED_ARENA_MAX_MEM_BYTES_MULTILINGUAL_E5_LARGE",
+    ];
+
+    #[test]
+    #[serial]
+    fn init_arena_config_for_model_default_when_nothing_set() {
+        let guard = EnvGuard::new(ALL_VARS_WITH_PER_MODEL);
+        let cfg = init_arena_config_for_model("jina-code-v2");
+        drop(guard);
+        assert_eq!(cfg.max_mem_bytes, 6 * 1024 * 1024 * 1024, "default 6 GiB");
+    }
+
+    #[test]
+    #[serial]
+    fn init_arena_config_for_model_uses_global_when_no_per_model() {
+        let guard = EnvGuard::new(ALL_VARS_WITH_PER_MODEL);
+        guard.set("EMBED_ARENA_MAX_MEM_BYTES", "3221225472"); // 3 GiB global
+        let cfg = init_arena_config_for_model("jina-code-v2");
+        drop(guard);
+        assert_eq!(cfg.max_mem_bytes, 3 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    #[serial]
+    fn init_arena_config_for_model_per_model_wins_over_global() {
+        // EMBED_ARENA_MAX_MEM_BYTES_JINA_CODE_V2 beats the global.
+        let guard = EnvGuard::new(ALL_VARS_WITH_PER_MODEL);
+        guard.set("EMBED_ARENA_MAX_MEM_BYTES", "6442450944"); // 6 GiB global
+        guard.set("EMBED_ARENA_MAX_MEM_BYTES_JINA_CODE_V2", "2147483648"); // 2 GiB per-model
+        let cfg = init_arena_config_for_model("jina-code-v2");
+        drop(guard);
+        assert_eq!(cfg.max_mem_bytes, 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    #[serial]
+    fn init_arena_config_for_model_per_model_does_not_affect_other_models() {
+        // Jina override must not bleed into e5-large.
+        let guard = EnvGuard::new(ALL_VARS_WITH_PER_MODEL);
+        guard.set("EMBED_ARENA_MAX_MEM_BYTES_JINA_CODE_V2", "2147483648");
+        guard.set("EMBED_ARENA_MAX_MEM_BYTES", "3221225472"); // global 3 GiB
+        let cfg = init_arena_config_for_model("multilingual-e5-large");
+        drop(guard);
+        assert_eq!(cfg.max_mem_bytes, 3 * 1024 * 1024 * 1024); // e5 sees global
+    }
+
+    #[test]
+    #[serial]
+    fn init_arena_config_empty_model_key_delegates_to_global_path() {
+        // Empty model_key = supervisor path, no per-model lookup.
+        let guard = EnvGuard::new(ALL_VARS_WITH_PER_MODEL);
+        guard.set("EMBED_ARENA_MAX_MEM_BYTES", "4294967296"); // 4 GiB
+        let cfg = init_arena_config_for_model("");
+        drop(guard);
+        assert_eq!(cfg.max_mem_bytes, 4 * 1024 * 1024 * 1024);
     }
 }

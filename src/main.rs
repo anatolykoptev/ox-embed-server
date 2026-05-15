@@ -586,19 +586,53 @@ async fn main() {
         let pool = crate::supervisor::WorkerPool::new();
 
         // Collect spawn specs for embed + rerank + splade.
+        //
+        // Per-worker metrics port scheme:
+        //   Base port from EMBED_WORKER_METRICS_PORT_BASE (default 19200).
+        //   Each worker gets base + index (across embed+rerank+splade in
+        //   declaration order). Unset EMBED_WORKER_METRICS_PORT_BASE → metrics
+        //   HTTP disabled for all workers (back-compat).
+        let metrics_port_base: Option<u16> = std::env::var("EMBED_WORKER_METRICS_PORT_BASE")
+            .ok()
+            .and_then(|s| s.trim().parse::<u16>().ok());
+
+        // Read global pool size raw value once so per-model resolver can fall
+        // back to it without re-reading the env var inside the loop.
+        let global_embed_pool_raw = std::env::var("EMBED_SESSION_POOL_SIZE").ok();
         let mut specs: Vec<crate::supervisor::SpawnSpec> = Vec::new();
+        let mut worker_index: u16 = 0;
         for model_def in &cfg.models {
+            let pool_size = crate::config::resolve_embed_pool_size_for_model(
+                &model_def.name,
+                global_embed_pool_raw.as_deref(),
+            );
+            let mut env_extra: Vec<(String, String)> = Vec::new();
+            if let Some(base) = metrics_port_base {
+                env_extra.push((
+                    "EMBED_WORKER_METRICS_PORT".into(),
+                    (base + worker_index).to_string(),
+                ));
+            }
+            worker_index += 1;
             specs.push(crate::supervisor::SpawnSpec {
                 model: model_def.name.clone(),
                 kind: crate::supervisor::WorkerKind::Embed,
                 worker_bin: cfg.worker_bin_path.clone(),
                 socket_dir: cfg.worker_socket_dir.clone(),
-                pool_size: cfg.embed_pool_size,
+                pool_size,
                 intra_threads: cfg.intra_threads,
-                env_extra: Vec::new(),
+                env_extra,
             });
         }
         for r_def in &cfg.rerankers {
+            let mut env_extra: Vec<(String, String)> = Vec::new();
+            if let Some(base) = metrics_port_base {
+                env_extra.push((
+                    "EMBED_WORKER_METRICS_PORT".into(),
+                    (base + worker_index).to_string(),
+                ));
+            }
+            worker_index += 1;
             specs.push(crate::supervisor::SpawnSpec {
                 model: r_def.name.clone(),
                 kind: crate::supervisor::WorkerKind::Rerank,
@@ -606,10 +640,18 @@ async fn main() {
                 socket_dir: cfg.worker_socket_dir.clone(),
                 pool_size: cfg.reranker_pool_size.max(1),
                 intra_threads: cfg.reranker_intra_threads.max(1),
-                env_extra: Vec::new(),
+                env_extra,
             });
         }
         for s_def in &cfg.splades {
+            let mut env_extra: Vec<(String, String)> = Vec::new();
+            if let Some(base) = metrics_port_base {
+                env_extra.push((
+                    "EMBED_WORKER_METRICS_PORT".into(),
+                    (base + worker_index).to_string(),
+                ));
+            }
+            worker_index += 1;
             specs.push(crate::supervisor::SpawnSpec {
                 model: s_def.name.clone(),
                 kind: crate::supervisor::WorkerKind::Splade,
@@ -617,7 +659,7 @@ async fn main() {
                 socket_dir: cfg.worker_socket_dir.clone(),
                 pool_size: cfg.splade_pool_size.max(1),
                 intra_threads: cfg.splade_intra_threads.max(1),
-                env_extra: Vec::new(),
+                env_extra,
             });
         }
 

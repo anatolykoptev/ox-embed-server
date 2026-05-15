@@ -804,6 +804,49 @@ fn parse_embed_pool_size(raw: Option<&str>) -> usize {
     }
 }
 
+/// Convert a model key (e.g. `"jina-code-v2"`) to the SCREAMING_SNAKE_CASE
+/// suffix used in per-model env var names (e.g. `"JINA_CODE_V2"`).
+///
+/// Rule: uppercase + replace `-` with `_`. This is the same transform used
+/// by `ONNX_OPT_CACHE_DIR_<KEY>` and `EMBED_MEMORY_PATTERN_<KEY>`.
+pub(crate) fn model_env_key(model_key: &str) -> String {
+    model_key.to_uppercase().replace('-', "_")
+}
+
+/// Resolve the embed session pool size for a specific model.
+///
+/// Lookup order:
+///   1. `EMBED_SESSION_POOL_SIZE_<MODEL_KEY_UPPER>` — per-model override.
+///      Example: `"jina-code-v2"` → `EMBED_SESSION_POOL_SIZE_JINA_CODE_V2`.
+///   2. `global_raw` — the value of the global `EMBED_SESSION_POOL_SIZE` env
+///      (pass `env::var("EMBED_SESSION_POOL_SIZE").ok().as_deref()`).
+///   3. Default: 1.
+///
+/// Same rejection contract as `parse_embed_pool_size`: 0 warns + falls back,
+/// garbage falls back silently.
+pub(crate) fn resolve_embed_pool_size_for_model(
+    model_key: &str,
+    global_raw: Option<&str>,
+) -> usize {
+    let suffix = model_env_key(model_key);
+    let per_model_key = format!("EMBED_SESSION_POOL_SIZE_{suffix}");
+    let per_model_raw = env::var(&per_model_key).ok();
+    if let Some(ref raw) = per_model_raw {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            let parsed = parse_embed_pool_size(Some(trimmed));
+            tracing::info!(
+                model = %model_key,
+                env = %per_model_key,
+                pool_size = parsed,
+                "per-model EMBED_SESSION_POOL_SIZE override"
+            );
+            return parsed;
+        }
+    }
+    parse_embed_pool_size(global_raw)
+}
+
 /// Parse `EMBED_MULTI_PROCESS` env value.
 ///
 /// - Unset or `None` → `false` (default: single-process mode).
@@ -1924,5 +1967,81 @@ mod tests {
         // Unrecognized values must NOT activate multi-process (typo guard).
         assert!(!parse_multi_process_flag(Some("yes")));
         assert!(!parse_multi_process_flag(Some("on")));
+    }
+
+    // -----------------------------------------------------------------
+    // model_env_key helper — shared by pool-size + arena override paths.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn model_env_key_converts_dashes_to_underscores_and_uppercases() {
+        assert_eq!(super::model_env_key("jina-code-v2"), "JINA_CODE_V2");
+        assert_eq!(
+            super::model_env_key("multilingual-e5-large"),
+            "MULTILINGUAL_E5_LARGE"
+        );
+        assert_eq!(super::model_env_key("e5"), "E5");
+    }
+
+    // -----------------------------------------------------------------
+    // EMBED_SESSION_POOL_SIZE_<MODEL_KEY_UPPER> per-model override.
+    //
+    // resolve_embed_pool_size_for_model(model_key, global_raw) must:
+    //   - prefer per-model env over global
+    //   - fall back to global when per-model absent
+    //   - fall back to default (1) when both absent
+    //   - reject 0 with warn + default, identical to parse_embed_pool_size
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn resolve_embed_pool_size_for_model_default_when_nothing_set() {
+        // Neither per-model nor global set → default 1.
+        let size = super::resolve_embed_pool_size_for_model("jina-code-v2", None);
+        assert_eq!(size, 1);
+    }
+
+    #[test]
+    fn resolve_embed_pool_size_for_model_uses_global_when_no_per_model() {
+        // Global set, no per-model → global wins.
+        let size = super::resolve_embed_pool_size_for_model("jina-code-v2", Some("3"));
+        assert_eq!(size, 3);
+    }
+
+    #[test]
+    fn resolve_embed_pool_size_for_model_per_model_wins_over_global() {
+        // EMBED_SESSION_POOL_SIZE_JINA_CODE_V2=1 must beat global=3.
+        unsafe {
+            std::env::set_var("EMBED_SESSION_POOL_SIZE_JINA_CODE_V2", "1");
+        }
+        let size = super::resolve_embed_pool_size_for_model("jina-code-v2", Some("3"));
+        unsafe {
+            std::env::remove_var("EMBED_SESSION_POOL_SIZE_JINA_CODE_V2");
+        }
+        assert_eq!(size, 1);
+    }
+
+    #[test]
+    fn resolve_embed_pool_size_for_model_per_model_does_not_affect_other_models() {
+        // Jina override must not bleed into e5-large.
+        unsafe {
+            std::env::set_var("EMBED_SESSION_POOL_SIZE_JINA_CODE_V2", "1");
+        }
+        let size = super::resolve_embed_pool_size_for_model("multilingual-e5-large", Some("2"));
+        unsafe {
+            std::env::remove_var("EMBED_SESSION_POOL_SIZE_JINA_CODE_V2");
+        }
+        assert_eq!(size, 2); // e5 gets global, not jina override
+    }
+
+    #[test]
+    fn resolve_embed_pool_size_for_model_rejects_zero_same_as_global_parser() {
+        unsafe {
+            std::env::set_var("EMBED_SESSION_POOL_SIZE_JINA_CODE_V2", "0");
+        }
+        let size = super::resolve_embed_pool_size_for_model("jina-code-v2", None);
+        unsafe {
+            std::env::remove_var("EMBED_SESSION_POOL_SIZE_JINA_CODE_V2");
+        }
+        assert_eq!(size, 1); // 0 rejected → default
     }
 }
