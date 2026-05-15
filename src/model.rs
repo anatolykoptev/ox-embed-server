@@ -1404,6 +1404,15 @@ impl StandaloneEmbedder {
             pool_size,
             0, // idle_evict_secs — disabled; worker is short-lived
         )?;
+        // Warmup restores the pre-PR-#68 behaviour: the in-process path at
+        // main.rs called warmup() for every model. The multi-process cutover
+        // (Wave 3.2) moved loading here but omitted the call, causing ORT to
+        // record fresh per-shape scratch plans in BFCArena on the first prod
+        // request for each novel (B, S) shape — with memory_pattern=true the
+        // arena never shrinks between plans, ratcheting to cap -> swap thrash.
+        if let Err(e) = inner.warmup(&def.name, &cfg.embed_warmup_batch_sizes, def.warmup_seq_len) {
+            tracing::error!(model = %model_name, error = %e, "embed worker warmup failed (non-fatal)");
+        }
         Ok(Self { inner, dims })
     }
 
@@ -1464,6 +1473,10 @@ impl StandaloneReranker {
             tokenizer_max_len = def.max_len,
             "reranker loaded; max_seq_len from IPC is advisory (tokenizer truncates at load-time max_len)"
         );
+        // Warmup -- mirrors main.rs:393 single-process path (omitted in PR #68).
+        if let Err(e) = inner.warmup(&cfg.rerank_warmup_batch_sizes, cfg.embed_warmup_seq_len) {
+            tracing::error!(model = %model_name, error = %e, "reranker worker warmup failed (non-fatal)");
+        }
         Ok(Self { inner })
     }
 
@@ -1521,6 +1534,10 @@ impl StandaloneSplade {
             tokenizer_max_len = def.max_len,
             "splade loaded; max_seq_len from IPC is advisory (tokenizer truncates at load-time max_len)"
         );
+        // Warmup -- mirrors main.rs:475 single-process path (omitted in PR #68).
+        if let Err(e) = inner.warmup(&cfg.splade_warmup_batch_sizes) {
+            tracing::error!(model = %model_name, error = %e, "splade worker warmup failed (non-fatal)");
+        }
         Ok(Self { inner })
     }
 
