@@ -23,6 +23,7 @@
 //! - Graceful shutdown via ControlMessage::Shutdown before kill_on_drop SIGKILL.
 
 use crate::ipc::client::WorkerClient;
+use crate::supervisor::util::resolve_duration_secs_env;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -54,7 +55,8 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 ///   - jina-code-v2: ~8–12 s (large BERT variant)
 ///   - SPLADE: ~2–4 s
 /// 60 s provides 4–5× headroom on the slowest model. Overridable via
-/// `EMBED_WORKER_SOCKET_WAIT_SECS`.
+/// `EMBED_WORKER_SOCKET_WAIT_SECS`. Captured at startup; restart the
+/// container to change.
 const SOCKET_WAIT_SECS: u64 = 60;
 
 /// Poll granularity for the socket-file existence check during worker startup.
@@ -62,34 +64,6 @@ const SOCKET_WAIT_SECS: u64 = 60;
 /// 200 ms is fine-grained enough that the per-model startup delay is within
 /// one poll interval of the actual socket appearance time. Not operator-tunable.
 const SOCKET_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(200);
-
-/// Parse `EMBED_WORKER_SOCKET_WAIT_SECS` from the environment, falling back to
-/// `SOCKET_WAIT_SECS`. Warns and falls back on parse failure or zero.
-fn resolve_socket_wait() -> Duration {
-    let default = Duration::from_secs(SOCKET_WAIT_SECS);
-    match std::env::var("EMBED_WORKER_SOCKET_WAIT_SECS") {
-        Err(_) => default,
-        Ok(raw) => match raw.trim().parse::<u64>() {
-            Ok(n) if n > 0 => Duration::from_secs(n),
-            Ok(_) => {
-                tracing::warn!(
-                    EMBED_WORKER_SOCKET_WAIT_SECS = %raw,
-                    fallback_secs = SOCKET_WAIT_SECS,
-                    "EMBED_WORKER_SOCKET_WAIT_SECS=0 is invalid; using default"
-                );
-                default
-            }
-            Err(_) => {
-                tracing::warn!(
-                    EMBED_WORKER_SOCKET_WAIT_SECS = %raw,
-                    fallback_secs = SOCKET_WAIT_SECS,
-                    "EMBED_WORKER_SOCKET_WAIT_SECS is not a valid u64; using default"
-                );
-                default
-            }
-        },
-    }
-}
 
 /// Advance exponential backoff by doubling, capped at MAX_BACKOFF.
 fn next_backoff(current: Duration) -> Duration {
@@ -142,6 +116,11 @@ pub struct WorkerSupervisor {
     client_slot: Arc<RwLock<Option<Arc<WorkerClient>>>>,
     /// Monotonically increasing count of successful respawns for observability.
     restart_count: Arc<std::sync::atomic::AtomicU64>,
+    /// How long to wait for a freshly-spawned worker's socket to appear.
+    ///
+    /// Resolved once from `EMBED_WORKER_SOCKET_WAIT_SECS` at [`launch`] time;
+    /// restart the container to pick up a changed value.
+    socket_wait: Duration,
 }
 
 impl WorkerSupervisor {
@@ -149,14 +128,23 @@ impl WorkerSupervisor {
     /// failure (startup errors are not retried; only post-startup crashes
     /// trigger the watchdog respawn loop).
     pub async fn launch(spec: SpawnSpec) -> anyhow::Result<Arc<Self>> {
+        // Resolve env-tunable values once here so every respawn uses the same
+        // values captured at startup. Restart the container to change them.
+        let socket_wait = resolve_duration_secs_env(
+            "EMBED_WORKER_SOCKET_WAIT_SECS",
+            Duration::from_secs(SOCKET_WAIT_SECS),
+            &format!("SOCKET_WAIT_SECS ({SOCKET_WAIT_SECS})"),
+        );
+
         let supervisor = Arc::new(Self {
             spec: spec.clone(),
             client_slot: Arc::new(RwLock::new(None)),
             restart_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            socket_wait,
         });
 
         // Initial spawn — fail loudly so the server startup loop can exit(1).
-        let (child, client) = Self::spawn_one(&supervisor.spec).await?;
+        let (child, client) = Self::spawn_one(&supervisor.spec, supervisor.socket_wait).await?;
         *supervisor.client_slot.write().await = Some(client);
 
         // Pre-touch the restart counter to 0 — makes "healthy / no restarts"
@@ -178,7 +166,7 @@ impl WorkerSupervisor {
     ///
     /// Returns `(Child, Arc<WorkerClient>)` on success. Fails if the process
     /// dies before the socket appears or if the initial connect fails.
-    async fn spawn_one(spec: &SpawnSpec) -> anyhow::Result<(Child, Arc<WorkerClient>)> {
+    async fn spawn_one(spec: &SpawnSpec, socket_wait: Duration) -> anyhow::Result<(Child, Arc<WorkerClient>)> {
         if let Err(e) = std::fs::create_dir_all(&spec.socket_dir) {
             tracing::warn!(dir = ?spec.socket_dir, error = %e, "create_dir_all failed; subsequent bind may fail");
         }
@@ -204,9 +192,7 @@ impl WorkerSupervisor {
             e
         })?;
 
-        // Poll up to SOCKET_WAIT_SECS for socket, with early-exit if child dies first.
-        // Timeout is overridable via EMBED_WORKER_SOCKET_WAIT_SECS for slow hosts.
-        let socket_wait = resolve_socket_wait();
+        // Poll up to socket_wait for socket, with early-exit if child dies first.
         let deadline = Instant::now() + socket_wait;
         loop {
             if Instant::now() >= deadline {
@@ -283,7 +269,7 @@ impl WorkerSupervisor {
             // Respawn loop — each failed attempt advances backoff exactly once.
             loop {
                 tokio::time::sleep(backoff).await;
-                match Self::spawn_one(&self.spec).await {
+                match Self::spawn_one(&self.spec, self.socket_wait).await {
                     Ok((new_child, new_client)) => {
                         *self.client_slot.write().await = Some(new_client);
                         self.restart_count
@@ -328,7 +314,17 @@ impl WorkerSupervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::supervisor::util::resolve_duration_secs_env;
     use serial_test::serial;
+    use std::time::Duration;
+
+    fn resolve_socket_wait() -> Duration {
+        resolve_duration_secs_env(
+            "EMBED_WORKER_SOCKET_WAIT_SECS",
+            Duration::from_secs(SOCKET_WAIT_SECS),
+            &format!("SOCKET_WAIT_SECS ({SOCKET_WAIT_SECS})"),
+        )
+    }
 
     #[test]
     #[serial]
@@ -389,7 +385,14 @@ mod tests {
         let b2 = next_backoff(b1);
         assert_eq!(b2, Duration::from_secs(8));
 
-        // Ensure cap is respected.
+        // Boundary: 32 s × 2 = 64 s → clamped to MAX_BACKOFF (60 s).
+        assert_eq!(
+            next_backoff(Duration::from_secs(32)),
+            Duration::from_secs(60),
+            "32s doubles to 64s which must clamp to MAX_BACKOFF=60s"
+        );
+
+        // Ensure cap is respected for values already beyond MAX_BACKOFF.
         let huge = Duration::from_secs(1000);
         assert_eq!(next_backoff(huge), MAX_BACKOFF);
     }

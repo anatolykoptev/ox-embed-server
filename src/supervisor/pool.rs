@@ -6,6 +6,7 @@
 //! `EMBED_DISPATCH_TIMEOUT_SECS`).
 
 use crate::ipc::protocol::WorkerResponse;
+use crate::supervisor::util::resolve_duration_secs_env;
 use crate::supervisor::WorkerSupervisor;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,14 +15,15 @@ use tokio::sync::RwLock;
 
 // ── pool tuning defaults ───────────────────────────────────────────────────────
 
-/// Default maximum time to wait for a respawning worker to become available.
+/// Maximum time to wait for a respawning worker to become available.
 ///
 /// 30 s is chosen as the worst-case bound for a model reload:
 ///   - ONNX graph load: ~5–15 s on ARM for the largest models (jina-code-v2).
 ///   - Socket wait poll: up to SOCKET_WAIT_POLL_INTERVAL × 300 iterations.
 /// Callers (memdb-go) retry on error, so a bounded 30 s timeout surfaces a
 /// clear error rather than queuing silently forever.
-/// Overridable via `EMBED_DISPATCH_TIMEOUT_SECS`.
+/// Overridable via `EMBED_DISPATCH_TIMEOUT_SECS`. Captured at startup;
+/// restart the container to change.
 const DISPATCH_TIMEOUT_SECS: u64 = 30;
 
 /// How often to poll for a live client while a worker is respawning.
@@ -30,34 +32,6 @@ const DISPATCH_TIMEOUT_SECS: u64 = 30;
 /// (model reload ≈ 5–15 s) without burning CPU. Not operator-tunable:
 /// changing the poll granularity doesn't meaningfully affect P99 latency.
 const DISPATCH_POLL_INTERVAL: Duration = Duration::from_millis(200);
-
-/// Parse `EMBED_DISPATCH_TIMEOUT_SECS` from the environment, falling back to
-/// `DISPATCH_TIMEOUT_SECS`. Warns and falls back on parse failure or zero.
-fn resolve_dispatch_timeout() -> Duration {
-    let default = Duration::from_secs(DISPATCH_TIMEOUT_SECS);
-    match std::env::var("EMBED_DISPATCH_TIMEOUT_SECS") {
-        Err(_) => default,
-        Ok(raw) => match raw.trim().parse::<u64>() {
-            Ok(n) if n > 0 => Duration::from_secs(n),
-            Ok(_) => {
-                tracing::warn!(
-                    EMBED_DISPATCH_TIMEOUT_SECS = %raw,
-                    fallback_secs = DISPATCH_TIMEOUT_SECS,
-                    "EMBED_DISPATCH_TIMEOUT_SECS=0 is invalid; using default"
-                );
-                default
-            }
-            Err(_) => {
-                tracing::warn!(
-                    EMBED_DISPATCH_TIMEOUT_SECS = %raw,
-                    fallback_secs = DISPATCH_TIMEOUT_SECS,
-                    "EMBED_DISPATCH_TIMEOUT_SECS is not a valid u64; using default"
-                );
-                default
-            }
-        },
-    }
-}
 
 pub struct WorkerPool {
     workers: Arc<RwLock<HashMap<String, Arc<WorkerSupervisor>>>>,
@@ -69,7 +43,11 @@ impl WorkerPool {
     pub fn new() -> Self {
         Self {
             workers: Arc::new(RwLock::new(HashMap::new())),
-            dispatch_timeout: resolve_dispatch_timeout(),
+            dispatch_timeout: resolve_duration_secs_env(
+                "EMBED_DISPATCH_TIMEOUT_SECS",
+                Duration::from_secs(DISPATCH_TIMEOUT_SECS),
+                &format!("DISPATCH_TIMEOUT_SECS ({DISPATCH_TIMEOUT_SECS})"),
+            ),
         }
     }
 
@@ -163,8 +141,24 @@ impl Default for WorkerPool {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_dispatch_timeout, DISPATCH_TIMEOUT_SECS};
+    use super::{DISPATCH_TIMEOUT_SECS, DISPATCH_POLL_INTERVAL};
+    use crate::supervisor::util::resolve_duration_secs_env;
     use serial_test::serial;
+    use std::time::Duration;
+
+    fn resolve_dispatch_timeout() -> Duration {
+        resolve_duration_secs_env(
+            "EMBED_DISPATCH_TIMEOUT_SECS",
+            Duration::from_secs(DISPATCH_TIMEOUT_SECS),
+            &format!("DISPATCH_TIMEOUT_SECS ({DISPATCH_TIMEOUT_SECS})"),
+        )
+    }
+
+    #[test]
+    fn poll_interval_is_subzero() {
+        // Sanity: poll interval < 1s so respawn detection latency is bounded.
+        assert!(DISPATCH_POLL_INTERVAL.as_millis() < 1000);
+    }
 
     #[test]
     #[serial]

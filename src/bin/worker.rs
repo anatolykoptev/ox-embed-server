@@ -30,14 +30,14 @@ use tokio::sync::Semaphore;
 /// (24 vCPU / 3 models × pool_size sessions). Increasing beyond 2 stalls
 /// other sessions under concurrent inference. Overridable via
 /// `EMBED_WORKER_INTRA_THREADS`.
-const DEFAULT_INTRA_THREADS: usize = 2;
+const INTRA_THREADS: usize = 2;
 
 /// Default ONNX session pool size per worker (i.e. max concurrent inferences).
 ///
 /// 1 session is the safe baseline — each session holds ~650 MiB of model
 /// weights in the shared BFCArena. Increase only when a model fits within
 /// the arena budget with headroom. Overridable via `EMBED_WORKER_POOL_SIZE`.
-const DEFAULT_POOL_SIZE: usize = 1;
+const POOL_SIZE: usize = 1;
 
 /// Multiplier applied to pool_size when computing the default max-waiters cap.
 ///
@@ -135,10 +135,10 @@ async fn main() -> anyhow::Result<()> {
     let model_name = require_env("EMBED_WORKER_MODEL")?;
     let socket_path: PathBuf = require_env("EMBED_WORKER_SOCKET")?.into();
     let intra_threads: usize = std::env::var("EMBED_WORKER_INTRA_THREADS")
-        .unwrap_or_else(|_| DEFAULT_INTRA_THREADS.to_string())
+        .unwrap_or_else(|_| INTRA_THREADS.to_string())
         .parse()?;
     let pool_size: usize = std::env::var("EMBED_WORKER_POOL_SIZE")
-        .unwrap_or_else(|_| DEFAULT_POOL_SIZE.to_string())
+        .unwrap_or_else(|_| POOL_SIZE.to_string())
         .parse()?;
 
     // Resolve max_waiters once at startup -- cheaper than re-reading env
@@ -343,7 +343,7 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        resolve_max_waiters, DEFAULT_INTRA_THREADS, DEFAULT_POOL_SIZE, WAITERS_FLOOR,
+        resolve_max_waiters, INTRA_THREADS, POOL_SIZE, WAITERS_FLOOR,
         WAITERS_POOL_MULTIPLIER,
     };
     use serial_test::serial;
@@ -357,8 +357,8 @@ mod tests {
     #[test]
     fn constants_have_sane_values() {
         // Guard against accidentally editing constants to nonsense values.
-        assert!(DEFAULT_INTRA_THREADS >= 1, "intra_threads must be ≥1");
-        assert!(DEFAULT_POOL_SIZE >= 1, "pool_size must be ≥1");
+        assert!(INTRA_THREADS >= 1, "intra_threads must be ≥1");
+        assert!(POOL_SIZE >= 1, "pool_size must be ≥1");
         assert!(
             WAITERS_POOL_MULTIPLIER >= 1,
             "waiters multiplier must be ≥1"
