@@ -12,7 +12,7 @@ RUN apt-get update && \
 # compiled object content. Paths inside docker are stable (/app) so no --remap-path-prefix
 # needed — cache keys are deterministic and hit rate is high.
 # Download aarch64 or x86_64 musl binary based on build host architecture.
-ENV SCCACHE_VERSION=0.10.0
+ENV SCCACHE_VERSION=0.15.0
 RUN ARCH=$(uname -m) && \
     curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-${ARCH}-unknown-linux-musl.tar.gz" \
     | tar xz --strip-components=1 -C /usr/local/bin "sccache-v${SCCACHE_VERSION}-${ARCH}-unknown-linux-musl/sccache" && \
