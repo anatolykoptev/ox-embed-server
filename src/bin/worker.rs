@@ -450,8 +450,7 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        resolve_max_waiters, INTRA_THREADS, POOL_SIZE, WAITERS_FLOOR,
-        WAITERS_POOL_MULTIPLIER,
+        INTRA_THREADS, POOL_SIZE, WAITERS_FLOOR, WAITERS_POOL_MULTIPLIER, resolve_max_waiters,
     };
     use serial_test::serial;
 

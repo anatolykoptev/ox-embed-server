@@ -121,6 +121,12 @@ pub struct WorkerSupervisor {
     /// Resolved once from `EMBED_WORKER_SOCKET_WAIT_SECS` at [`launch`] time;
     /// restart the container to pick up a changed value.
     socket_wait: Duration,
+    /// PID of the currently live worker child process.
+    ///
+    /// Updated atomically after every successful [`spawn_one`] and cleared to 0
+    /// when the child exits (before respawn). The RSS-poll loop reads this to
+    /// call `/proc/<pid>/status`; 0 means worker is between respawns.
+    current_pid: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl WorkerSupervisor {
@@ -141,16 +147,29 @@ impl WorkerSupervisor {
             client_slot: Arc::new(RwLock::new(None)),
             restart_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             socket_wait,
+            current_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         });
 
         // Initial spawn — fail loudly so the server startup loop can exit(1).
         let (child, client) = Self::spawn_one(&supervisor.spec, supervisor.socket_wait).await?;
         *supervisor.client_slot.write().await = Some(client);
+        // Store child PID so the RSS-poll loop can read /proc/<pid>/status.
+        // child.id() returns None only if the process has already been awaited,
+        // which cannot happen here (we just spawned it).
+        if let Some(pid) = child.id() {
+            supervisor
+                .current_pid
+                .store(pid, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // Pre-touch the restart counter to 0 — makes "healthy / no restarts"
         // observable as a present-but-zero series, not absent (which
         // Prometheus operators read as "metric not wired").
         crate::metrics::worker_restart_touch(&supervisor.spec.model);
+        // Pre-touch RSS gauge to 0 — same rationale as restart counter:
+        // makes "healthy worker, RSS not yet sampled" visible in Prometheus
+        // as 0 rather than absent.
+        crate::metrics::worker_rss_touch(&supervisor.spec.model);
 
         // Hand off the Child to the watchdog task; it owns the Child for its
         // entire lifetime.
@@ -166,7 +185,10 @@ impl WorkerSupervisor {
     ///
     /// Returns `(Child, Arc<WorkerClient>)` on success. Fails if the process
     /// dies before the socket appears or if the initial connect fails.
-    async fn spawn_one(spec: &SpawnSpec, socket_wait: Duration) -> anyhow::Result<(Child, Arc<WorkerClient>)> {
+    async fn spawn_one(
+        spec: &SpawnSpec,
+        socket_wait: Duration,
+    ) -> anyhow::Result<(Child, Arc<WorkerClient>)> {
         if let Err(e) = std::fs::create_dir_all(&spec.socket_dir) {
             tracing::warn!(dir = ?spec.socket_dir, error = %e, "create_dir_all failed; subsequent bind may fail");
         }
@@ -265,12 +287,20 @@ impl WorkerSupervisor {
 
             // Clear client slot — dispatchers see "worker unavailable".
             *self.client_slot.write().await = None;
+            // Clear PID — RSS-poll loop skips this worker until it is live again.
+            self.current_pid
+                .store(0, std::sync::atomic::Ordering::Relaxed);
 
             // Respawn loop — each failed attempt advances backoff exactly once.
             loop {
                 tokio::time::sleep(backoff).await;
                 match Self::spawn_one(&self.spec, self.socket_wait).await {
                     Ok((new_child, new_client)) => {
+                        // Store new PID before handing child back to wait().
+                        if let Some(pid) = new_child.id() {
+                            self.current_pid
+                                .store(pid, std::sync::atomic::Ordering::Relaxed);
+                        }
                         *self.client_slot.write().await = Some(new_client);
                         self.restart_count
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -303,6 +333,15 @@ impl WorkerSupervisor {
     pub fn restart_count(&self) -> u64 {
         self.restart_count
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// PID of the currently live worker process, or 0 if between respawns.
+    ///
+    /// Reads the atomic with Relaxed ordering — the RSS poll loop only uses
+    /// this for a best-effort `/proc/<pid>/status` read; a briefly stale PID
+    /// at most causes one skipped or misattributed sample, not correctness loss.
+    pub fn current_pid(&self) -> u32 {
+        self.current_pid.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Model name this supervisor is responsible for.
@@ -375,7 +414,11 @@ mod tests {
             Some(p) => unsafe { std::env::set_var("EMBED_WORKER_SOCKET_WAIT_SECS", p) },
             None => unsafe { std::env::remove_var("EMBED_WORKER_SOCKET_WAIT_SECS") },
         }
-        assert_eq!(d.as_secs(), SOCKET_WAIT_SECS, "invalid falls back to default");
+        assert_eq!(
+            d.as_secs(),
+            SOCKET_WAIT_SECS,
+            "invalid falls back to default"
+        );
     }
 
     #[test]

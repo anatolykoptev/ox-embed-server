@@ -20,3 +20,6 @@ pub mod arena;
 
 // mlock helper — pin ONNX weight bytes into RAM to prevent swap-out.
 pub mod mlock;
+
+// /proc/<pid>/status helpers for per-worker RSS sampling (Linux-only).
+pub mod proc;

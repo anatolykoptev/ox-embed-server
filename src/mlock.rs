@@ -127,8 +127,7 @@ impl std::ops::DerefMut for MlockedSession {
 ///
 /// Returns `Err` only when the file cannot be read.
 pub fn read_and_mlock(path: &Path) -> Result<MlockedBuf, String> {
-    let buf = std::fs::read(path)
-        .map_err(|e| format!("read ONNX {}: {e}", path.display()))?;
+    let buf = std::fs::read(path).map_err(|e| format!("read ONNX {}: {e}", path.display()))?;
 
     if !mlock_enabled() {
         return Ok(MlockedBuf { buf, locked: false });
@@ -239,7 +238,10 @@ mod tests {
 
         let buf = result.expect("should succeed even when mlock disabled");
         assert_eq!(buf.as_slice(), payload);
-        assert!(!buf.locked, "locked must be false when EMBED_MLOCK_WEIGHTS=0");
+        assert!(
+            !buf.locked,
+            "locked must be false when EMBED_MLOCK_WEIGHTS=0"
+        );
     }
 
     /// Missing file must return `Err`, not panic.

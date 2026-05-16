@@ -23,8 +23,8 @@ use ort::session::builder::GraphOptimizationLevel;
 use tokenizers::Tokenizer;
 
 use super::RerankerModel;
-use crate::model::configure_truncation;
 use crate::mlock::{MlockedSession, read_and_mlock};
+use crate::model::configure_truncation;
 use crate::onnx_cache::{self, CacheDir, LoadPlan};
 
 /// Parse `ORT_OPT_LEVEL` the same way `EmbedModel` does (shared env var —

@@ -939,6 +939,34 @@ pub fn worker_restart_touch(model: &str) {
     .absolute(0);
 }
 
+/// Set the per-worker RSS gauge.
+///
+/// Called by the supervisor RSS-poll loop every 15 s. Value is bytes
+/// read from `/proc/<pid>/status` VmRSS field.
+///
+/// `model` matches `SpawnSpec::model` (e.g. `multilingual-e5-large`) so
+/// operators can alert per-model: `embed_worker_rss_bytes{model} > 4 GiB`.
+pub fn worker_rss_set(model: &str, bytes: f64) {
+    metrics::gauge!(
+        "embed_worker_rss_bytes",
+        "model" => model.to_string()
+    )
+    .set(bytes);
+}
+
+/// Pre-touch the per-worker RSS gauge to 0 at supervisor launch.
+///
+/// Without this, Prometheus reads "no data" as absent until the first
+/// 15 s poll fires — indistinguishable from "metric not wired". Calling
+/// this immediately after initial spawn makes the 0-byte baseline visible.
+pub fn worker_rss_touch(model: &str) {
+    metrics::gauge!(
+        "embed_worker_rss_bytes",
+        "model" => model.to_string()
+    )
+    .set(0.0);
+}
+
 /// Increment the rerank-documents-rejected counter. Called when a
 /// `/v1/rerank` request carries more documents than `rerank_max_input_docs`.
 /// The request is rejected with HTTP 400 before tokenization — the counter
