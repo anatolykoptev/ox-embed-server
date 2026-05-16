@@ -737,15 +737,16 @@ fn build_evictable_pool(
     // on every call so post-eviction cold starts pick up cache changes.
     let onnx_path_buf = onnx_path.to_path_buf();
     let model_name_owned = model_name.to_string();
-    let factory: Arc<dyn Fn() -> Result<MlockedSession, String> + Send + Sync> = Arc::new(move || {
-        build_one_session(
-            &model_name_owned,
-            &onnx_path_buf,
-            opt_level,
-            intra_threads,
-            memory_pattern,
-        )
-    });
+    let factory: Arc<dyn Fn() -> Result<MlockedSession, String> + Send + Sync> =
+        Arc::new(move || {
+            build_one_session(
+                &model_name_owned,
+                &onnx_path_buf,
+                opt_level,
+                intra_threads,
+                memory_pattern,
+            )
+        });
 
     // Build the initial pool_size sessions up front (startup). Any failure
     // here is fatal (wrong ONNX path / bad config) — panic is intentional.

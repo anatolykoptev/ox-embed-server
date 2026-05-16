@@ -6,8 +6,8 @@
 //! `EMBED_DISPATCH_TIMEOUT_SECS`).
 
 use crate::ipc::protocol::WorkerResponse;
-use crate::supervisor::util::resolve_duration_secs_env;
 use crate::supervisor::WorkerSupervisor;
+use crate::supervisor::util::resolve_duration_secs_env;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -131,6 +131,26 @@ impl WorkerPool {
     pub async fn models(&self) -> Vec<String> {
         self.workers.read().await.keys().cloned().collect()
     }
+
+    /// Snapshot of (model_name, pid) pairs for currently live workers.
+    ///
+    /// Workers between respawns have `pid == 0` and are excluded from the
+    /// returned list — the RSS-poll loop has nothing to read for them.
+    pub async fn worker_pids(&self) -> Vec<(String, u32)> {
+        self.workers
+            .read()
+            .await
+            .values()
+            .filter_map(|sup| {
+                let pid = sup.current_pid();
+                if pid != 0 {
+                    Some((sup.model().to_string(), pid))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
 }
 
 impl Default for WorkerPool {
@@ -141,7 +161,7 @@ impl Default for WorkerPool {
 
 #[cfg(test)]
 mod tests {
-    use super::{DISPATCH_TIMEOUT_SECS, DISPATCH_POLL_INTERVAL};
+    use super::{DISPATCH_POLL_INTERVAL, DISPATCH_TIMEOUT_SECS};
     use crate::supervisor::util::resolve_duration_secs_env;
     use serial_test::serial;
     use std::time::Duration;
@@ -196,7 +216,11 @@ mod tests {
             Some(p) => unsafe { std::env::set_var("EMBED_DISPATCH_TIMEOUT_SECS", p) },
             None => unsafe { std::env::remove_var("EMBED_DISPATCH_TIMEOUT_SECS") },
         }
-        assert_eq!(d.as_secs(), DISPATCH_TIMEOUT_SECS, "zero falls back to default");
+        assert_eq!(
+            d.as_secs(),
+            DISPATCH_TIMEOUT_SECS,
+            "zero falls back to default"
+        );
     }
 
     #[test]
@@ -209,6 +233,10 @@ mod tests {
             Some(p) => unsafe { std::env::set_var("EMBED_DISPATCH_TIMEOUT_SECS", p) },
             None => unsafe { std::env::remove_var("EMBED_DISPATCH_TIMEOUT_SECS") },
         }
-        assert_eq!(d.as_secs(), DISPATCH_TIMEOUT_SECS, "invalid falls back to default");
+        assert_eq!(
+            d.as_secs(),
+            DISPATCH_TIMEOUT_SECS,
+            "invalid falls back to default"
+        );
     }
 }

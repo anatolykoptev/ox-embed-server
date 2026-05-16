@@ -33,8 +33,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use ndarray::Array2;
 use crate::mlock::MlockedSession;
+use ndarray::Array2;
 use ort::value::Tensor;
 use tokenizers::Tokenizer;
 

@@ -799,9 +799,7 @@ fn parse_embed_pool_size(raw: Option<&str>, source_key: Option<&str>) -> usize {
         None => DEFAULT,
         Some(s) => match s.trim().parse::<usize>() {
             Ok(0) => {
-                tracing::warn!(
-                    "{key}=0 is invalid; falling back to default {DEFAULT}"
-                );
+                tracing::warn!("{key}=0 is invalid; falling back to default {DEFAULT}");
                 DEFAULT
             }
             Ok(n) => n,

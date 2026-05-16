@@ -265,7 +265,9 @@ pub(crate) fn parse_bytes_with_suffix(env_key: &str, s: &str) -> usize {
         "K" | "KIB" => 1024,
         "M" | "MIB" => 1024 * 1024,
         "G" | "GIB" => 1024 * 1024 * 1024,
-        _ => panic!("{env_key}: unrecognised size suffix {suffix_raw:?}; accepted: B, K, KiB, M, MiB, G, GiB"),
+        _ => panic!(
+            "{env_key}: unrecognised size suffix {suffix_raw:?}; accepted: B, K, KiB, M, MiB, G, GiB"
+        ),
     };
 
     let result = mantissa.checked_mul(multiplier).unwrap_or_else(|| {
@@ -314,7 +316,6 @@ pub fn register_shared_cpu_arena() -> Result<(), String> {
 }
 
 fn register_shared_cpu_arena_with_cfg(cfg: ArenaCfg) -> Result<(), String> {
-
     tracing::info!(
         max_mem_bytes = cfg.max_mem_bytes,
         initial_chunk_bytes = cfg.initial_chunk_bytes,
@@ -697,7 +698,10 @@ mod tests {
     fn parse_bytes_with_suffix_raw_bytes() {
         assert_eq!(parse_bytes_with_suffix("TEST", "0"), 0);
         assert_eq!(parse_bytes_with_suffix("TEST", "1024"), 1024);
-        assert_eq!(parse_bytes_with_suffix("TEST", "2147483648"), 2 * 1024 * 1024 * 1024);
+        assert_eq!(
+            parse_bytes_with_suffix("TEST", "2147483648"),
+            2 * 1024 * 1024 * 1024
+        );
     }
 
     #[test]
@@ -722,9 +726,18 @@ mod tests {
 
     #[test]
     fn parse_bytes_with_suffix_g_and_gib() {
-        assert_eq!(parse_bytes_with_suffix("TEST", "2G"), 2 * 1024 * 1024 * 1024);
-        assert_eq!(parse_bytes_with_suffix("TEST", "2GiB"), 2 * 1024 * 1024 * 1024);
-        assert_eq!(parse_bytes_with_suffix("TEST", "6GiB"), 6 * 1024 * 1024 * 1024);
+        assert_eq!(
+            parse_bytes_with_suffix("TEST", "2G"),
+            2 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            parse_bytes_with_suffix("TEST", "2GiB"),
+            2 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            parse_bytes_with_suffix("TEST", "6GiB"),
+            6 * 1024 * 1024 * 1024
+        );
     }
 
     #[test]

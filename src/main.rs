@@ -17,6 +17,7 @@ mod model_splade;
 mod onnx_cache;
 mod otel;
 mod pool;
+mod proc;
 mod supervisor;
 mod token_cache;
 mod types;
@@ -634,10 +635,7 @@ async fn main() {
             );
             let mut env_extra: Vec<(String, String)> = Vec::new();
             if let Some(port) = worker_metrics_port(metrics_port_base, worker_index) {
-                env_extra.push((
-                    "EMBED_WORKER_METRICS_PORT".into(),
-                    port.to_string(),
-                ));
+                env_extra.push(("EMBED_WORKER_METRICS_PORT".into(), port.to_string()));
             }
             worker_index = worker_index.saturating_add(1);
             specs.push(crate::supervisor::SpawnSpec {
@@ -653,10 +651,7 @@ async fn main() {
         for r_def in &cfg.rerankers {
             let mut env_extra: Vec<(String, String)> = Vec::new();
             if let Some(port) = worker_metrics_port(metrics_port_base, worker_index) {
-                env_extra.push((
-                    "EMBED_WORKER_METRICS_PORT".into(),
-                    port.to_string(),
-                ));
+                env_extra.push(("EMBED_WORKER_METRICS_PORT".into(), port.to_string()));
             }
             worker_index = worker_index.saturating_add(1);
             specs.push(crate::supervisor::SpawnSpec {
@@ -672,10 +667,7 @@ async fn main() {
         for s_def in &cfg.splades {
             let mut env_extra: Vec<(String, String)> = Vec::new();
             if let Some(port) = worker_metrics_port(metrics_port_base, worker_index) {
-                env_extra.push((
-                    "EMBED_WORKER_METRICS_PORT".into(),
-                    port.to_string(),
-                ));
+                env_extra.push(("EMBED_WORKER_METRICS_PORT".into(), port.to_string()));
             }
             worker_index = worker_index.saturating_add(1);
             specs.push(crate::supervisor::SpawnSpec {
@@ -726,6 +718,42 @@ async fn main() {
     } else {
         None
     };
+
+    // Spawn per-worker RSS gauge poller (multi-process mode only).
+    //
+    // Reads /proc/<pid>/status VmRSS every 15 s and writes to
+    // `embed_worker_rss_bytes{model}`. Wires directly into the existing
+    // WorkerPool -- no extra state needed.
+    //
+    // 15 s cadence is coarse enough to have negligible CPU cost while
+    // still detecting BFCArena ratchet within one scrape interval
+    // (Prometheus default = 15 s, so worst-case lag = 30 s).
+    if let Some(ref rss_pool) = worker_pool {
+        let rss_pool_clone = Arc::clone(rss_pool);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let pairs = rss_pool_clone.worker_pids().await;
+                for (model, pid) in pairs {
+                    match proc::read_proc_status_rss(pid) {
+                        Ok(bytes) => {
+                            crate::metrics::worker_rss_set(&model, bytes as f64);
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                model = %model,
+                                pid,
+                                error = %e,
+                                "RSS read failed; worker may have just restarted"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     let state = Arc::new(AppState {
         models: model_entries,
