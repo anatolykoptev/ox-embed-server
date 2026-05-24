@@ -23,3 +23,6 @@ pub mod mlock;
 
 // /proc/<pid>/status helpers for per-worker RSS sampling (Linux-only).
 pub mod proc;
+
+// per-model waiter-queue configuration — accessible from integration tests.
+pub mod worker_waiters;

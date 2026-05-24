@@ -251,6 +251,39 @@ async fn main() {
         }
     }
 
+    // Warn if EMBED_MAX_WAITERS_<KEY> is set for a model key that doesn't
+    // match any loaded model (embed + rerank + splade). This catches typos
+    // like EMBED_MAX_WAITERS_JINA_CODEV2 (missing underscore) early.
+    {
+        let known_keys: std::collections::HashSet<String> = cfg
+            .models
+            .iter()
+            .map(|m| crate::config::model_env_key(&m.name))
+            .chain(cfg.rerankers.iter().map(|r| crate::config::model_env_key(&r.name)))
+            .chain(cfg.splades.iter().map(|s| crate::config::model_env_key(&s.name)))
+            .collect();
+        let unknown_waiters: Vec<String> = std::env::vars()
+            .filter_map(|(k, _)| {
+                if let Some(suffix) = k.strip_prefix("EMBED_MAX_WAITERS_") {
+                    if !known_keys.contains(suffix) {
+                        Some(k)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !unknown_waiters.is_empty() {
+            tracing::warn!(
+                vars = %unknown_waiters.join(", "),
+                known = ?known_keys,
+                "EMBED_MAX_WAITERS_<KEY> set for unknown model key(s); check for typos (key must be uppercase with dashes replaced by underscores)"
+            );
+        }
+    }
+
     // When EMBED_MULTI_PROCESS=1 the supervisor must NOT load ONNX sessions —
     // doing so duplicates ~2.4 GiB RSS that the workers already hold.
     // ModelEntry.model is therefore Option<Arc<EmbedModel>>: Some in legacy
