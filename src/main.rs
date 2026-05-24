@@ -259,8 +259,16 @@ async fn main() {
             .models
             .iter()
             .map(|m| crate::config::model_env_key(&m.name))
-            .chain(cfg.rerankers.iter().map(|r| crate::config::model_env_key(&r.name)))
-            .chain(cfg.splades.iter().map(|s| crate::config::model_env_key(&s.name)))
+            .chain(
+                cfg.rerankers
+                    .iter()
+                    .map(|r| crate::config::model_env_key(&r.name)),
+            )
+            .chain(
+                cfg.splades
+                    .iter()
+                    .map(|s| crate::config::model_env_key(&s.name)),
+            )
             .collect();
         let unknown_waiters: Vec<String> = std::env::vars()
             .filter_map(|(k, _)| {

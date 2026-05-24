@@ -23,11 +23,11 @@
 //! - Graceful shutdown via ControlMessage::Shutdown before kill_on_drop SIGKILL.
 
 use crate::ipc::client::WorkerClient;
-use tokio::io::{AsyncBufReadExt as _, BufReader};
 use crate::supervisor::util::resolve_duration_secs_env;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt as _, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::RwLock;
 
@@ -233,11 +233,10 @@ impl WorkerSupervisor {
                 let reader = BufReader::new(child_stdout);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    // Use eprint! so the supervisor itself doesn't double-buffer
-                    // behind a tokio io task; write! to stdout is fine too since
-                    // the supervisor is single-threaded on stdout.
-                    print!("{}{}
-", model_tag, line);
+                    // println! is fine here: each forwarded line is terminated by
+                    // the newline from the worker's tracing output. The supervisor
+                    // has a single stdout writer; no double-buffering concern.
+                    println!("{}{}", model_tag, line);
                 }
             });
         }
@@ -247,8 +246,7 @@ impl WorkerSupervisor {
                 let reader = BufReader::new(child_stderr);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    eprint!("{}{}
-", model_tag, line);
+                    eprintln!("{}{}", model_tag, line);
                 }
             });
         }

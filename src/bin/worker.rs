@@ -196,7 +196,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Resolve max_waiters once at startup -- cheaper than re-reading env
     // on every request, and captured by copy into the spawned async tasks.
-    let max_waiters = embed_server::worker_waiters::resolve_max_waiters_for_model(pool_size, &model_name);
+    let max_waiters =
+        embed_server::worker_waiters::resolve_max_waiters_for_model(pool_size, &model_name);
 
     tracing::info!(
         kind = %kind,
@@ -410,7 +411,7 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::{INTRA_THREADS, POOL_SIZE};
     use embed_server::worker_waiters::{
-        resolve_max_waiters_for_model, WAITERS_FLOOR, WAITERS_POOL_MULTIPLIER,
+        WAITERS_FLOOR, WAITERS_POOL_MULTIPLIER, resolve_max_waiters_for_model,
     };
     use serial_test::serial;
 

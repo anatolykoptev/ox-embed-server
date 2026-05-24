@@ -99,7 +99,7 @@ pub fn resolve_max_waiters_for_model(pool_size: usize, model_name: &str) -> usiz
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_max_waiters_for_model, WAITERS_FLOOR, WAITERS_POOL_MULTIPLIER};
+    use super::{WAITERS_FLOOR, WAITERS_POOL_MULTIPLIER, resolve_max_waiters_for_model};
     use serial_test::serial;
 
     // All tests mutate process-global env — serialised via #[serial].

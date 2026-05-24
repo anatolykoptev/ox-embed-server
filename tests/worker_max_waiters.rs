@@ -10,7 +10,7 @@
 //! to avoid UB (Rust 1.82+ `set_var` is unsafe for concurrent use).
 
 use embed_server::worker_waiters::{
-    resolve_max_waiters_for_model, WAITERS_FLOOR, WAITERS_POOL_MULTIPLIER,
+    WAITERS_FLOOR, WAITERS_POOL_MULTIPLIER, resolve_max_waiters_for_model,
 };
 use serial_test::serial;
 
@@ -135,7 +135,10 @@ fn key_transform_dashes_to_underscores() {
         }
     }
 
-    assert_eq!(result, 256, "jina-code-v2 key must resolve JINA_CODE_V2 var");
+    assert_eq!(
+        result, 256,
+        "jina-code-v2 key must resolve JINA_CODE_V2 var"
+    );
 }
 
 // ── embed_worker_queue_depth gauge ────────────────────────────────────────────
