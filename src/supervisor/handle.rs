@@ -27,6 +27,7 @@ use crate::supervisor::util::resolve_duration_secs_env;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt as _, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::RwLock;
 
@@ -203,8 +204,8 @@ impl WorkerSupervisor {
             .env("EMBED_WORKER_SOCKET", &socket_path)
             .env("EMBED_WORKER_POOL_SIZE", spec.pool_size.to_string())
             .env("EMBED_WORKER_INTRA_THREADS", spec.intra_threads.to_string())
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
         for (k, v) in &spec.env_extra {
             cmd.env(k, v);
@@ -213,6 +214,42 @@ impl WorkerSupervisor {
             tracing::error!(model = %spec.model, error = %e, "worker spawn failed");
             e
         })?;
+
+        // Spawn log-forwarding tasks: pipe worker stdout/stderr to supervisor
+        // stdout/stderr with a `[<model>]` prefix so `docker logs` shows
+        // per-model lines.
+        //
+        // Back-pressure note: worker uses a synchronous tracing writer. If the
+        // OS pipe buffer fills (64 KiB), the worker's sync write blocks, which
+        // can stall the tokio runtime. This is acceptable: the pipe empties
+        // as fast as the supervisor's stdout can drain (docker logs; no
+        // intermediate buffer). Under a log flood the worker rate-limits
+        // itself — a useful natural back-pressure rather than a hazard.
+        // The tasks are fire-and-forget (no join handle): they exit naturally
+        // when the child closes its end of the pipe on exit.
+        if let Some(child_stdout) = child.stdout.take() {
+            let model_tag = format!("[{}] ", spec.model);
+            tokio::spawn(async move {
+                let reader = BufReader::new(child_stdout);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    // println! is fine here: each forwarded line is terminated by
+                    // the newline from the worker's tracing output. The supervisor
+                    // has a single stdout writer; no double-buffering concern.
+                    println!("{}{}", model_tag, line);
+                }
+            });
+        }
+        if let Some(child_stderr) = child.stderr.take() {
+            let model_tag = format!("[{}] ", spec.model);
+            tokio::spawn(async move {
+                let reader = BufReader::new(child_stderr);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    eprintln!("{}{}", model_tag, line);
+                }
+            });
+        }
 
         // Poll up to socket_wait for socket, with early-exit if child dies first.
         let deadline = Instant::now() + socket_wait;

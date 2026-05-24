@@ -41,20 +41,9 @@ const INTRA_THREADS: usize = 2;
 /// the arena budget with headroom. Overridable via `EMBED_WORKER_POOL_SIZE`.
 const POOL_SIZE: usize = 1;
 
-/// Multiplier applied to pool_size when computing the default max-waiters cap.
-///
-/// 8× gives ample burst headroom while keeping the waiter queue bounded.
-/// The formula is `pool_size × WAITERS_POOL_MULTIPLIER`, floored at
-/// `WAITERS_FLOOR`.
-const WAITERS_POOL_MULTIPLIER: usize = 8;
-
-/// Minimum max-waiters cap regardless of pool_size.
-///
-/// Prevents `pool_size=1` (or very small) from producing a cap so low (8)
-/// that brief single-connection bursts trigger "worker queue overflow".
-/// 16 ensures at least one full round of requests per ONNX-inference batch
-/// can queue without rejection.
-const WAITERS_FLOOR: usize = 16;
+// Waiter-queue constants (WAITERS_POOL_MULTIPLIER, WAITERS_FLOOR) and the
+// per-model resolver live in `embed_server::worker_waiters` so integration
+// tests under `tests/` can reach them without spawning a real worker.
 
 // Counter for tasks waiting to acquire the per-worker semaphore.
 // When this exceeds max_waiters, new requests get an immediate
@@ -67,43 +56,8 @@ const WAITERS_FLOOR: usize = 16;
 // without bound under pathological bursts.
 static WAITERS: AtomicUsize = AtomicUsize::new(0);
 
-/// Resolve the max-waiters limit once at startup.
-///
-/// Reads `EMBED_MAX_WAITERS` env:
-/// - If unset: falls back to `pool_size × WAITERS_POOL_MULTIPLIER` (floor WAITERS_FLOOR).
-/// - If set but unparseable or zero: warns and falls back to the formula.
-///   A zero value would cause 100% rejection of all incoming requests, so it
-///   is treated as a misconfiguration rather than an intentional setting.
-fn resolve_max_waiters(pool_size: usize) -> usize {
-    let default = || {
-        pool_size
-            .saturating_mul(WAITERS_POOL_MULTIPLIER)
-            .max(WAITERS_FLOOR)
-    };
-    match std::env::var("EMBED_MAX_WAITERS") {
-        Err(_) => default(),
-        Ok(raw) => match raw.parse::<usize>() {
-            Ok(n) if n > 0 => n,
-            Ok(_) => {
-                // Parsed as zero — would silently reject every request.
-                tracing::warn!(
-                    EMBED_MAX_WAITERS = %raw,
-                    fallback = default(),
-                    "EMBED_MAX_WAITERS=0 would reject all requests; using formula fallback"
-                );
-                default()
-            }
-            Err(_) => {
-                tracing::warn!(
-                    EMBED_MAX_WAITERS = %raw,
-                    fallback = default(),
-                    "EMBED_MAX_WAITERS is not a valid usize; using formula fallback"
-                );
-                default()
-            }
-        },
-    }
-}
+// resolve_max_waiters_for_model is re-exported from embed_server::worker_waiters.
+// The worker binary calls it at startup (line ~245) passing pool_size + model_name.
 
 /// Install a Prometheus metrics recorder in the worker process and, if
 /// `EMBED_WORKER_METRICS_PORT` is set, spawn a lightweight HTTP server
@@ -242,7 +196,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Resolve max_waiters once at startup -- cheaper than re-reading env
     // on every request, and captured by copy into the spawned async tasks.
-    let max_waiters = resolve_max_waiters(pool_size);
+    let max_waiters =
+        embed_server::worker_waiters::resolve_max_waiters_for_model(pool_size, &model_name);
 
     tracing::info!(
         kind = %kind,
@@ -322,6 +277,7 @@ async fn main() -> anyhow::Result<()> {
         })?;
         let loaded = loaded.clone();
         let semaphore = semaphore.clone();
+        let model_name = model_name.clone();
         tokio::spawn(async move {
             loop {
                 let req: WorkerRequest = match read_frame(&mut stream).await {
@@ -347,8 +303,10 @@ async fn main() -> anyhow::Result<()> {
                 // queue overflow" so callers get an immediate error instead
                 // of accumulating silently.
                 let waiters_now = WAITERS.fetch_add(1, Ordering::Relaxed);
+                embed_server::metrics::set_worker_queue_depth(&model_name, waiters_now + 1);
                 if waiters_now >= max_waiters {
                     WAITERS.fetch_sub(1, Ordering::Relaxed);
+                    embed_server::metrics::set_worker_queue_depth(&model_name, waiters_now);
                     tracing::warn!(
                         waiters = waiters_now,
                         max_waiters,
@@ -365,14 +323,16 @@ async fn main() -> anyhow::Result<()> {
                 // Acquired permit drops at end of iteration — automatic release.
                 let _permit = match semaphore.clone().acquire_owned().await {
                     Ok(p) => {
-                        WAITERS.fetch_sub(1, Ordering::Relaxed);
+                        let depth = WAITERS.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
+                        embed_server::metrics::set_worker_queue_depth(&model_name, depth);
                         p
                     }
                     Err(_) => {
                         // Only fires if the semaphore was explicitly closed —
                         // we never call close(), so this is unreachable in
                         // current code. Future-proof: surface as a clear error.
-                        WAITERS.fetch_sub(1, Ordering::Relaxed);
+                        let depth = WAITERS.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
+                        embed_server::metrics::set_worker_queue_depth(&model_name, depth);
                         let resp = WorkerResponse::Err {
                             request_id: req.request_id(),
                             message: "worker semaphore closed".into(),
@@ -449,8 +409,9 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        INTRA_THREADS, POOL_SIZE, WAITERS_FLOOR, WAITERS_POOL_MULTIPLIER, resolve_max_waiters,
+    use super::{INTRA_THREADS, POOL_SIZE};
+    use embed_server::worker_waiters::{
+        WAITERS_FLOOR, WAITERS_POOL_MULTIPLIER, resolve_max_waiters_for_model,
     };
     use serial_test::serial;
 
@@ -478,13 +439,23 @@ mod tests {
     #[test]
     #[serial]
     fn resolve_max_waiters_default_formula() {
-        // Without EMBED_MAX_WAITERS set, formula = pool_size × WAITERS_POOL_MULTIPLIER, floor WAITERS_FLOOR.
+        // Without EMBED_MAX_WAITERS or per-model env set, formula applies.
         let prev = std::env::var("EMBED_MAX_WAITERS").ok();
-        unsafe { std::env::remove_var("EMBED_MAX_WAITERS") };
-        let val = resolve_max_waiters(4);
-        match prev {
-            Some(p) => unsafe { std::env::set_var("EMBED_MAX_WAITERS", p) },
-            None => unsafe { std::env::remove_var("EMBED_MAX_WAITERS") },
+        let prev_per = std::env::var("EMBED_MAX_WAITERS_TEST_MODEL").ok();
+        unsafe {
+            std::env::remove_var("EMBED_MAX_WAITERS");
+            std::env::remove_var("EMBED_MAX_WAITERS_TEST_MODEL");
+        }
+        let val = resolve_max_waiters_for_model(4, "test-model");
+        unsafe {
+            match prev {
+                Some(p) => std::env::set_var("EMBED_MAX_WAITERS", p),
+                None => std::env::remove_var("EMBED_MAX_WAITERS"),
+            }
+            match prev_per {
+                Some(p) => std::env::set_var("EMBED_MAX_WAITERS_TEST_MODEL", p),
+                None => std::env::remove_var("EMBED_MAX_WAITERS_TEST_MODEL"),
+            }
         }
         assert_eq!(val, 4 * WAITERS_POOL_MULTIPLIER, "4 × multiplier");
     }
@@ -492,13 +463,23 @@ mod tests {
     #[test]
     #[serial]
     fn resolve_max_waiters_floor() {
-        // pool_size=1 -> 1×8=8 < 16 -> floor kicks in.
+        // pool_size=1 → 1×8=8 < 16 → floor kicks in. Per-model unset.
         let prev = std::env::var("EMBED_MAX_WAITERS").ok();
-        unsafe { std::env::remove_var("EMBED_MAX_WAITERS") };
-        let val = resolve_max_waiters(1);
-        match prev {
-            Some(p) => unsafe { std::env::set_var("EMBED_MAX_WAITERS", p) },
-            None => unsafe { std::env::remove_var("EMBED_MAX_WAITERS") },
+        let prev_per = std::env::var("EMBED_MAX_WAITERS_TEST_MODEL").ok();
+        unsafe {
+            std::env::remove_var("EMBED_MAX_WAITERS");
+            std::env::remove_var("EMBED_MAX_WAITERS_TEST_MODEL");
+        }
+        let val = resolve_max_waiters_for_model(1, "test-model");
+        unsafe {
+            match prev {
+                Some(p) => std::env::set_var("EMBED_MAX_WAITERS", p),
+                None => std::env::remove_var("EMBED_MAX_WAITERS"),
+            }
+            match prev_per {
+                Some(p) => std::env::set_var("EMBED_MAX_WAITERS_TEST_MODEL", p),
+                None => std::env::remove_var("EMBED_MAX_WAITERS_TEST_MODEL"),
+            }
         }
         assert_eq!(val, WAITERS_FLOOR, "floor = WAITERS_FLOOR");
     }
@@ -506,13 +487,23 @@ mod tests {
     #[test]
     #[serial]
     fn resolve_max_waiters_env_override() {
-        // EMBED_MAX_WAITERS=64 overrides formula regardless of pool_size.
+        // EMBED_MAX_WAITERS=64 overrides formula when per-model unset.
         let prev = std::env::var("EMBED_MAX_WAITERS").ok();
-        unsafe { std::env::set_var("EMBED_MAX_WAITERS", "64") };
-        let val = resolve_max_waiters(2);
-        match prev {
-            Some(p) => unsafe { std::env::set_var("EMBED_MAX_WAITERS", p) },
-            None => unsafe { std::env::remove_var("EMBED_MAX_WAITERS") },
+        let prev_per = std::env::var("EMBED_MAX_WAITERS_TEST_MODEL").ok();
+        unsafe {
+            std::env::set_var("EMBED_MAX_WAITERS", "64");
+            std::env::remove_var("EMBED_MAX_WAITERS_TEST_MODEL");
+        }
+        let val = resolve_max_waiters_for_model(2, "test-model");
+        unsafe {
+            match prev {
+                Some(p) => std::env::set_var("EMBED_MAX_WAITERS", p),
+                None => std::env::remove_var("EMBED_MAX_WAITERS"),
+            }
+            match prev_per {
+                Some(p) => std::env::set_var("EMBED_MAX_WAITERS_TEST_MODEL", p),
+                None => std::env::remove_var("EMBED_MAX_WAITERS_TEST_MODEL"),
+            }
         }
         assert_eq!(val, 64);
     }
@@ -520,13 +511,23 @@ mod tests {
     #[test]
     #[serial]
     fn resolve_max_waiters_env_invalid_falls_back() {
-        // Non-numeric EMBED_MAX_WAITERS warns and falls back to formula.
+        // Non-numeric EMBED_MAX_WAITERS warns and falls back to formula (per-model unset).
         let prev = std::env::var("EMBED_MAX_WAITERS").ok();
-        unsafe { std::env::set_var("EMBED_MAX_WAITERS", "not-a-number") };
-        let val = resolve_max_waiters(3);
-        match prev {
-            Some(p) => unsafe { std::env::set_var("EMBED_MAX_WAITERS", p) },
-            None => unsafe { std::env::remove_var("EMBED_MAX_WAITERS") },
+        let prev_per = std::env::var("EMBED_MAX_WAITERS_TEST_MODEL").ok();
+        unsafe {
+            std::env::set_var("EMBED_MAX_WAITERS", "not-a-number");
+            std::env::remove_var("EMBED_MAX_WAITERS_TEST_MODEL");
+        }
+        let val = resolve_max_waiters_for_model(3, "test-model");
+        unsafe {
+            match prev {
+                Some(p) => std::env::set_var("EMBED_MAX_WAITERS", p),
+                None => std::env::remove_var("EMBED_MAX_WAITERS"),
+            }
+            match prev_per {
+                Some(p) => std::env::set_var("EMBED_MAX_WAITERS_TEST_MODEL", p),
+                None => std::env::remove_var("EMBED_MAX_WAITERS_TEST_MODEL"),
+            }
         }
         assert_eq!(val, 3 * WAITERS_POOL_MULTIPLIER, "3 × multiplier");
     }
@@ -534,13 +535,23 @@ mod tests {
     #[test]
     #[serial]
     fn resolve_max_waiters_zero_falls_back() {
-        // EMBED_MAX_WAITERS=0 would reject every request; must fall back to formula.
+        // EMBED_MAX_WAITERS=0 → fall back to formula (per-model also unset).
         let prev = std::env::var("EMBED_MAX_WAITERS").ok();
-        unsafe { std::env::set_var("EMBED_MAX_WAITERS", "0") };
-        let val = resolve_max_waiters(2);
-        match prev {
-            Some(p) => unsafe { std::env::set_var("EMBED_MAX_WAITERS", p) },
-            None => unsafe { std::env::remove_var("EMBED_MAX_WAITERS") },
+        let prev_per = std::env::var("EMBED_MAX_WAITERS_TEST_MODEL").ok();
+        unsafe {
+            std::env::set_var("EMBED_MAX_WAITERS", "0");
+            std::env::remove_var("EMBED_MAX_WAITERS_TEST_MODEL");
+        }
+        let val = resolve_max_waiters_for_model(2, "test-model");
+        unsafe {
+            match prev {
+                Some(p) => std::env::set_var("EMBED_MAX_WAITERS", p),
+                None => std::env::remove_var("EMBED_MAX_WAITERS"),
+            }
+            match prev_per {
+                Some(p) => std::env::set_var("EMBED_MAX_WAITERS_TEST_MODEL", p),
+                None => std::env::remove_var("EMBED_MAX_WAITERS_TEST_MODEL"),
+            }
         }
         // 2 × 8 = 16, which also hits the floor(16), so either way WAITERS_FLOOR.
         assert_eq!(

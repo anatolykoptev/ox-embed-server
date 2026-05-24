@@ -938,6 +938,26 @@ pub fn worker_restart_touch(model: &str) {
     )
     .absolute(0);
 }
+/// Set the `embed_worker_queue_depth` gauge for a worker process.
+///
+/// Called from `src/bin/worker.rs` after each `WAITERS.fetch_add` /
+/// `WAITERS.fetch_sub` mutation to keep the gauge in sync with the in-flight
+/// waiter count.
+///
+/// Gauge semantics: this is per-worker-process. Each worker exposes its own
+/// `/metrics` HTTP server (port assigned by `EMBED_WORKER_METRICS_PORT`);
+/// the supervisor's `/metrics` endpoint does NOT include this series.
+///
+/// Race note: the gauge is updated with a relaxed atomic load — it is an
+/// observation, not a control signal. A brief lag of one request cycle is
+/// acceptable for a gauge vs. introducing unnecessary acquire/release fences.
+pub fn set_worker_queue_depth(model: &str, depth: usize) {
+    metrics::gauge!(
+        "embed_worker_queue_depth",
+        "model" => model.to_string()
+    )
+    .set(depth as f64);
+}
 
 /// Set the per-worker RSS gauge.
 ///

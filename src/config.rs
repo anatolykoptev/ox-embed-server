@@ -813,7 +813,7 @@ fn parse_embed_pool_size(raw: Option<&str>, source_key: Option<&str>) -> usize {
 ///
 /// Rule: uppercase + replace `-` with `_`. This is the same transform used
 /// by `ONNX_OPT_CACHE_DIR_<KEY>` and `EMBED_MEMORY_PATTERN_<KEY>`.
-pub(crate) fn model_env_key(model_key: &str) -> String {
+pub fn model_env_key(model_key: &str) -> String {
     model_key.to_uppercase().replace('-', "_")
 }
 
