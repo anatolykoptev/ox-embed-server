@@ -69,16 +69,33 @@ Integration tests with real models require: `EMBED_MODELS=...` + `RERANKER_MODEL
 
 ## Deploy
 
-Auto-deploy: push to `main` → dozor webhook (`~/.dozor/deploy-repos.yaml`, repo `anatolykoptev/ox-embed-server`) → rebuild image → `docker compose up -d --no-deps --force-recreate embed-server`. Smoke timeout 120 s (workers warm up in ~3.4 s parallel).
+**Where it runs**: pillow VPS (`132.145.192.254`) as Docker container `embed-server`.
+Migrated 2026-05-23 — krolik dozor entry commented out (`~/.dozor/deploy-repos.yaml` lines 239-245).
+Public endpoint: `https://embed.krolik.tools` (Caddy on pillow host, `NOT` containerized).
+Caddy terminates TLS + bearer-auth gate + proxies upstream to `embed-server:8082`. Config: `/etc/caddy/Caddyfile` on pillow.
 
-Manual:
+**No auto-deploy.** Build + deploy are manual on pillow:
+
 ```bash
-cd ~/deploy/krolik-server
-docker compose build --no-cache embed-server   # ~3 min cold deps, ~40 s warm
+ssh pillow
+cd ~/embed-server                                       # compose.yml lives here (verified)
+docker compose build --no-cache embed-server            # ~3 min cold deps, ~40 s warm
 docker compose up -d --no-deps --force-recreate embed-server
 ```
 
-Releases: release-please on push to `main`. Conventional commits → auto PR + tag. Do not tag manually.
+Smoke: `curl -sf https://embed.krolik.tools/health` → `ok`. Workers warm up in ~3.4 s parallel.
+
+**Restart without rebuild** (TEMP mitigation only — see jina backpressure incident):
+```bash
+ssh pillow 'docker restart embed-server'
+```
+
+**Releases**: release-please on push to `main`. Conventional commits → auto PR + tag. Do not tag manually.
+
+**Cross-references**:
+- `plans/embed-server/2026-05-23-full-move-to-pillow.md` — migration plan
+- `plans/embed-server/2026-05-27-jina-backpressure-followup.md` — current incident dossier (restart band-aid pattern)
+- `~/.dozor/deploy-repos.yaml` on krolik — deactivated entry (lines 239-245)
 
 ## Gotchas
 
