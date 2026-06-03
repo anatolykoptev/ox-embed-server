@@ -7,11 +7,23 @@ use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 const MIB: f64 = 1024.0 * 1024.0;
 const GIB: f64 = 1024.0 * MIB;
 
-/// Install the Prometheus recorder and return its rendering handle.
+/// Apply every embed-server histogram bucket configuration to a
+/// `PrometheusBuilder`.
 ///
-/// Sets sensible histogram buckets for latency (_duration_seconds) and batch
-/// size metrics. Stamps `embed_build_info{version}` to 1.
-pub fn init(version: &str) -> PrometheusHandle {
+/// This is the SINGLE authority for bucket boundaries. Both the supervisor
+/// recorder (`init`) and the per-worker recorder
+/// (`bin/worker.rs::install_worker_metrics`) call it, so a histogram emitted
+/// from a worker process lands in the same buckets as the same series emitted
+/// from the supervisor. Before this was extracted, the worker installed a
+/// bare `PrometheusBuilder::new()` with NO bucket config — every worker-side
+/// histogram (e.g. `embed_worker_queue_wait_duration_seconds`,
+/// `embed_inference_duration_seconds`) fell back to library defaults, so the
+/// same metric had different buckets depending on which process emitted it.
+///
+/// The `_duration_seconds` matcher is a Suffix match, so any new latency
+/// histogram ending in `_duration_seconds` (supervisor or worker) inherits the
+/// 5 ms → 30 s ladder automatically.
+pub fn apply_histogram_buckets(builder: PrometheusBuilder) -> PrometheusBuilder {
     let duration_matcher =
         metrics_exporter_prometheus::Matcher::Suffix("_duration_seconds".to_string());
     let batch_matcher = metrics_exporter_prometheus::Matcher::Suffix("batch_size".to_string());
@@ -70,7 +82,7 @@ pub fn init(version: &str) -> PrometheusHandle {
     let rerank_input_docs_size_matcher =
         metrics_exporter_prometheus::Matcher::Full("embed_rerank_input_docs_size".to_string());
 
-    let handle = PrometheusBuilder::new()
+    builder
         .set_buckets_for_metric(
             duration_matcher,
             &[
@@ -160,6 +172,15 @@ pub fn init(version: &str) -> PrometheusHandle {
             &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0],
         )
         .expect("set rerank input docs size buckets")
+}
+
+/// Install the supervisor Prometheus recorder and return its rendering handle.
+///
+/// Delegates bucket configuration to [`apply_histogram_buckets`] (the single
+/// authority) so the supervisor and worker recorders never drift. Stamps
+/// `embed_build_info{version}` to 1.
+pub fn init(version: &str) -> PrometheusHandle {
+    let handle = apply_histogram_buckets(PrometheusBuilder::new())
         .install_recorder()
         .expect("install Prometheus recorder");
 
@@ -199,6 +220,37 @@ pub fn record_inference(model: &str, duration: Duration, batch_size: usize) {
         "model" => model.to_string()
     )
     .record(batch_size as f64);
+}
+
+/// Record the time a worker request spent waiting for the per-worker
+/// inference permit (UDS frame read → semaphore acquired), i.e. the
+/// head-of-line queue wait BEFORE the ONNX forward pass starts.
+///
+/// Why this exists (jina-code-v2 backpressure incident, 2026-05-27/06-02):
+/// the supervisor's `embed_inference_duration_seconds` on `:8082` measures the
+/// full `dispatch_embed` round-trip — UDS connect + worker queue wait + ONNX
+/// inference. When `jina-code-v2` (pool_size=1, ~13 s/inference on
+/// Neoverse-N1) is backlogged by the fleet auto-index, that single histogram
+/// shows a multi-second p95 that is INDISTINGUISHABLE between "the model is
+/// slow" and "the queue is deep". This worker-side split lets operators
+/// subtract: supervisor round-trip − worker `embed_inference_duration_seconds`
+/// = `embed_worker_queue_wait_duration_seconds`. A rising queue-wait with flat
+/// inference time means the producer is outrunning the drain rate — the
+/// signal that previously required a manual `docker restart` to surface.
+///
+/// Emitted from the worker recorder, so it appears on the per-worker
+/// `EMBED_WORKER_METRICS_PORT` scrape, not on supervisor `:8082`. The metric
+/// name ends in `_duration_seconds` ON PURPOSE so it matches the Suffix
+/// matcher in [`apply_histogram_buckets`] and is rendered as a HISTOGRAM with
+/// the 5 ms → 30 s latency ladder — a name ending in only `_seconds` would
+/// miss the suffix and fall back to a summary (no buckets), which the
+/// regression test in `tests/worker_inference_observability.rs` guards against.
+pub fn record_worker_queue_wait(model: &str, duration: Duration) {
+    metrics::histogram!(
+        "embed_worker_queue_wait_duration_seconds",
+        "model" => model.to_string()
+    )
+    .record(duration.as_secs_f64());
 }
 
 /// Increment rejected-due-to-backpressure counter. Called from the

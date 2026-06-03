@@ -72,7 +72,12 @@ static WAITERS: AtomicUsize = AtomicUsize::new(0);
 /// batcher counters accumulate) but no HTTP port is opened — back-compat
 /// for existing deploys.
 fn install_worker_metrics(model_name: &str) -> PrometheusHandle {
-    let handle = PrometheusBuilder::new()
+    // Use the SHARED bucket config (single authority in `metrics.rs`) so
+    // worker-side histograms — `embed_inference_duration_seconds`,
+    // `embed_worker_queue_wait_duration_seconds` — land in the same buckets as the
+    // supervisor's. A bare `PrometheusBuilder::new()` here would silently fall
+    // back to library-default buckets, making cross-process comparison wrong.
+    let handle = embed_server::metrics::apply_histogram_buckets(PrometheusBuilder::new())
         .install_recorder()
         .expect("install Prometheus recorder in worker");
 
@@ -285,6 +290,14 @@ async fn main() -> anyhow::Result<()> {
                     Err(_) => break,
                 };
 
+                // Wall-clock start of the queue-wait window: from a fully-read
+                // request frame until the inference permit is acquired. Recorded
+                // as `embed_worker_queue_wait_duration_seconds` so operators can separate
+                // "queue is deep" (rising wait) from "model is slow" (rising
+                // `embed_inference_duration_seconds`). See the jina-code-v2
+                // backpressure incident dossier.
+                let queue_wait_start = std::time::Instant::now();
+
                 // Bounded-queue admission: await permit instead of instant
                 // reject. With per-request UDS conn (PR #62), burst load
                 // would mass-trigger try_acquire failures + 500-spam to
@@ -325,6 +338,13 @@ async fn main() -> anyhow::Result<()> {
                     Ok(p) => {
                         let depth = WAITERS.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
                         embed_server::metrics::set_worker_queue_depth(&model_name, depth);
+                        // Permit acquired — close the queue-wait window. Under
+                        // pool_size=1 this equals the time the previous
+                        // inference held the single slot (head-of-line wait).
+                        embed_server::metrics::record_worker_queue_wait(
+                            &model_name,
+                            queue_wait_start.elapsed(),
+                        );
                         p
                     }
                     Err(_) => {
@@ -346,6 +366,19 @@ async fn main() -> anyhow::Result<()> {
                 // blocking pool so the async runtime thread is not stalled.
                 let req_id = req.request_id();
                 let loaded_ref = loaded.clone();
+                // Batch size for `embed_inference_duration_seconds` — captured
+                // before `req` is moved into the closure. Splade carries texts;
+                // rerank carries documents (one inference pair per document).
+                let infer_batch_size = match &req {
+                    WorkerRequest::Embed(r) => r.texts.len(),
+                    WorkerRequest::Rerank(r) => r.documents.len(),
+                    WorkerRequest::Splade(r) => r.texts.len(),
+                };
+                // Pure-inference window: just the spawn_blocking ONNX forward
+                // pass, EXCLUDING the queue wait recorded above. This is the
+                // worker-side `embed_inference_duration_seconds` that the
+                // supervisor's conflated round-trip metric could not isolate.
+                let infer_start = std::time::Instant::now();
                 let resp = tokio::task::spawn_blocking(move || match (&*loaded_ref, req) {
                     (LoadedModel::Embed(m), WorkerRequest::Embed(r)) => {
                         match m.infer(r.texts, r.max_seq_len) {
@@ -398,6 +431,20 @@ async fn main() -> anyhow::Result<()> {
                     request_id: req_id,
                     message: format!("spawn_blocking join error: {e}"),
                 });
+
+                // Record the pure ONNX forward-pass time for completed
+                // inferences only. An `Err` variant covers worker queue
+                // overflow / model error / join failure — those are tracked by
+                // the supervisor's `embed_inference_failure` counter and would
+                // pollute the latency histogram with near-zero or partial
+                // durations, so they are excluded here.
+                if !matches!(resp, WorkerResponse::Err { .. }) {
+                    embed_server::metrics::record_inference(
+                        &model_name,
+                        infer_start.elapsed(),
+                        infer_batch_size,
+                    );
+                }
 
                 if write_frame(&mut stream, &resp).await.is_err() {
                     break;
