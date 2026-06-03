@@ -116,7 +116,7 @@ impl RerankerModel {
             "creating reranker ONNX session(s)"
         );
 
-        let key = crate::config::model_env_key(&name);
+        let key = crate::config::model_env_key(name);
         let memory_pattern = crate::config::parse_memory_pattern(
             std::env::var(format!("EMBED_MEMORY_PATTERN_{key}"))
                 .ok()

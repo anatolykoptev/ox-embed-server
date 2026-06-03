@@ -55,6 +55,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 ///   - e5-large INT8: ~3–5 s on ARM
 ///   - jina-code-v2: ~8–12 s (large BERT variant)
 ///   - SPLADE: ~2–4 s
+///
 /// 60 s provides 4–5× headroom on the slowest model. Overridable via
 /// `EMBED_WORKER_SOCKET_WAIT_SECS`. Captured at startup; restart the
 /// container to change.

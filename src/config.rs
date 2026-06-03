@@ -828,6 +828,11 @@ pub fn model_env_key(model_key: &str) -> String {
 ///
 /// Same rejection contract as `parse_embed_pool_size`: 0 warns + falls back,
 /// garbage falls back silently.
+// `config` is compiled into both the lib (`pub mod config`) and the binary
+// (`mod config` in main.rs). The only non-test caller lives in the binary
+// (main.rs:~673), so the lib-target dead-code pass sees no caller; suppress
+// rather than delete — deleting breaks the worker-spawn pool-size resolution.
+#[allow(dead_code)]
 pub(crate) fn resolve_embed_pool_size_for_model(
     model_key: &str,
     global_raw: Option<&str>,

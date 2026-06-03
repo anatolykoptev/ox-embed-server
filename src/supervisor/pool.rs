@@ -20,6 +20,7 @@ use tokio::sync::RwLock;
 /// 30 s is chosen as the worst-case bound for a model reload:
 ///   - ONNX graph load: ~5–15 s on ARM for the largest models (jina-code-v2).
 ///   - Socket wait poll: up to SOCKET_WAIT_POLL_INTERVAL × 300 iterations.
+///
 /// Callers (memdb-go) retry on error, so a bounded 30 s timeout surfaces a
 /// clear error rather than queuing silently forever.
 /// Overridable via `EMBED_DISPATCH_TIMEOUT_SECS`. Captured at startup;
