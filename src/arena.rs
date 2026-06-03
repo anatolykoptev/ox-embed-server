@@ -148,6 +148,11 @@ pub struct ArenaCfg {
 ///
 /// Global-only variant — checks no per-model env. Calls
 /// `init_arena_config_for_model("")` internally.
+// `allow(dead_code)`: production reads per-model config via
+// `init_arena_config_for_model()`; this global-only convenience wrapper has
+// only `#[cfg(test)]` callers. `arena` is also compiled into main.rs's private
+// `mod arena`, whose non-test build therefore sees no caller.
+#[allow(dead_code)]
 pub fn init_arena_config() -> ArenaCfg {
     init_arena_config_for_model("")
 }

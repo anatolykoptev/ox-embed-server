@@ -9,10 +9,13 @@
 //! model is slow" from "the queue is deep" — the operator had to `docker
 //! restart` to find out.
 //!
-//! The fix records, on the WORKER recorder:
-//!   - `embed_worker_queue_wait_duration_seconds{model}` — head-of-line queue wait
-//!     (frame read → inference permit acquired)
-//!   - `embed_inference_duration_seconds{model}` — pure ONNX forward pass
+//! The fix records, on the WORKER recorder, under names DISTINCT from the
+//! supervisor's so Prometheus `sum by (model, le)` (both scrape jobs carry
+//! `service="embed-server"`) never merges the two distributions:
+//!   - `embed_worker_queue_wait_duration_seconds{model}` — head-of-line queue
+//!     wait (frame read → inference permit acquired)
+//!   - `embed_worker_inference_duration_seconds{model}` — pure ONNX forward
+//!     pass (permit acquired → response ready)
 //!
 //! and routes the worker recorder through `metrics::apply_histogram_buckets`
 //! (the single bucket authority) so worker-side latency histograms land in the
@@ -24,7 +27,9 @@
 //! `install_recorder` wins, so we install once in a shared helper and let both
 //! assertions share the handle.
 
-use embed_server::metrics::{apply_histogram_buckets, record_inference, record_worker_queue_wait};
+use embed_server::metrics::{
+    apply_histogram_buckets, record_worker_inference, record_worker_queue_wait,
+};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -45,50 +50,84 @@ fn worker_queue_wait_and_inference_render_with_shared_buckets() {
     let h = handle();
 
     // Exercise the queue-wait histogram and the pure-inference histogram the
-    // way the worker does — both labelled by model.
+    // way the worker does — both labelled by model, both via the worker-side
+    // recording helpers.
     record_worker_queue_wait("jina-code-v2", Duration::from_millis(1500));
-    record_inference("jina-code-v2", Duration::from_millis(13_000), 1);
+    record_worker_inference("jina-code-v2", Duration::from_millis(13_000), 1);
 
     let rendered = h.render();
 
-    // 1. Both series exist, model-labelled.
+    // 1. Both worker series exist, model-labelled.
     assert!(
         rendered.contains("embed_worker_queue_wait_duration_seconds"),
         "queue-wait histogram must be exported so operators can separate \
          queue depth from model speed:\n{rendered}"
     );
     assert!(
-        rendered.contains("embed_inference_duration_seconds"),
+        rendered.contains("embed_worker_inference_duration_seconds"),
         "pure-inference histogram must be exported from the worker recorder:\n{rendered}"
     );
     assert!(
-        rendered.contains(r#"embed_worker_queue_wait_duration_seconds_bucket{model="jina-code-v2""#),
+        rendered
+            .contains(r#"embed_worker_queue_wait_duration_seconds_bucket{model="jina-code-v2""#),
         "queue-wait series must carry the model label:\n{rendered}"
     );
+    assert!(
+        rendered.contains(r#"embed_worker_inference_duration_seconds_bucket{model="jina-code-v2""#),
+        "inference series must carry the model label:\n{rendered}"
+    );
 
-    // 2. The shared bucket authority applied to BOTH histograms — the
+    // 2. METRIC-NAME COLLISION GUARD (MAJOR-1). The worker recorder must NEVER
+    //    emit the supervisor's `embed_inference_duration_seconds`. Prometheus
+    //    scrapes BOTH the supervisor (:8082) and every worker port, both
+    //    labelled `service="embed-server"`; the per-model alerts (e.g.
+    //    EmbedHighLatencyJina) do `sum by (model, le)`, which drops job/instance.
+    //    If the worker re-emitted that name, the supervisor round-trip and the
+    //    worker pure-inference distributions would merge into one nonsense
+    //    quantile. Match on the full token `embed_inference_duration_seconds_bucket{`
+    //    (with the trailing `_bucket{`): the worker's
+    //    `embed_worker_inference_duration_seconds_bucket{` has `_worker_` spliced
+    //    in, so it does NOT contain that token — no false match on the new name.
+    assert!(
+        !rendered.contains("embed_inference_duration_seconds_bucket{"),
+        "worker recorder must NOT emit the supervisor's \
+         `embed_inference_duration_seconds` — it collides under \
+         `sum by (model, le)` and breaks the per-model latency alerts:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("\nembed_batch_size_bucket{"),
+        "worker recorder must NOT emit the supervisor's `embed_batch_size` — \
+         the worker uses the distinct `embed_worker_batch_size`:\n{rendered}"
+    );
+
+    // 3. The shared bucket authority applied to BOTH histograms — the
     //    `_duration_seconds` Suffix matcher gives every latency histogram the
     //    30 s top bucket. A bare `PrometheusBuilder::new()` (the pre-fix worker
     //    recorder) would NOT produce a `le="30"` bucket. This guards the
     //    bucket-drift regression: if a future edit reverts the worker to a bare
     //    builder, this assertion fails.
     assert!(
-        rendered.contains(r#"embed_worker_queue_wait_duration_seconds_bucket{model="jina-code-v2",le="30""#),
+        rendered.contains(
+            r#"embed_worker_queue_wait_duration_seconds_bucket{model="jina-code-v2",le="30""#
+        ),
         "queue-wait histogram must inherit the shared 30 s top bucket \
          (proves apply_histogram_buckets ran on the worker recorder):\n{rendered}"
     );
     assert!(
-        rendered
-            .contains(r#"embed_inference_duration_seconds_bucket{model="jina-code-v2",le="30""#),
+        rendered.contains(
+            r#"embed_worker_inference_duration_seconds_bucket{model="jina-code-v2",le="30""#
+        ),
         "inference histogram must inherit the shared 30 s top bucket:\n{rendered}"
     );
 
-    // 3. The 1.5 s queue wait lands at/above the 2.5 s cumulative bucket but
+    // 4. The 1.5 s queue wait lands at/above the 2.5 s cumulative bucket but
     //    NOT in the 1 s bucket — confirms the value (not just the series name)
     //    is recorded. Cumulative histogram semantics: le="2.5" count == 1,
     //    le="1" count == 0.
     assert!(
-        rendered.contains(r#"embed_worker_queue_wait_duration_seconds_bucket{model="jina-code-v2",le="2.5"} 1"#),
+        rendered.contains(
+            r#"embed_worker_queue_wait_duration_seconds_bucket{model="jina-code-v2",le="2.5"} 1"#
+        ),
         "1.5 s wait must fall in the le=2.5 cumulative bucket:\n{rendered}"
     );
 }

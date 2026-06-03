@@ -209,6 +209,15 @@ pub fn record_request(model: &str, status: &str, duration: Duration, texts: usiz
 }
 
 /// Record one ONNX inference call.
+///
+/// Emitted from the SUPERVISOR recorder (`:8082`). Here `duration` is the
+/// `dispatch_embed` round-trip the supervisor measured — UDS connect + worker
+/// queue wait + ONNX forward pass — NOT the pure forward pass. The worker
+/// records its own pure-inference split via [`record_worker_inference`] under a
+/// distinct name; do NOT emit `embed_inference_duration_seconds` from the
+/// worker recorder or the two distributions merge under Prometheus
+/// `sum by (model, le)` (both scrape jobs carry `service="embed-server"`) and
+/// the per-model latency alerts read a meaningless quantile.
 pub fn record_inference(model: &str, duration: Duration, batch_size: usize) {
     metrics::histogram!(
         "embed_inference_duration_seconds",
@@ -217,6 +226,44 @@ pub fn record_inference(model: &str, duration: Duration, batch_size: usize) {
     .record(duration.as_secs_f64());
     metrics::histogram!(
         "embed_batch_size",
+        "model" => model.to_string()
+    )
+    .record(batch_size as f64);
+}
+
+/// Record the pure ONNX forward-pass time on the WORKER recorder.
+///
+/// Distinct name from the supervisor's [`record_inference`]
+/// (`embed_inference_duration_seconds`) ON PURPOSE — both processes are scraped
+/// with `service="embed-server"`, so emitting the same series name from both
+/// would make Prometheus `sum by (model, le)` merge the supervisor round-trip
+/// histogram (UDS + queue + ONNX) with the worker pure-inference histogram into
+/// one quantile (two observations per request, different distributions),
+/// silently breaking the per-model latency alerts (e.g. `EmbedHighLatencyJina`).
+///
+/// With the supervisor round-trip and this worker pure-inference series both
+/// available, queue wait is recoverable two ways: subtract
+/// (`embed_inference_duration_seconds` round-trip − `embed_worker_inference_duration_seconds`
+/// pure) or read [`record_worker_queue_wait`]'s
+/// `embed_worker_queue_wait_duration_seconds` directly. Scoped to the embed
+/// path only (no rerank/splade) so it never lands without a supervisor
+/// counterpart to subtract against — those paths keep their existing
+/// `embed_rerank_*` namespace.
+//
+// `allow(dead_code)`: `metrics` is compiled twice (lib `pub mod metrics` +
+// `mod metrics` in main.rs). The only caller is `src/bin/worker.rs` via the
+// lib path (`embed_server::metrics::`), so main.rs's private copy sees no
+// caller and the lib's public copy is exempt. Same masking applied to the
+// sibling worker-only recorders below.
+#[allow(dead_code)]
+pub fn record_worker_inference(model: &str, duration: Duration, batch_size: usize) {
+    metrics::histogram!(
+        "embed_worker_inference_duration_seconds",
+        "model" => model.to_string()
+    )
+    .record(duration.as_secs_f64());
+    metrics::histogram!(
+        "embed_worker_batch_size",
         "model" => model.to_string()
     )
     .record(batch_size as f64);
@@ -233,7 +280,8 @@ pub fn record_inference(model: &str, duration: Duration, batch_size: usize) {
 /// Neoverse-N1) is backlogged by the fleet auto-index, that single histogram
 /// shows a multi-second p95 that is INDISTINGUISHABLE between "the model is
 /// slow" and "the queue is deep". This worker-side split lets operators
-/// subtract: supervisor round-trip − worker `embed_inference_duration_seconds`
+/// subtract: supervisor round-trip `embed_inference_duration_seconds` − worker
+/// `embed_worker_inference_duration_seconds`
 /// = `embed_worker_queue_wait_duration_seconds`. A rising queue-wait with flat
 /// inference time means the producer is outrunning the drain rate — the
 /// signal that previously required a manual `docker restart` to surface.
@@ -245,6 +293,8 @@ pub fn record_inference(model: &str, duration: Duration, batch_size: usize) {
 /// the 5 ms → 30 s latency ladder — a name ending in only `_seconds` would
 /// miss the suffix and fall back to a summary (no buckets), which the
 /// regression test in `tests/worker_inference_observability.rs` guards against.
+// `allow(dead_code)`: worker-only recorder, see [`record_worker_inference`].
+#[allow(dead_code)]
 pub fn record_worker_queue_wait(model: &str, duration: Duration) {
     metrics::histogram!(
         "embed_worker_queue_wait_duration_seconds",
@@ -1003,6 +1053,8 @@ pub fn worker_restart_touch(model: &str) {
 /// Race note: the gauge is updated with a relaxed atomic load — it is an
 /// observation, not a control signal. A brief lag of one request cycle is
 /// acceptable for a gauge vs. introducing unnecessary acquire/release fences.
+// `allow(dead_code)`: worker-only recorder, see [`record_worker_inference`].
+#[allow(dead_code)]
 pub fn set_worker_queue_depth(model: &str, depth: usize) {
     metrics::gauge!(
         "embed_worker_queue_depth",

@@ -120,11 +120,20 @@ Host-level: swap usage dropped from 15 GiB pegged (pre-refactor jina arena thras
 |--------|------|-------|
 | `embed_worker_restart_total{model}` | counter | Pre-touched to 0 at supervisor launch. Increments on watchdog respawn. |
 | `embed_requests_total{model,status}` | counter | Shared with legacy path. |
-| `embed_inference_duration_seconds{model}` | histogram | Pre-existing. Includes IPC round-trip when routed via worker. |
+| `embed_inference_duration_seconds{model}` | histogram | **Supervisor (`:8082`).** Full `dispatch_embed` round-trip — UDS connect + worker queue wait + ONNX. Pre-existing; do NOT emit this name from the worker recorder (collides under Prometheus `sum by (model, le)`, breaks the per-model latency alerts). |
+| `embed_worker_inference_duration_seconds{model}` | histogram | **Worker recorder.** Pure ONNX forward pass only (permit acquired → response). Embed path only. Subtract from the supervisor round-trip, or compare to the queue-wait series, to isolate model speed from queue depth. |
+| `embed_worker_queue_wait_duration_seconds{model}` | histogram | **Worker recorder.** Head-of-line queue wait (UDS frame read → inference permit acquired). For jina-code-v2 (pool=1) this is the term that grows under a fleet auto-index burst and trips the go-code client header-timeout. |
+| `embed_worker_batch_size{model}` | histogram | **Worker recorder.** Embed-path batch size paired with `embed_worker_inference_duration_seconds`. |
+| `embed_worker_queue_depth{model}` | gauge | **Worker recorder.** In-flight waiter count per worker process. |
 | `embed_build_info{version}` | gauge | Set to `EMBED_VERSION` env, default `phase-2-multi-process`. |
 | `embed_arena_*` | gauges/counters | Per-supervisor (in-process arena), not per-worker. |
 
-Worker-side metrics are NOT exposed (workers don't run their own Prometheus exporter — would require multi-process aggregation). Operationally tracked via supervisor logs + per-process RSS via `docker top` + `/proc/<pid>/status`.
+Worker-side metrics ARE exposed since PR #75: each worker binds its own
+Prometheus exporter on `EMBED_WORKER_METRICS_PORT` (scrape job
+`embed-server-workers` in `krolik-server/config/prometheus.yml`, one target per
+worker index). The `embed_worker_*` series above live there, NOT on the
+supervisor `:8082`. Per-process RSS is still observable via `docker top` +
+`/proc/<pid>/status`.
 
 ## Deploy + rollback
 

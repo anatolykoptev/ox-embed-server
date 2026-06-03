@@ -62,7 +62,10 @@ impl MlockedBuf {
     }
 
     /// Returns the buffer length in bytes.
-    #[allow(dead_code)]
+    // An mlocked buffer is always non-empty by construction (it wraps a sized
+    // allocation), so a paired `is_empty()` would be dead weight; suppress the
+    // lint rather than add an unused accessor.
+    #[allow(dead_code, clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.buf.len()
     }
