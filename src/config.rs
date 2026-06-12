@@ -4,6 +4,17 @@ use std::env;
 pub struct ModelDef {
     pub name: String,
     pub dir: String,
+    /// Filename of the ONNX model inside `dir`.
+    ///
+    /// Defaults to `"model_quantized.onnx"` when the 7th segment of the
+    /// `EMBED_MODELS` spec is absent, preserving byte-identical behaviour for
+    /// all existing 6-segment entries.
+    ///
+    /// Set to e.g. `"model_int8.onnx"` for models whose file does not follow
+    /// the default naming convention. Validation: non-empty, no path separator
+    /// characters (`/`, `\`) and no `..` component — the value is joined onto
+    /// `dir` as a plain filename.
+    pub onnx_filename: String,
     pub dim: usize,
     pub max_len: usize,
     pub pad_id: u32,
@@ -347,7 +358,8 @@ impl Config {
     ///
     /// - `EMBED_PORT`: listen port (default 8082)
     /// - `EMBED_MODELS`: comma-separated model specs
-    ///   Format: `name:dir:dim:max_len:pad_id:has_tti`
+    ///   Format: `name:dir:dim:max_len:pad_id:has_tti[:onnx_filename]`
+    ///   The 7th segment is optional; omitting it defaults to `model_quantized.onnx`.
     /// - `EMBED_DEFAULT_MODEL`: default model name (default: first)
     pub fn from_env() -> Result<Self, String> {
         let port = env::var("EMBED_PORT")
@@ -961,9 +973,10 @@ fn parse_one_model(
     global_warmup_seq_len: Option<usize>,
 ) -> Result<ModelDef, String> {
     let parts: Vec<&str> = entry.trim().split(':').collect();
-    if parts.len() != 6 {
+    if parts.len() < 6 || parts.len() > 7 {
         return Err(format!(
-            "model entry must have 6 colon-separated fields, got {}: '{entry}'",
+            "model entry must have 6 or 7 colon-separated fields \
+             (name:dir:dim:max_len:pad_id:has_tti[:onnx_filename]), got {}: '{entry}'",
             parts.len()
         ));
     }
@@ -1103,9 +1116,37 @@ fn parse_one_model(
     );
     tracing::info!(model = %name, memory_pattern, "session config");
 
+    // Optional 7th segment: ONNX filename inside `dir`.
+    // Absent → "model_quantized.onnx" (back-compat default).
+    // Present → validate: non-empty, no path separators, no ".." component.
+    let onnx_filename = if parts.len() == 7 {
+        let raw = parts[6].trim();
+        if raw.is_empty() {
+            return Err(format!(
+                "model '{name}': onnx_filename (7th segment) is empty; \
+                 omit the segment to use the default 'model_quantized.onnx'"
+            ));
+        }
+        if raw.contains('/') || raw.contains('\\') {
+            return Err(format!(
+                "model '{name}': onnx_filename '{raw}' must be a plain filename, \
+                 not a path (no '/' or '\\')"
+            ));
+        }
+        if raw == ".." || raw.starts_with("../") || raw.starts_with("..\\") {
+            return Err(format!(
+                "model '{name}': onnx_filename '{raw}' contains a path-traversal component"
+            ));
+        }
+        raw.to_string()
+    } else {
+        "model_quantized.onnx".to_string()
+    };
+
     Ok(ModelDef {
         name,
         dir: parts[1].to_string(),
+        onnx_filename,
         dim,
         max_len,
         pad_id,
@@ -1785,6 +1826,7 @@ mod tests {
         ModelDef {
             name: name.to_string(),
             dir: "/models".to_string(),
+            onnx_filename: "model_quantized.onnx".to_string(),
             dim: 768,
             max_len,
             pad_id: 0,
@@ -1900,6 +1942,110 @@ mod tests {
         assert_eq!(defs2[0].batch_max_seq, 256); // still global default
         assert_eq!(defs2[0].warmup_seq_len, Some(512)); // = max_len=512
         assert!(defs2[0].memory_pattern); // default true (no env var set in tests)
+    }
+
+    // -----------------------------------------------------------------
+    // E3b: onnx_filename — optional 7th segment in EMBED_MODELS spec.
+    //
+    // Contract:
+    //   6-segment spec   → onnx_filename == "model_quantized.onnx" (default)
+    //   7-segment spec   → onnx_filename == the given filename
+    //   traversal        → parse error
+    //   empty 7th seg    → parse error
+    //   8-segment spec   → parse error (too many fields)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_models_six_segment_defaults_onnx_filename() {
+        // 6-segment spec must populate onnx_filename with the legacy default
+        // so existing prod configs are byte-identically unchanged.
+        let defs =
+            parse_models("multilingual-e5-large:/models:1024:256:1:false").unwrap();
+        assert_eq!(defs[0].onnx_filename, "model_quantized.onnx");
+    }
+
+    #[test]
+    fn parse_models_seven_segment_uses_given_filename() {
+        // 7th segment overrides the default — CodeRankEmbed canonical spec.
+        let defs = parse_models(
+            "code-rank-embed:/models-coderank:768:512:0:false:model_int8.onnx",
+        )
+        .unwrap();
+        assert_eq!(defs[0].onnx_filename, "model_int8.onnx");
+        // Other fields parsed normally.
+        assert_eq!(defs[0].name, "code-rank-embed");
+        assert_eq!(defs[0].dir, "/models-coderank");
+        assert_eq!(defs[0].dim, 768);
+        assert_eq!(defs[0].max_len, 512);
+        assert_eq!(defs[0].pad_id, 0);
+        assert!(!defs[0].has_token_type_ids);
+    }
+
+    #[test]
+    fn parse_models_seven_segment_whitespace_trimmed() {
+        // Surrounding whitespace on the 7th segment must be stripped
+        // (consistent with other field handling).
+        let defs =
+            parse_models("m:/d:768:512:0:false:  model_int8.onnx  ").unwrap();
+        assert_eq!(defs[0].onnx_filename, "model_int8.onnx");
+    }
+
+    #[test]
+    fn parse_models_rejects_path_separator_in_filename() {
+        // Filenames with '/' are rejected — the value is joined onto dir;
+        // allowing separators would enable path traversal.
+        let result = parse_models("m:/d:768:512:0:false:sub/model.onnx");
+        let err = result.err().expect("should have been Err");
+        assert!(
+            err.contains("plain filename"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_models_rejects_dotdot_traversal() {
+        // ".." is a path-traversal component — must be rejected even without
+        // a separator, because `dir.join("..")` would escape the model dir.
+        let result = parse_models("m:/d:768:512:0:false:..");
+        let err = result.err().expect("should have been Err");
+        assert!(
+            err.contains("path-traversal"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_models_rejects_empty_seventh_segment() {
+        // An empty 7th segment is ambiguous — reject with a helpful message
+        // so the operator knows to omit the trailing colon instead.
+        let result = parse_models("m:/d:768:512:0:false:");
+        let err = result.err().expect("should have been Err");
+        assert!(
+            err.contains("empty"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_models_rejects_eight_segments() {
+        // 8 segments is always an error (format: name:dir:dim:max_len:pad_id:has_tti[:onnx_filename]).
+        let result = parse_models("m:/d:768:512:0:false:model.onnx:extra");
+        let err = result.err().expect("should have been Err");
+        assert!(
+            err.contains("6 or 7"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_models_five_segments_still_rejected() {
+        // Fewer than 6 fields remain an error (unchanged pre-existing behaviour).
+        let result = parse_models("m:/d:768:512:0");
+        let err = result.err().expect("should have been Err");
+        assert!(
+            err.contains("6 or 7"),
+            "unexpected error: {err}"
+        );
     }
 
     // -----------------------------------------------------------------

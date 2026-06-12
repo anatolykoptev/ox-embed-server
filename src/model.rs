@@ -193,7 +193,7 @@ impl EmbedModel {
 
         let dir = Path::new(&def.dir);
 
-        let onnx_path = dir.join("model_quantized.onnx");
+        let onnx_path = dir.join(&def.onnx_filename);
         if !onnx_path.exists() {
             return Err(format!("ONNX file not found: {}", onnx_path.display()));
         }
@@ -807,19 +807,47 @@ fn build_one_session(
         // shared one, doubling allocator state.
         .with_execution_providers([ep::CPU::default().with_arena_allocator(false).build()])
         .map_err(|e| format!("disable per-session cpu mem arena: {e}"))?;
-    // Read the ONNX file (original or cached) into a mlocked buffer so the
-    // kernel cannot swap those pages out under host memory pressure. The buffer
-    // is passed to ORT via commit_from_memory rather than commit_from_file so
-    // we own the source bytes and can mlock them. If mlock fails (RLIMIT too
-    // low, no privilege) read_and_mlock logs a warning and still returns the
-    // bytes — load proceeds normally without pinning.
-    let mlocked = read_and_mlock(&load_path)
-        .map_err(|e| format!("read ONNX bytes {}: {e}", load_path.display()))?;
-    let session = builder
-        .commit_from_memory(mlocked.as_slice())
-        .map_err(|e| format!("load ONNX {}: {e}", load_path.display()))?;
+    // ONNX external-data detection: if a sibling `<onnx>.data` file exists
+    // alongside `load_path`, ORT must load via `commit_from_file` so the
+    // runtime can locate the data file relative to the ONNX directory.
+    // `commit_from_memory` has no directory context and will fail to resolve
+    // the external-data path (`CreateSessionFromArray` in ORT C++ has no
+    // `model_path` argument). The mlock optimisation is skipped for such
+    // models — external-data models keep their weights in ORT's own heap.
+    let external_data_path = {
+        let mut p = load_path.as_os_str().to_owned();
+        p.push(".data");
+        std::path::PathBuf::from(p)
+    };
+    let has_external_data = external_data_path.exists();
+
+    let session = if has_external_data {
+        tracing::info!(
+            path = %load_path.display(),
+            data = %external_data_path.display(),
+            "ONNX has external data — loading via commit_from_file (mlock skipped)"
+        );
+        builder
+            .commit_from_file(&load_path)
+            .map_err(|e| format!("load ONNX {}: {e}", load_path.display()))?
+    } else {
+        // Read the ONNX file (original or cached) into a mlocked buffer so the
+        // kernel cannot swap those pages out under host memory pressure. The
+        // buffer is passed to ORT via commit_from_memory rather than
+        // commit_from_file so we own the source bytes and can mlock them. If
+        // mlock fails (RLIMIT too low, no privilege) read_and_mlock logs a
+        // warning and still returns the bytes — load proceeds normally without
+        // pinning.
+        let mlocked = read_and_mlock(&load_path)
+            .map_err(|e| format!("read ONNX bytes {}: {e}", load_path.display()))?;
+        let session = builder
+            .commit_from_memory(mlocked.as_slice())
+            .map_err(|e| format!("load ONNX {}: {e}", load_path.display()))?;
+        onnx_cache::observe_post_commit(&plan, t_commit.elapsed().as_millis());
+        return Ok(MlockedSession::new(session, mlocked));
+    };
     onnx_cache::observe_post_commit(&plan, t_commit.elapsed().as_millis());
-    Ok(MlockedSession::new(session, mlocked))
+    Ok(MlockedSession::new_without_mlock(session))
 }
 
 #[cfg(test)]
