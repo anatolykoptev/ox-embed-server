@@ -106,6 +106,17 @@ impl MlockedSession {
     pub fn new(session: Session, buf: MlockedBuf) -> Self {
         Self { session, _buf: buf }
     }
+
+    /// Create a session that was loaded via `commit_from_file` (e.g. models
+    /// with external-data sibling files). The mlock optimisation does not
+    /// apply — ORT holds the weights in its own heap allocation rather than
+    /// in our buffer — so `_buf` is left empty.
+    pub fn new_without_mlock(session: Session) -> Self {
+        Self {
+            session,
+            _buf: MlockedBuf { buf: vec![], locked: false },
+        }
+    }
 }
 
 impl std::ops::Deref for MlockedSession {
