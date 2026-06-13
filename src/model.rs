@@ -769,6 +769,21 @@ fn build_evictable_pool(
     ))
 }
 
+/// Return `true` when a sibling `<onnx_path>.data` file exists next to the
+/// **original** model file.
+///
+/// Must be called with the original `onnx_path`, never with a cache-redirected
+/// path: the `.data` sidecar lives next to the source model, not in any cache
+/// directory. When external data is present we must also disable caching
+/// (`LoadPlan::NoCache`) because an ORT-optimized graph written into the cache
+/// directory would lose its relative reference to the sidecar — there is no
+/// coherent way to cache an external-data model.
+fn should_use_external_data(onnx_path: &Path) -> bool {
+    let mut p = onnx_path.as_os_str().to_owned();
+    p.push(".data");
+    std::path::Path::new(&p).exists()
+}
+
 /// Build a single ONNX session with the configured parameters.
 /// Called by the factory closure in [`build_evictable_pool`] — both at
 /// startup (for initial pool fill) and lazily after eviction.
@@ -779,10 +794,26 @@ fn build_one_session(
     intra_threads: usize,
     memory_pattern: bool,
 ) -> Result<MlockedSession, String> {
+    // External-data detection MUST happen against the original onnx_path before
+    // any cache redirection. If a `<onnx_path>.data` sidecar exists, caching is
+    // incoherent (an optimized graph in the cache dir has no `.data` next to it)
+    // so we force NoCache regardless of what the env says. This also guarantees
+    // that both sessions in a pool_size=2 scenario take identical, deterministic
+    // paths: session #0 (which would be a Miss) and session #1 (which would see
+    // the Miss-written file as a Hit) both become NoCache → commit_from_file on
+    // onnx_path, with no order-dependent divergence.
+    let has_external_data = should_use_external_data(onnx_path);
+
     // Per-model override: `ONNX_OPT_CACHE_DIR_<MODEL_NAME_UPPER>` takes
     // precedence over the global `ONNX_OPT_CACHE_DIR`.
     let cache = CacheDir::from_env_for_model(model_name);
-    let plan = LoadPlan::decide(cache.as_ref(), onnx_path);
+    let plan = if has_external_data {
+        // External-data models cannot be cached — force NoCache so every pool
+        // session loads from the original path and can locate the sidecar.
+        LoadPlan::NoCache
+    } else {
+        LoadPlan::decide(cache.as_ref(), onnx_path)
+    };
     let load_path = plan.load_source(onnx_path).to_path_buf();
     let t_commit = std::time::Instant::now();
     // memory_pattern=true: ORT plans scratch reuse within the shared
@@ -807,29 +838,28 @@ fn build_one_session(
         // shared one, doubling allocator state.
         .with_execution_providers([ep::CPU::default().with_arena_allocator(false).build()])
         .map_err(|e| format!("disable per-session cpu mem arena: {e}"))?;
-    // ONNX external-data detection: if a sibling `<onnx>.data` file exists
-    // alongside `load_path`, ORT must load via `commit_from_file` so the
-    // runtime can locate the data file relative to the ONNX directory.
-    // `commit_from_memory` has no directory context and will fail to resolve
-    // the external-data path (`CreateSessionFromArray` in ORT C++ has no
-    // `model_path` argument). The mlock optimisation is skipped for such
-    // models — external-data models keep their weights in ORT's own heap.
-    let external_data_path = {
-        let mut p = load_path.as_os_str().to_owned();
-        p.push(".data");
-        std::path::PathBuf::from(p)
-    };
-    let has_external_data = external_data_path.exists();
 
-    let session = if has_external_data {
+    // When external data is present, load_path == onnx_path (NoCache above),
+    // so ORT can resolve the `.data` sidecar relative to the model directory.
+    // commit_from_memory has no directory context and cannot locate the sidecar.
+    // The mlock optimisation is skipped for such models — external-data models
+    // keep their weights in ORT's own heap.
+    if has_external_data {
+        let data_path = {
+            let mut p = onnx_path.as_os_str().to_owned();
+            p.push(".data");
+            std::path::PathBuf::from(p)
+        };
         tracing::info!(
-            path = %load_path.display(),
-            data = %external_data_path.display(),
-            "ONNX has external data — loading via commit_from_file (mlock skipped)"
+            path = %onnx_path.display(),
+            data = %data_path.display(),
+            "ONNX has external data — loading via commit_from_file (mlock skipped, cache disabled)"
         );
-        builder
-            .commit_from_file(&load_path)
-            .map_err(|e| format!("load ONNX {}: {e}", load_path.display()))?
+        let session = builder
+            .commit_from_file(onnx_path)
+            .map_err(|e| format!("load ONNX {}: {e}", onnx_path.display()))?;
+        onnx_cache::observe_post_commit(&plan, t_commit.elapsed().as_millis());
+        Ok(MlockedSession::new_without_mlock(session))
     } else {
         // Read the ONNX file (original or cached) into a mlocked buffer so the
         // kernel cannot swap those pages out under host memory pressure. The
@@ -844,10 +874,8 @@ fn build_one_session(
             .commit_from_memory(mlocked.as_slice())
             .map_err(|e| format!("load ONNX {}: {e}", load_path.display()))?;
         onnx_cache::observe_post_commit(&plan, t_commit.elapsed().as_millis());
-        return Ok(MlockedSession::new(session, mlocked));
-    };
-    onnx_cache::observe_post_commit(&plan, t_commit.elapsed().as_millis());
-    Ok(MlockedSession::new_without_mlock(session))
+        Ok(MlockedSession::new(session, mlocked))
+    }
 }
 
 #[cfg(test)]
@@ -903,6 +931,84 @@ mod seq_pad_tests {
         assert_eq!(round_up_seq_len(250, 300), 256);
         // 257.next_power_of_two() == 512, capped to 300.
         assert_eq!(round_up_seq_len(257, 300), 300);
+    }
+}
+
+/// Tests for the external-data / cache-policy decision logic.
+///
+/// These are pure filesystem-state tests — no ORT sessions involved.
+/// The key invariant: `should_use_external_data` must read the ORIGINAL
+/// onnx path, never a cache-redirected path, so a cache HIT cannot flip
+/// the decision and cause a startup failure on session #1 of a pool.
+#[cfg(test)]
+mod session_load_decision_tests {
+    use super::should_use_external_data;
+
+    /// No `.data` sidecar → mlock path should be taken (external data = false).
+    #[test]
+    fn no_sidecar_returns_false() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let onnx = dir.path().join("model.onnx");
+        std::fs::write(&onnx, b"fake").expect("write onnx");
+        // No model.onnx.data created.
+        assert!(
+            !should_use_external_data(&onnx),
+            "no sidecar → should_use_external_data must be false"
+        );
+    }
+
+    /// A sibling `<model>.onnx.data` exists → external-data path must be taken.
+    #[test]
+    fn with_sidecar_returns_true() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let onnx = dir.path().join("model_int8.onnx");
+        let data = dir.path().join("model_int8.onnx.data");
+        std::fs::write(&onnx, b"fake onnx").expect("write onnx");
+        std::fs::write(&data, b"fake weights").expect("write data");
+        assert!(
+            should_use_external_data(&onnx),
+            "sidecar present → should_use_external_data must be true"
+        );
+    }
+
+    /// Cache-HIT regression guard: a redirected load_path in a *different*
+    /// directory (simulating what `LoadPlan::Hit` would produce) must NOT
+    /// cause a false-positive even if a file with the cache name happens to
+    /// exist. The decision is anchored to the original onnx_path.
+    ///
+    /// Scenario: session #0 writes an optimized graph to cache_dir; session #1
+    /// sees a Hit and previously probed `cache_dir/<basename>.data` (doesn't
+    /// exist) → returned false → commit_from_memory → ORT fails to find the
+    /// sidecar. This test verifies that the corrected code anchors the probe to
+    /// onnx_path, so both sessions agree regardless of cache state.
+    #[test]
+    fn cache_hit_path_does_not_affect_decision() {
+        let model_dir = tempfile::tempdir().expect("model tempdir");
+        let cache_dir = tempfile::tempdir().expect("cache tempdir");
+
+        let onnx_path = model_dir.path().join("model_int8.onnx");
+        let onnx_data = model_dir.path().join("model_int8.onnx.data");
+        std::fs::write(&onnx_path, b"fake onnx").expect("write onnx");
+        std::fs::write(&onnx_data, b"fake weights").expect("write data");
+
+        // Simulate what a cache Hit would redirect to — in a different dir,
+        // with NO corresponding .data file there.
+        let cached_path = cache_dir.path().join("model_int8.onnx.1234.optimized.onnx");
+        std::fs::write(&cached_path, b"optimized graph").expect("write cached");
+        // Deliberately do NOT create cached_path + ".data".
+
+        // The decision must be anchored to onnx_path (has sidecar → true),
+        // not to cached_path (no sidecar → would return false if broken).
+        assert!(
+            should_use_external_data(&onnx_path),
+            "must probe original onnx_path, not a hypothetical cache-redirected path"
+        );
+        // Confirm the cached path itself would return false if probed — proving
+        // the test is actually exercising the discrimination.
+        assert!(
+            !should_use_external_data(&cached_path),
+            "cache-redirected path has no sidecar → false (this is the broken behaviour the fix prevents)"
+        );
     }
 }
 
