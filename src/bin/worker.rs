@@ -161,6 +161,44 @@ fn install_worker_metrics(model_name: &str) -> PrometheusHandle {
     handle
 }
 
+/// Handle the result of shared CPU arena registration.
+///
+/// Returns `Err` on failure (aborting worker startup), matching the
+/// reranker/splade pattern which panics via
+/// `assert_arena_registered_before_session`. Previously the embed path only
+/// warned and continued, silently falling back to per-session BFCArena with
+/// unbounded memory growth.
+///
+/// Incrementing `embed_arena_registration_failed_total` before returning the
+/// error makes the failure observable in `/metrics` even though the worker
+/// exits immediately afterwards (the supervisor's `/metrics` endpoint
+/// scrapes the worker's last render).
+fn handle_arena_registration(result: Result<(), String>) -> anyhow::Result<()> {
+    match result {
+        Ok(()) => {
+            tracing::info!("shared CPU arena registered (worker)");
+            Ok(())
+        }
+        Err(e) => {
+            embed_server::metrics::record_arena_registration_failed();
+            Err(anyhow::anyhow!("shared arena registration failed: {e}"))
+        }
+    }
+}
+
+/// Register the shared CPU arena for this worker's model.
+///
+/// Pre-touches the `embed_arena_registration_failed_total` counter to 0 so
+/// it is visible in `/metrics` from startup even when no failure occurs,
+/// then delegates to [`handle_arena_registration`] for the fail/continue
+/// decision.
+fn register_arena_for_worker(model_name: &str) -> anyhow::Result<()> {
+    embed_server::metrics::arena_registration_failed_touch();
+    handle_arena_registration(embed_server::arena::register_shared_cpu_arena_for_model(
+        model_name,
+    ))
+}
+
 fn require_env(var: &str) -> anyhow::Result<String> {
     std::env::var(var).map_err(|_e| {
         tracing::error!(var, "required environment variable missing");
@@ -229,14 +267,13 @@ async fn main() -> anyhow::Result<()> {
     // Register the shared CPU arena BEFORE any Session::builder() call.
     // Each worker is a fresh process — the parent supervisor's registration
     // doesn't carry over. RerankerModel::load and SpladeModel::load both
-    // assert this; EmbedModel::load silently falls back to per-session
-    // BFCArena without it (less efficient).
+    // assert this via `assert_arena_registered_before_session` (which panics).
+    // The embed path (StandaloneEmbedder::load) does NOT assert — without a
+    // shared arena it silently falls back to per-session BFCArena, causing
+    // unbounded memory growth. So registration failure MUST abort startup,
+    // not warn-and-continue.
     // Uses per-model EMBED_ARENA_MAX_MEM_BYTES_<KEY> override if set.
-    if let Err(e) = embed_server::arena::register_shared_cpu_arena_for_model(&model_name) {
-        tracing::warn!(error = %e, "shared arena registration failed; sessions will use per-session BFCArena");
-    } else {
-        tracing::info!("shared CPU arena registered (worker)");
-    }
+    register_arena_for_worker(&model_name)?;
 
     let loaded = match kind.as_str() {
         "embed" => LoadedModel::Embed(
@@ -463,7 +500,7 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{INTRA_THREADS, POOL_SIZE};
+    use super::{INTRA_THREADS, POOL_SIZE, handle_arena_registration};
     use embed_server::worker_waiters::{
         WAITERS_FLOOR, WAITERS_POOL_MULTIPLIER, resolve_max_waiters_for_model,
     };
@@ -474,6 +511,38 @@ mod tests {
     // std::env::set_var is non-reentrant (glibc setenv) and officially
     // unsafe since Rust 1.82. The #[serial] attribute (serial_test crate)
     // ensures these tests never run concurrently, making the mutations safe.
+
+    // ── arena registration error propagation ──────────────────────────────────
+
+    #[test]
+    fn arena_registration_failure_propagates_as_error() {
+        // When register_shared_cpu_arena_for_model returns Err, the worker
+        // MUST propagate it as an error (aborting startup) — NOT warn and
+        // continue. Warn-and-continue caused the embed path to silently fall
+        // back to per-session BFCArena with unbounded memory growth (issue #92).
+        let result = handle_arena_registration(Err("simulated ORT failure".into()));
+        assert!(
+            result.is_err(),
+            "arena registration failure must abort startup, not warn-and-continue"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("shared arena registration failed"),
+            "error message must mention arena registration failure, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn arena_registration_success_returns_ok() {
+        // Happy path: registration succeeds → Ok(()), worker continues.
+        let result = handle_arena_registration(Ok(()));
+        assert!(
+            result.is_ok(),
+            "successful arena registration must not abort startup"
+        );
+    }
+
+    // ── existing tests ─────────────────────────────────────────────────────────
 
     #[test]
     // These are compile-time `const` values, so clippy's

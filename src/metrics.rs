@@ -628,6 +628,43 @@ pub fn record_arena_register_skipped() {
     metrics::counter!("embed_arena_register_skipped_total").increment(1);
 }
 
+/// Increment the counter tracking how many times arena allocator
+/// registration FAILED, causing worker startup to abort.
+///
+/// Expected steady-state value is 0 — a non-zero value means a worker
+/// process exited immediately because `register_shared_cpu_arena_for_model`
+/// returned `Err`. Without the shared arena, the embed path silently falls
+/// back to per-session BFCArena (unbounded memory growth), so startup MUST
+/// fail rather than warn-and-continue (matching the reranker/splade pattern
+/// which panics via `assert_arena_registered_before_session`).
+///
+/// Pre-touched to 0 at worker startup via [`arena_registration_failed_touch`]
+/// so the series is visible in `/metrics` even when no failure occurs.
+// `allow(dead_code)`: worker-only recorder, see [`record_worker_inference`].
+// The only caller is `src/bin/worker.rs` (embed-worker binary).
+#[allow(dead_code)]
+pub fn record_arena_registration_failed() {
+    metrics::counter!("embed_arena_registration_failed_total").increment(1);
+}
+
+/// Pre-touch the arena-registration-failed counter to 0 at worker startup.
+///
+/// Prometheus counters only appear in `/metrics` after the first
+/// `increment`. Without this, "0 registration failures since boot" is
+/// indistinguishable from "metric not wired" — operators get a false
+/// absence-of-signal. Follows the same pattern as [`carry_lost_touch`] and
+/// [`worker_restart_touch`].
+///
+/// Called from `register_arena_for_worker` in `src/bin/worker.rs` before
+/// the registration attempt, so every worker has the counter visible at
+/// value 0 from startup.
+// `allow(dead_code)`: worker-only recorder, see [`record_worker_inference`].
+// The only caller is `src/bin/worker.rs` (embed-worker binary).
+#[allow(dead_code)]
+pub fn arena_registration_failed_touch() {
+    metrics::counter!("embed_arena_registration_failed_total").absolute(0);
+}
+
 /// Increment the token-cache miss counter by `n`.
 ///
 /// See `record_token_cache_hit` for the batch-increment semantic and
