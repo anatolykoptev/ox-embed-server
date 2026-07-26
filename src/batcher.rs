@@ -205,6 +205,9 @@ impl DynamicBatcher {
             wait: Duration::from_millis(wait_ms),
             model_max_len,
         };
+        // Pre-touch the carry-lost counter to 0 so it appears in /metrics
+        // from startup (absent counter = "not wired" false-negative).
+        crate::metrics::carry_lost_touch(&arc_name);
         let handle = tokio::spawn(run_worker(rx, Arc::new(embed_fn), arc_name.clone(), cfg));
         DynamicBatcher {
             name: arc_name,
@@ -293,6 +296,7 @@ impl DynamicBatcher {
     /// alive on the stuck worker's stack and the client's `reply_rx.await`
     /// frozen until the process exits.
     pub async fn shutdown(self, timeout: Duration) {
+        let name = self.name.clone();
         let DynamicBatcher { sender, worker, .. } = self;
         drop(sender);
         // Use `select!` with `&mut worker` so we retain the `JoinHandle`
@@ -305,6 +309,16 @@ impl DynamicBatcher {
             _ = tokio::time::sleep(timeout) => true,
         };
         if timed_out {
+            // The worker is stuck (e.g. a `dispatch_batch` call blocked in a
+            // long `spawn_blocking` ONNX inference). Aborting unwinds the
+            // worker's stack, dropping any pending `carry` item's
+            // `oneshot::Sender` — the client receives `BatchError::Shutdown`
+            // instead of hanging. Record the carry-lost event here because
+            // this is the reachable path where a carry item is actually
+            // dropped. (The old defensive `carry.take()` block at the top of
+            // the worker loop was unreachable: `carry.take()` on line 405
+            // already consumes it before `rx.recv()`.)
+            crate::metrics::record_carry_lost(&name);
             worker.abort();
         }
     }
@@ -407,20 +421,13 @@ async fn run_worker(
             None => match rx.recv().await {
                 Some(i) => i,
                 None => {
-                    // Channel closed. In normal flow `carry` is always
+                    // Channel closed and no carry pending (carry is always
                     // consumed by `carry.take()` above before we reach
-                    // `rx.recv()`, so this branch is defensive: if a
-                    // future refactor changes the loop structure, a
-                    // carry item left here would have its reply sender
-                    // dropped silently (causing `BatchError::Shutdown`
-                    // on the client side via oneshot recv-error). We
-                    // make that path explicit + observable.
-                    if let Some(item) = carry.take() {
-                        crate::metrics::record_carry_lost(&name);
-                        // `item` (and its reply sender) is dropped here,
-                        // causing the client to receive BatchError::Shutdown.
-                        drop(item);
-                    }
+                    // `rx.recv()`). The carry-drop-on-abort case is handled
+                    // in `shutdown()`'s timeout branch, which calls
+                    // `worker.abort()` — unwinding the stack and dropping any
+                    // in-flight carry sender — and records
+                    // `embed_batcher_carry_lost_total` there.
                     break;
                 }
             },
