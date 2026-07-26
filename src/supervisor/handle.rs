@@ -323,11 +323,12 @@ impl WorkerSupervisor {
                 );
             }
 
-            // Clear client slot — dispatchers see "worker unavailable".
-            *self.client_slot.write().await = None;
-            // Clear PID — RSS-poll loop skips this worker until it is live again.
-            self.current_pid
-                .store(0, std::sync::atomic::Ordering::Relaxed);
+            // Clear worker state on exit — pid FIRST, then client slot.
+            // Ordering matters: clearing pid before client_slot ensures the
+            // RSS-poll loop sees pid=0 (skip) before dispatchers see
+            // "unavailable", avoiding the epoch-exit gap where a dead PID
+            // is still readable while the slot is already None.
+            self.clear_on_exit().await;
 
             // Respawn loop — each failed attempt advances backoff exactly once.
             loop {
@@ -359,6 +360,28 @@ impl WorkerSupervisor {
                 }
             }
         }
+    }
+
+    /// Clear worker state on exit — `current_pid` first, then `client_slot`.
+    ///
+    /// Ordering invariant: `current_pid` is set to 0 BEFORE `client_slot`
+    /// becomes None. This ensures:
+    ///   - The RSS-poll loop sees pid=0 (skip) before dispatchers see
+    ///     "unavailable" — no window where it reads `/proc/<dead_pid>/status`.
+    ///   - Concurrent observers never see the inconsistent state
+    ///     (pid != 0 && client_slot = None).
+    ///
+    /// On respawn (in `watchdog_loop`), the order is intentionally reversed
+    /// (PID set first, then client_slot) — reading a live-but-not-ready PID
+    /// is harmless (just memory stats), and dispatchers correctly see
+    /// "unavailable" until `client_slot` is set.
+    async fn clear_on_exit(&self) {
+        // Clear PID FIRST — RSS-poll loop sees pid=0 (skip) before
+        // dispatchers see "unavailable" via client_slot=None.
+        self.current_pid
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        // Clear client slot — dispatchers see "worker unavailable".
+        *self.client_slot.write().await = None;
     }
 
     /// Returns the current live client, or `None` if a respawn is in progress.
@@ -457,6 +480,70 @@ mod tests {
             SOCKET_WAIT_SECS,
             "invalid falls back to default"
         );
+    }
+
+    /// Verifies the epoch-exit ordering invariant: on worker exit,
+    /// `current_pid` is cleared to 0 BEFORE `client_slot` becomes None.
+    ///
+    /// This prevents the RSS-poll loop from reading `/proc/<dead_pid>/status`
+    /// (exit gap) and ensures a consistent state for concurrent observers.
+    ///
+    /// The test is deterministic: it holds a read lock on `client_slot` so
+    /// the write in `clear_on_exit` blocks, then inspects `current_pid`.
+    /// With the correct ordering (pid-first), pid is already 0 when the
+    /// write blocks. With the buggy ordering (client-first), pid is still
+    /// the old value because the write blocked before the pid store ran.
+    #[tokio::test]
+    async fn clear_on_exit_clears_pid_before_client_slot() {
+        let supervisor = Arc::new(WorkerSupervisor {
+            spec: SpawnSpec {
+                model: "test-model".into(),
+                kind: WorkerKind::Embed,
+                worker_bin: PathBuf::from("/bin/true"),
+                socket_dir: PathBuf::from("/tmp"),
+                pool_size: 1,
+                intra_threads: 1,
+                env_extra: vec![],
+            },
+            client_slot: Arc::new(RwLock::new(None)),
+            restart_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            socket_wait: Duration::from_secs(60),
+            current_pid: Arc::new(std::sync::atomic::AtomicU32::new(42)),
+        });
+
+        // Hold a read lock on client_slot so the write in clear_on_exit
+        // blocks at the RwLock acquisition point.
+        let _read_guard = supervisor.client_slot.read().await;
+
+        // Spawn clear_on_exit. With correct ordering (pid-first), it stores
+        // pid=0 then blocks on the write lock. With buggy ordering
+        // (client-first), it blocks on the write lock immediately, leaving
+        // pid=42.
+        let sup_clone = supervisor.clone();
+        let clear_handle = tokio::spawn(async move {
+            sup_clone.clear_on_exit().await;
+        });
+
+        // Let the clear task run up to the blocking write().await.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // With the fix: pid is already 0 (stored before the write attempt).
+        // With the bug: pid is still 42 (write blocked before pid store).
+        let pid = supervisor.current_pid();
+        assert_eq!(
+            pid, 0,
+            "current_pid must be cleared to 0 before client_slot becomes None \
+             (epoch-exit ordering gap)"
+        );
+
+        // Release the read lock so clear_on_exit can complete.
+        drop(_read_guard);
+        clear_handle.await.unwrap();
+
+        // Final state: both cleared.
+        assert_eq!(supervisor.current_pid(), 0);
+        assert!(supervisor.client().await.is_none());
     }
 
     #[test]
