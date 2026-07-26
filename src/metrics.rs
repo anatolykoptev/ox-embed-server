@@ -473,6 +473,28 @@ pub fn record_carry(model: &str) {
     .increment(1);
 }
 
+/// Increment the carry-lost counter — fired when a carry item's reply
+/// is resolved with `BatchError::Shutdown` because the worker exited
+/// (channel closed) before the carry could be dispatched.
+///
+/// This is the observability path for the fix that sends `Shutdown` to
+/// a pending carry item on channel close (`run_worker` exit). In the
+/// normal shutdown path the worker is aborted (via `shutdown`'s
+/// `worker.abort()` on timeout), which drops the carry's reply sender
+/// without calling this counter — the counter specifically tracks the
+/// defensive `carry.take()` + drop path at the top of the worker loop.
+/// A non-zero rate here means the channel closed with a carry still
+/// pending after the last dispatched batch, which operators should
+/// never see in healthy operation (it implies shutdown raced with an
+/// in-flight overflow split).
+pub fn record_carry_lost(model: &str) {
+    metrics::counter!(
+        "embed_batcher_carry_lost_total",
+        "model" => model.to_string()
+    )
+    .increment(1);
+}
+
 /// Increment embedding-cache hit counter by `n` in a single call.
 ///
 /// Positions-in-request semantics: the same text at N positions counts

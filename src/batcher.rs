@@ -282,10 +282,31 @@ impl DynamicBatcher {
     /// Graceful drain: drop the channel so the worker sees all items through,
     /// then wait up to `timeout` for its `JoinHandle` to finish. Called on
     /// SIGTERM from `main::drain_batchers` after axum's HTTP drain returns.
+    ///
+    /// If the worker doesn't finish within `timeout` (e.g. a `dispatch_batch`
+    /// call is stuck in a long `spawn_blocking` ONNX inference), the worker
+    /// task is **aborted** — not just detached. Aborting unwinds the worker's
+    /// stack, which drops any pending `carry` item's `oneshot::Sender`,
+    /// causing the client to receive `BatchError::Shutdown` instead of
+    /// hanging indefinitely. A plain `JoinHandle` drop (the old behaviour)
+    /// would detach the task without unwinding, leaving the carry sender
+    /// alive on the stuck worker's stack and the client's `reply_rx.await`
+    /// frozen until the process exits.
     pub async fn shutdown(self, timeout: Duration) {
         let DynamicBatcher { sender, worker, .. } = self;
         drop(sender);
-        let _ = tokio::time::timeout(timeout, worker).await;
+        // Use `select!` with `&mut worker` so we retain the `JoinHandle`
+        // after the timeout fires (vs. `tokio::time::timeout` which
+        // consumes and drops it, detaching the task without abort).
+        let mut worker = worker;
+        let timed_out = tokio::select! {
+            biased;
+            _ = &mut worker => false,
+            _ = tokio::time::sleep(timeout) => true,
+        };
+        if timed_out {
+            worker.abort();
+        }
     }
 
     /// Test-only: enqueue an item with a caller-supplied reply sender.
@@ -385,7 +406,23 @@ async fn run_worker(
             Some(c) => c,
             None => match rx.recv().await {
                 Some(i) => i,
-                None => break,
+                None => {
+                    // Channel closed. In normal flow `carry` is always
+                    // consumed by `carry.take()` above before we reach
+                    // `rx.recv()`, so this branch is defensive: if a
+                    // future refactor changes the loop structure, a
+                    // carry item left here would have its reply sender
+                    // dropped silently (causing `BatchError::Shutdown`
+                    // on the client side via oneshot recv-error). We
+                    // make that path explicit + observable.
+                    if let Some(item) = carry.take() {
+                        crate::metrics::record_carry_lost(&name);
+                        // `item` (and its reply sender) is dropped here,
+                        // causing the client to receive BatchError::Shutdown.
+                        drop(item);
+                    }
+                    break;
+                }
             },
         };
         let mut accum = BatchAccum::default();
@@ -1907,5 +1944,91 @@ mod tests {
             .expect("still has clones")
             .shutdown(Duration::from_millis(200))
             .await;
+    }
+
+    // -----------------------------------------------------------------
+    // Carry-item shutdown safety (#91)
+    //
+    // When the batcher's mpsc channel closes with a carry item pending
+    // from the previous overflow split, the carry item's oneshot::Sender
+    // must be dropped (causing the client to receive BatchError::Shutdown)
+    // — not left alive on a stuck worker's stack, hanging the client.
+    // -----------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn carry_item_not_lost_on_shutdown() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let blocked = Arc::new(AtomicBool::new(true));
+        let blocked_cl = blocked.clone();
+
+        // max_batch_tokens=100, padded=true, wait_ms=50.
+        // First item (10 tokens): padded 10*1=10 < 100 → admitted.
+        // Second item (200 tokens): padded max(10,200)*2=400 ≥ 100 → carried.
+        // embed_fn blocks so dispatch_batch doesn't complete during shutdown,
+        // keeping the worker stuck and the carry item alive on its stack.
+        let b = DynamicBatcher::with_tokens(
+            "t_carry_shutdown",
+            move |ids: Vec<Vec<u32>>| {
+                while blocked_cl.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(ids.iter().map(|_| vec![0.0f32; 4]).collect())
+            },
+            /*max_batch_tokens*/ 100,
+            /*max_batch_items*/ 4,
+            /*max_batch_seq*/ 16,
+            /*padded_model*/ true,
+            /*wait_ms*/ 50,
+            /*max_queue*/ 10,
+        );
+
+        // Enqueue the small item — it will be admitted to the batch.
+        let (small_tx, small_rx) = oneshot::channel();
+        b.enqueue_for_test(vec![vec![1u32; 10]], small_tx)
+            .expect("enqueue small");
+
+        // Let the worker pick up the small item and enter the coalesce
+        // window (wait_ms=50).
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        // Enqueue the large item — it will overflow and be carried.
+        let (large_tx, large_rx) = oneshot::channel();
+        b.enqueue_for_test(vec![vec![1u32; 200]], large_tx)
+            .expect("enqueue large");
+
+        // Wait for the coalesce window to close (wait_ms=50) and
+        // dispatch_batch to start. The embed_fn is blocked, so
+        // dispatch_batch is stuck and the carry item is alive in the
+        // worker's `carry` local.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        // Shutdown with a tiny timeout. dispatch_batch is still blocked,
+        // so the worker won't finish within the timeout. The fix aborts
+        // the worker task, unwinding its stack and dropping the carry
+        // item's reply sender.
+        b.shutdown(Duration::from_millis(10)).await;
+
+        // The carry item's reply must NOT hang — it must resolve to
+        // Err(RecvError) (which maps to BatchError::Shutdown on the
+        // embed_tokens side) because the sender was dropped via abort.
+        tokio::select! {
+            result = large_rx => {
+                assert!(
+                    result.is_err(),
+                    "expected Shutdown (recv error), got Ok"
+                );
+            }
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                panic!("carry item hung on shutdown — worker.abort() not firing");
+            }
+        }
+
+        // Release the block so the detached spawn_blocking task can
+        // finish (its result is discarded, but the thread should exit).
+        blocked.store(false, Ordering::SeqCst);
+        // small_rx also gets Shutdown (its reply sender was in the
+        // dispatch_batch future, dropped with the worker).
+        drop(small_rx);
     }
 }
