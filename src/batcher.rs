@@ -862,8 +862,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn queue_full_returns_error() {
         // E2: with the 80% backpressure gate, a `max_queue=10` batcher
-        // rejects the 9th producer (threshold = 10 * 8 / 10 = 8; depth
+        // rejects the 10th producer (threshold = 10 * 8 / 10 = 8; depth
         // ≥ 8 ⇒ reject). Worker blocked on a flag so items accumulate.
+        //
+        // 9 producers: worker consumes 1 (blocked in spawn_blocking),
+        // 8 remain in the channel buffer → depth = 10 − 2 = 8 ≥ 8 ⇒ the
+        // 10th call is rejected BEFORE try_send. With only 8 producers
+        // depth would be 7 < 8 and the 10th call would pass the gate,
+        // succeed try_send, then block on reply_rx forever (worker
+        // stuck) — the original hang (issue #123).
         use std::sync::atomic::{AtomicBool, Ordering};
         let blocked = Arc::new(AtomicBool::new(true));
         let blocked_cl = blocked.clone();
@@ -880,19 +887,26 @@ mod tests {
             /*max_queue*/ 10,
         ));
         {
-            // Spawn 8 producers; worker is blocked so they stack up
-            // (one dispatched + up to 7 in the channel buffer ≤ 80%).
+            // Spawn 9 producers; worker is blocked so they stack up
+            // (one dispatched + 8 in the channel buffer = depth 8).
             let mut fillers = Vec::new();
-            for i in 0..8u32 {
+            for i in 0..9u32 {
                 let bc = b.clone();
                 fillers.push(tokio::spawn(
                     async move { bc.embed_tokens(tok(&[i])).await },
                 ));
             }
-            // Give the scheduler a moment so all 8 sends have landed
-            // and the producer-side depth gauge settles at ≥ 8.
+            // Give the scheduler a moment so all 9 sends have landed
+            // and the producer-side depth gauge settles at 8.
             tokio::time::sleep(Duration::from_millis(50)).await;
-            let overflow = b.embed_tokens(tok(&[99])).await;
+            // Safety net: if the gate logic regresses, fail fast
+            // instead of hanging the test runner (#123).
+            let overflow = tokio::time::timeout(
+                Duration::from_secs(5),
+                b.embed_tokens(tok(&[99])),
+            )
+            .await
+            .expect("embed_tokens hung — 80% gate did not reject (regression of #123)");
             assert!(
                 matches!(overflow, Err(BatchError::QueueFull(_))),
                 "got: {overflow:?}"
@@ -1484,9 +1498,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn backpressure_rejects_at_eighty_percent() {
         // max_queue=10 ⇒ threshold = 10 * 8 / 10 = 8. With 8 slots
-        // occupied (worker blocked), the 9th send must be rejected
-        // BEFORE reaching `try_send` — which proves the pre-check gate
-        // is active (try_send alone would wait up to max_queue=10).
+        // occupied in the channel (worker blocked consuming 1),
+        // the 10th send must be rejected BEFORE reaching `try_send` —
+        // which proves the pre-check gate is active (try_send alone
+        // would wait up to max_queue=10).
+        //
+        // 9 producers: worker consumes 1 (blocked in spawn_blocking),
+        // 8 remain in the channel buffer → depth = 10 − 2 = 8 ≥ 8.
+        // The 10th call is rejected at the pre-check gate. With only 8
+        // producers depth would be 7 < 8 and the 10th call would pass
+        // the gate, succeed try_send, then block on reply_rx forever
+        // (worker stuck) — the original hang (issue #123).
         use std::sync::atomic::{AtomicBool, Ordering};
         let handle = test_prometheus_handle();
         let name = "t_80pct";
@@ -1506,14 +1528,21 @@ mod tests {
         ));
         let before = read_queue_rejected(&handle.render(), name);
         let mut fillers = Vec::new();
-        for i in 0..8u32 {
+        for i in 0..9u32 {
             let bc = b.clone();
             fillers.push(tokio::spawn(
                 async move { bc.embed_tokens(tok(&[i])).await },
             ));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let rejected = b.embed_tokens(tok(&[99])).await;
+        // Safety net: if the gate logic regresses, fail fast
+        // instead of hanging the test runner (#123).
+        let rejected = tokio::time::timeout(
+            Duration::from_secs(5),
+            b.embed_tokens(tok(&[99])),
+        )
+        .await
+        .expect("embed_tokens hung — 80% gate did not reject (regression of #123)");
         assert!(
             matches!(rejected, Err(BatchError::QueueFull(_))),
             "expected QueueFull at 80% threshold, got: {rejected:?}"
