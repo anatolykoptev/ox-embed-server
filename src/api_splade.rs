@@ -200,8 +200,24 @@ pub async fn sparse_embeddings(
                 return server_error("splade failed: unexpected response kind".to_string());
             }
             Err(e) => {
+                use crate::supervisor::pool::DispatchError;
                 tracing::error!(model = %model_name, error = ?e, "worker_pool splade dispatch failed");
-                return server_error("splade failed".to_string());
+                // #97: dispatch timeout → 503 + Retry-After (transient).
+                let resp = match &e {
+                    DispatchError::Timeout { .. } => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        [("retry-after", "1")],
+                        Json(ErrorResponse {
+                            error: ErrorDetail {
+                                message: "splade failed: worker respawning".to_string(),
+                                error_type: "rate_limited",
+                            },
+                        }),
+                    )
+                        .into_response(),
+                    _ => server_error("splade failed".to_string()),
+                };
+                return resp;
             }
         }
     }

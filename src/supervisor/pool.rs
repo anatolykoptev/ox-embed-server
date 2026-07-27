@@ -13,6 +13,28 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
+/// Typed dispatch error — lets the API layer distinguish a transient
+/// "worker respawning" timeout (→ 503 + Retry-After, clients retry) from
+/// a hard inference failure (→ 500). Without this, `get_client` timeout
+/// was mapped to a generic `anyhow::Error` and surfaced as 500, breaking
+/// client retry logic (issue #97).
+#[derive(Debug, thiserror::Error)]
+pub enum DispatchError {
+    /// Worker for `model` not registered in the pool. Programmer error —
+    /// config/build issue, not transient.
+    #[error("no worker for model {model}")]
+    NoWorker { model: String },
+    /// Worker is respawning and did not become available within
+    /// `dispatch_timeout`. Transient — clients should retry after a
+    /// short backoff. Maps to HTTP 503 + Retry-After.
+    #[error("worker for model {model} unavailable after {timeout_secs}s (respawn in progress)")]
+    Timeout { model: String, timeout_secs: u64 },
+    /// Underlying IPC error (UDS read/write failure, frame decode error).
+    /// May be transient (worker crashed mid-dispatch) or permanent.
+    #[error(transparent)]
+    Ipc(#[from] std::io::Error),
+}
+
 // ── pool tuning defaults ───────────────────────────────────────────────────────
 
 /// Maximum time to wait for a respawning worker to become available.
@@ -62,12 +84,14 @@ impl WorkerPool {
     async fn get_client(
         &self,
         model: &str,
-    ) -> anyhow::Result<Arc<crate::ipc::client::WorkerClient>> {
+    ) -> Result<Arc<crate::ipc::client::WorkerClient>, DispatchError> {
         let supervisor = {
             let w = self.workers.read().await;
             w.get(model)
                 .cloned()
-                .ok_or_else(|| anyhow::anyhow!("no worker for model {model}"))?
+                .ok_or_else(|| DispatchError::NoWorker {
+                    model: model.to_string(),
+                })?
         };
 
         let deadline = std::time::Instant::now() + self.dispatch_timeout;
@@ -76,10 +100,10 @@ impl WorkerPool {
                 return Ok(client);
             }
             if std::time::Instant::now() >= deadline {
-                anyhow::bail!(
-                    "worker for model {model} unavailable after {}s (respawn in progress)",
-                    self.dispatch_timeout.as_secs()
-                );
+                return Err(DispatchError::Timeout {
+                    model: model.to_string(),
+                    timeout_secs: self.dispatch_timeout.as_secs(),
+                });
             }
             tokio::time::sleep(DISPATCH_POLL_INTERVAL).await;
         }
@@ -91,11 +115,12 @@ impl WorkerPool {
         model: &str,
         texts: Vec<String>,
         max_seq_len: u32,
-    ) -> anyhow::Result<WorkerResponse> {
+    ) -> Result<WorkerResponse, DispatchError> {
         let client = self.get_client(model).await?;
-        Ok(client
+        client
             .dispatch_embed(model.to_string(), texts, max_seq_len)
-            .await?)
+            .await
+            .map_err(DispatchError::Ipc)
     }
 
     /// Dispatch a rerank request to the worker registered for `model`.
@@ -105,11 +130,12 @@ impl WorkerPool {
         query: String,
         documents: Vec<String>,
         max_seq_len: u32,
-    ) -> anyhow::Result<WorkerResponse> {
+    ) -> Result<WorkerResponse, DispatchError> {
         let client = self.get_client(model).await?;
-        Ok(client
+        client
             .dispatch_rerank(model.to_string(), query, documents, max_seq_len)
-            .await?)
+            .await
+            .map_err(DispatchError::Ipc)
     }
 
     /// Dispatch a splade request to the worker registered for `model`.
@@ -120,11 +146,12 @@ impl WorkerPool {
         max_seq_len: u32,
         top_k: u32,
         min_weight: f32,
-    ) -> anyhow::Result<WorkerResponse> {
+    ) -> Result<WorkerResponse, DispatchError> {
         let client = self.get_client(model).await?;
-        Ok(client
+        client
             .dispatch_splade(model.to_string(), texts, max_seq_len, top_k, min_weight)
-            .await?)
+            .await
+            .map_err(DispatchError::Ipc)
     }
 
     /// Currently registered model names. Useful for /health, /metrics.
