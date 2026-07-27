@@ -311,11 +311,16 @@ async fn main() -> anyhow::Result<()> {
     let loaded = Arc::new(loaded);
     let semaphore = Arc::new(Semaphore::new(pool_size));
 
-    if socket_path.exists()
-        && let Err(e) = std::fs::remove_file(&socket_path)
-    {
-        tracing::error!(path = ?socket_path, error = %e, "stale socket cleanup failed");
-        return Err(e.into());
+    // Stale socket cleanup: if the UDS path exists from a previous worker
+    // instance, remove it before binding. Nested `if` (vs. collapsed
+    // `if X && let Err(e) = ...`) because the let-chain form requires Rust
+    // 2024 edition and this crate is on edition 2021.
+    #[allow(clippy::collapsible_if)]
+    if socket_path.exists() {
+        if let Err(e) = std::fs::remove_file(&socket_path) {
+            tracing::error!(path = ?socket_path, error = %e, "stale socket cleanup failed");
+            return Err(e.into());
+        }
     }
     let listener = UnixListener::bind(&socket_path)?;
     tracing::info!(kind = %loaded.kind(), "worker ready");

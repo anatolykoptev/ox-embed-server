@@ -114,7 +114,10 @@ impl MlockedSession {
     pub fn new_without_mlock(session: Session) -> Self {
         Self {
             session,
-            _buf: MlockedBuf { buf: vec![], locked: false },
+            _buf: MlockedBuf {
+                buf: vec![],
+                locked: false,
+            },
         }
     }
 }

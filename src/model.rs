@@ -4,16 +4,16 @@ use std::time::Instant;
 
 use ndarray::Array2;
 use ort::ep;
-use ort::session::builder::GraphOptimizationLevel;
 use ort::session::RunOptions;
 use ort::session::Session;
+use ort::session::builder::GraphOptimizationLevel;
 use ort::value::Tensor;
-use tokenizers::utils::truncation::{TruncationDirection, TruncationParams, TruncationStrategy};
 use tokenizers::Tokenizer;
+use tokenizers::utils::truncation::{TruncationDirection, TruncationParams, TruncationStrategy};
 
 use crate::config::ModelDef;
 use crate::evictable_pool::{AcquireError, EvictablePool};
-use crate::mlock::{read_and_mlock, MlockedSession};
+use crate::mlock::{MlockedSession, read_and_mlock};
 use crate::onnx_cache::{self, CacheDir, LoadPlan};
 use crate::pool;
 
