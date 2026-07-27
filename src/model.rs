@@ -833,9 +833,23 @@ fn build_one_session(
     let builder = Session::builder().map_err(|e| format!("session builder: {e}"))?;
     let builder = onnx_cache::apply_plan(builder, &plan, opt_level)
         .map_err(|e| format!("apply cache plan: {e}"))?;
+    let allow_spinning = crate::arena::parse_intra_op_spinning();
     let mut builder = builder
         .with_intra_threads(intra_threads)
         .map_err(|e| format!("set threads: {e}"))?
+        // Gate ORT's intra-op spin via env (ORT_INTRA_OP_SPINNING, default
+        // false). `OMP_WAIT_POLICY=PASSIVE` only governs OpenMP, NOT ORT's
+        // own intra pool — explicit `with_intra_op_spinning(false)` is the
+        // only way to stop the spin on a shared multi-tenant CPU. See
+        // arena::parse_intra_op_spinning for the full rationale.
+        .with_intra_op_spinning(allow_spinning)
+        .map_err(|e| format!("set intra spinning: {e}"))?
+        // Inter-op parallelism: BERT-family encoders are largely sequential
+        // (attention -> FFN -> norm), so inter-op threads yield no benefit
+        // and over-subscribe the 4-core CPU. ORT defaults inter_op_num_threads
+        // to the intra-op count; pinning to 1 eliminates the over-subscription.
+        .with_inter_threads(1)
+        .map_err(|e| format!("set inter threads: {e}"))?
         .with_memory_pattern(memory_pattern)
         .map_err(|e| format!("enable memory pattern: {e}"))?
         // Use the shared env-level arena registered in arena.rs.

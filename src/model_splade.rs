@@ -166,9 +166,17 @@ impl SpladeModel {
             let builder = Session::builder().map_err(|e| format!("session builder #{i}: {e}"))?;
             let builder = onnx_cache::apply_plan(builder, &plan, opt_level)
                 .map_err(|e| format!("apply cache plan #{i}: {e}"))?;
+            let allow_spinning = crate::arena::parse_intra_op_spinning();
             let mut builder = builder
                 .with_intra_threads(intra_threads)
                 .map_err(|e| format!("set threads #{i}: {e}"))?
+                // Gate ORT's intra-op spin (ORT_INTRA_OP_SPINNING, default
+                // false). See arena::parse_intra_op_spinning for rationale.
+                .with_intra_op_spinning(allow_spinning)
+                .map_err(|e| format!("set intra spinning #{i}: {e}"))?
+                // Inter-op threads: 1 (see model.rs for rationale).
+                .with_inter_threads(1)
+                .map_err(|e| format!("set inter threads #{i}: {e}"))?
                 // memory_pattern: per-model knob parsed from env at load time.
                 .with_memory_pattern(memory_pattern)
                 .map_err(|e| format!("enable memory pattern #{i}: {e}"))?
