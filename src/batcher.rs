@@ -280,7 +280,7 @@ impl DynamicBatcher {
     /// Backpressure: when the current queue depth is ≥ 80% of `max_queue`,
     /// this returns `BatchError::QueueFull` **before** enqueueing, instead
     /// of waiting for a slot. Fast-fail keeps p95 latency predictable
-    /// under overload and lets E1 retry-with-exp-backoff (memdb-go side)
+    /// under overload and lets E1 retry-with-exp-backoff (the downstream consumer side)
     /// reschedule the request. The handler maps `QueueFull` to HTTP 429
     /// with `Retry-After: 1`.
     ///

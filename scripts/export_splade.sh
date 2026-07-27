@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-OUT="${OUT:-/home/krolik/deploy/krolik-server/models/splade-v3-distilbert}"
+OUT="${OUT:-./models/splade-v3-distilbert}"
 VENV="${VENV:-/tmp/venv-embed-export}"
 
 mkdir -p "$OUT"

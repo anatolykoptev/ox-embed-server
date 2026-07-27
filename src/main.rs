@@ -330,7 +330,7 @@ async fn main() {
                 std::process::exit(1);
             });
             // Pre-warm at every configured embed batch shape (default `[1, 8]`
-            // — covers trivial single-text callers AND memdb-go's
+            // — covers trivial single-text callers AND the downstream consumer's
             // texts_per_req=8 default). Best-effort: per-shape errors log a
             // warn and the next shape proceeds. Override via
             // `EMBED_WARMUP_BATCH_SIZES`.
@@ -430,7 +430,7 @@ async fn main() {
             // pay graph compile + arena alloc cost (~3s observed on cold
             // gte-multi-rerank vs ~1.5s steady state). Default shape list is
             // `[1, 5]` — batch=1 covers the static fast-path single-pair
-            // calls, batch=5 covers memdb-go's D7 sub-query fanout default.
+            // calls, batch=5 covers the downstream consumer's D7 sub-query fanout default.
             // Override via `RERANK_WARMUP_BATCH_SIZES`. Best-effort:
             // warmup failure is logged but does not abort boot — the
             // server still serves correctly without it.
@@ -586,7 +586,7 @@ async fn main() {
 
     // Per-pair tokenizer cache (H.7). Default TOKEN_CACHE_MAX_ENTRIES=0
     // (disabled) — existing deployments see no behaviour change. A positive
-    // value amortizes ~50ms tokenizer calls when memdb-go's D7 sub-query
+    // value amortizes ~50ms tokenizer calls when the downstream consumer's D7 sub-query
     // rewrites re-score the same (query, doc) pairs.
     let token_cache = Arc::new(TokenCache::new(cfg.token_cache_max_entries));
     // Pre-warm hit+miss counters for every loaded reranker model so
@@ -649,8 +649,8 @@ async fn main() {
     // Spawn worker pool if multi-process mode is enabled.
     // All workers (embed + rerank + splade) launch in parallel via tokio::spawn —
     // each spawn awaits its UDS socket independently (cold model load ~5-15s per
-    // model). Sequential await would add 30-50s to startup and trip dozor's
-    // smoke-test deadline (canary_smoke_timeout=120s in deploy-repos.yaml).
+    // model). Sequential await would add 30-50s to startup and trip the deployment system's
+    // smoke-test deadline (canary smoke timeout = 120s).
     let worker_pool: Option<Arc<crate::supervisor::WorkerPool>> = if cfg.multi_process {
         tracing::info!(
             "multi-process mode enabled — spawning worker pool (in-process sessions skipped)"
@@ -734,7 +734,7 @@ async fn main() {
         //   long before its spawn, giving the previous worker's ONNX read a
         //   head-start on pagecache warm-up.
         //   Set to 0 to disable (parallel cold-load, original behaviour).
-        //   dozor smoke timeout is 120s; 4 workers × 2s = 6s overhead — well within budget.
+        //   the deployment system's smoke timeout is 120s; 4 workers × 2s = 6s overhead — well within budget.
         let spawn_stagger =
             crate::supervisor::util::resolve_spawn_stagger_ms("EMBED_WORKER_SPAWN_DELAY_MS", 2000);
         let total_workers = specs.len();
@@ -880,7 +880,7 @@ async fn main() {
             axum::routing::post(api_splade::sparse_embeddings),
         )
         // Phase H.18 — every request gets a root span linked to the
-        // upstream caller's trace via W3C traceparent (memdb-go sets it
+        // upstream caller's trace via W3C traceparent (the downstream consumer sets it
         // on every outbound /v1/* call). /health and /metrics also get
         // spans, but at default sampling (5 %) they're effectively
         // free; can exclude via env-driven sampler if it ever matters.

@@ -11,7 +11,7 @@ Per-process arena = per-model. Worker for `jina-code-v2` has its own arena, not 
 ## Topology
 
 ```
-  HTTP clients (memdb-go, go-code, go-nerv, etc.)
+  HTTP clients (downstream consumers, etc.)
                           │
                           ▼
                 ┌─────────────────────┐
@@ -122,7 +122,7 @@ Host-level: swap usage dropped from 15 GiB pegged (pre-refactor jina arena thras
 | `embed_requests_total{model,status}` | counter | Shared with legacy path. |
 | `embed_inference_duration_seconds{model}` | histogram | **Supervisor (`:8082`).** Full `dispatch_embed` round-trip — UDS connect + worker queue wait + ONNX. Pre-existing; do NOT emit this name from the worker recorder (collides under Prometheus `sum by (model, le)`, breaks the per-model latency alerts). |
 | `embed_worker_inference_duration_seconds{model}` | histogram | **Worker recorder.** Pure ONNX forward pass only (permit acquired → response). Embed path only. Subtract from the supervisor round-trip, or compare to the queue-wait series, to isolate model speed from queue depth. |
-| `embed_worker_queue_wait_duration_seconds{model}` | histogram | **Worker recorder.** Head-of-line queue wait (UDS frame read → inference permit acquired). For jina-code-v2 (pool=1) this is the term that grows under a fleet auto-index burst and trips the go-code client header-timeout. |
+| `embed_worker_queue_wait_duration_seconds{model}` | histogram | **Worker recorder.** Head-of-line queue wait (UDS frame read → inference permit acquired). For jina-code-v2 (pool=1) this is the term that grows under a fleet auto-index burst and trips the the downstream consumer client header-timeout. |
 | `embed_worker_batch_size{model}` | histogram | **Worker recorder.** Embed-path batch size paired with `embed_worker_inference_duration_seconds`. |
 | `embed_worker_queue_depth{model}` | gauge | **Worker recorder.** In-flight waiter count per worker process. |
 | `embed_build_info{version}` | gauge | Set to `EMBED_VERSION` env, default `phase-2-multi-process`. |
@@ -130,18 +130,18 @@ Host-level: swap usage dropped from 15 GiB pegged (pre-refactor jina arena thras
 
 Worker-side metrics ARE exposed since PR #75: each worker binds its own
 Prometheus exporter on `EMBED_WORKER_METRICS_PORT` (scrape job
-`embed-server-workers` in `krolik-server/config/prometheus.yml`, one target per
+`embed-server-workers` in `the deploy repo/config/prometheus.yml`, one target per
 worker index). The `embed_worker_*` series above live there, NOT on the
 supervisor `:8082`. Per-process RSS is still observable via `docker top` +
 `/proc/<pid>/status`.
 
 ## Deploy + rollback
 
-Enable: `EMBED_MULTI_PROCESS=1` in `~/deploy/krolik-server/compose/memdb.yml` (live default since 2026-05-12).
+Enable: `EMBED_MULTI_PROCESS=1` in `~/deploy/the deploy repo/compose/memdb.yml` (live default since 2026-05-12).
 
 Disable: set to `"0"` and `docker compose up -d --no-deps --force-recreate embed-server`. Behaviour reverts byte-identical to pre-2026-05-12 monolith — in-process `EmbedModel`/`RerankerModel`/`SpladeModel` handle inference, workers don't spawn.
 
-Image: dozor rebuilds on every push to `main` (~3 min). Smoke timeout was tuned to 120 s (was 30 s, caused false-rollback before parallel worker spawn landed in PR #61).
+Image: the deployment system rebuilds on every push to `main` (~3 min). Smoke timeout was tuned to 120 s (was 30 s, caused false-rollback before parallel worker spawn landed in PR #61).
 
 ## Related files
 
@@ -155,8 +155,8 @@ Image: dozor rebuilds on every push to `main` (~3 min). Smoke timeout was tuned 
 | `src/ipc/frame.rs` | postcard frame codec |
 | `src/main.rs` | Parallel worker spawn in `main()` |
 | `src/api*.rs` | Handler dispatch through `worker_pool` |
-| `docs/superpowers/plans/2026-05-12-multi-process-refactor.md` | Original implementation plan + execution log |
-| `docs/runbook.md` | Operational symptoms + responses |
+| `docs/architecture/multi-process.md` | Original implementation plan + execution log |
+| `docs/BUGS.md` | Operational symptoms + responses |
 | `docs/BUGS.md` | BUG-004 (motivating incident) |
 
 ## History

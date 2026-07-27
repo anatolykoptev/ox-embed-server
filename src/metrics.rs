@@ -42,7 +42,7 @@ pub fn apply_histogram_buckets(builder: PrometheusBuilder) -> PrometheusBuilder 
     // Max for e5-large: 8 × 256 = 2048; for jina: 8 × 512 = 4096; BATCH_MAX_TOKENS cap = 8192.
     let batch_tokens_matcher =
         metrics_exporter_prometheus::Matcher::Full("embed_batch_tokens".to_string());
-    // Texts per HTTP request: go-search sends 1-50, bulk ingest up to ~1500.
+    // Texts per HTTP request: the downstream consumer sends 1-50, bulk ingest up to ~1500.
     let texts_per_req_matcher =
         metrics_exporter_prometheus::Matcher::Full("embed_texts_per_request".to_string());
     // Pairs per /v1/rerank request: typically CROSS_ENCODER_MAX_DOCS = 15.
@@ -1034,8 +1034,8 @@ pub fn record_input_array_rejected(model: &str, reason: &str) {
 /// natural distribution and tune `EMBED_MAX_INPUT_ARRAY` accordingly.
 ///
 /// Histogram buckets: `[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, +Inf]`.
-/// These capture both the happy path (1-32 texts from go-search) and the
-/// pathological 100-text memdb-go batches that caused the BFCArena OOM.
+/// These capture both the happy path (1-32 texts from the downstream consumer) and the
+/// pathological 100-text batches from the downstream consumer that caused the BFCArena OOM.
 pub fn record_input_array_size(model: &str, n: usize) {
     metrics::histogram!(
         "embed_input_array_size",

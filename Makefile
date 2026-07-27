@@ -1,5 +1,5 @@
 SHELL := /bin/bash
-.PHONY: build build-debug test test-doc lint fmt clippy deny ci all deploy logs logs-clean help
+.PHONY: build build-debug test test-doc lint fmt clippy deny ci all logs logs-clean help
 
 # Production-grade build matrix used by CI-equivalent local check.
 # `--locked` catches Cargo.lock drift (real incident 2026-05-02).
@@ -9,7 +9,7 @@ SHELL := /bin/bash
 #   * tees stdout+stderr into a per-stage log under /tmp/embed-server-ci
 #   * stops the chain on first failure (`set -o pipefail` inside)
 #   * stamps elapsed seconds at the end
-# This mirrors dozor's deploy pattern (logfile per phase + status notify).
+# This mirrors the deployment system's deploy pattern (logfile per phase + status notify).
 
 CI_STAGE := scripts/ci-stage.sh
 LOGDIR ?= /tmp/embed-server-ci
@@ -49,11 +49,6 @@ ci: lint deny test build
 
 all: ci
 
-deploy:
-	cd ~/deploy/krolik-server && \
-	docker compose build --no-cache embed-server && \
-	docker compose up -d --no-deps --force-recreate embed-server
-
 # Show the most recent log for each stage. After a `make ci` run,
 # operators can grep across all phases with `make logs | less`.
 logs:
@@ -84,4 +79,3 @@ help:
 	@echo
 	@echo "  make logs         — tail last log per stage from $(LOGDIR)"
 	@echo "  make logs-clean   — wipe $(LOGDIR)"
-	@echo "  make deploy       — manual docker compose rebuild (dozor handles this on push to main)"

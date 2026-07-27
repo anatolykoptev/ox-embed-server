@@ -292,7 +292,7 @@ impl RerankerModel {
     /// actual content is shorter (lose padding-waste advantage of the
     /// dynamic path). The static-graph per-call speedup offsets this
     /// for typical seq>=64. The {b=1, b=5} default policy assumes
-    /// memdb-go's realistic shape, where `MaxCharsPerDoc=0` means real
+    /// the downstream consumer's realistic shape, where `MaxCharsPerDoc=0` means real
     /// docs frequently saturate the 256-token cap anyway.
     ///
     /// Caller (`score_pairs`) does the exact-match lookup and supplies
@@ -370,7 +370,7 @@ impl RerankerModel {
     /// cost (~3s observed for gte-multi-rerank cold, vs ~1.5s steady) —
     /// a tail-latency spike that's pure boot-time work and that ALSO
     /// re-fires when production traffic shifts to a new batch size
-    /// (e.g. memdb-go's batch=5 fanout vs batch=1 single-pair calls).
+    /// (e.g. the downstream consumer's batch=5 fanout vs batch=1 single-pair calls).
     ///
     /// `shapes` is a list of batch sizes (operator-controlled via
     /// `RERANK_WARMUP_BATCH_SIZES`). For each shape `B` we synthesise

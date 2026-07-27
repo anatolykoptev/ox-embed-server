@@ -89,7 +89,7 @@ pub fn assert_arena_registered_before_session() {
 ///   S=512) allocates ~400 MiB attention scratch + matmul buffers that
 ///   kSameAsRequested never shrinks between calls. Grows monotonically
 ///   to the cap set here. Compose sets cap = 3 GiB (PR #98,
-///   krolik-server).
+///   the deploy repo).
 /// - Note: PR #46 precomputed ALiBi constants, eliminating
 ///   the 1.258 GiB per-call scratch that previously caused jina-code-v2
 ///   to require ~1.5 GiB of arena per inference call.
@@ -100,12 +100,12 @@ pub fn assert_arena_registered_before_session() {
 /// under sustained large-batch jina-code-v2 load.
 ///
 /// **Operator action before rolling out this default:**
-/// Bump `compose/memdb.yml` embed-server `deploy.resources.limits.memory`
+/// Bump the compose file's embed-server `deploy.resources.limits.memory`
 /// to `12288M` (12 GiB = ~2 GiB resident + 6 GiB arena + ~4 GiB safety).
 ///
 /// **Alternative for 8 GiB hosts:**
 /// Set `EMBED_ARENA_MAX_MEM_BYTES=3221225472` (3 GiB, prod value per PR #98
-/// in krolik-server) — keeps arena + resident under the 8 GiB ceiling with
+/// in the deploy repo) — keeps arena + resident under the 8 GiB ceiling with
 /// headroom, but caps throughput on large jina-code-v2 batches. Reduce
 /// `BATCH_MAX_TOKENS` accordingly if 92% error rate reappears (FU-24).
 ///

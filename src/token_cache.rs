@@ -8,9 +8,9 @@
 //! half independently and glue it together later. Therefore the cache key
 //! is `(model, query, doc)` expressed as `(model_name, sha256(query ∥ "\0" ∥ doc))`.
 //!
-//! The D7 sub-query rewrite in memdb-go re-issues the same top-N docs
+//! The D7 sub-query rewrite in the downstream consumer re-issues the same top-N docs
 //! against multiple rephrased queries. A per-pair cache still wins here
-//! when memdb-go re-scores the same `(query_variant, doc)` pair — which
+//! when the downstream consumer re-scores the same `(query_variant, doc)` pair — which
 //! happens when the query rewrites are near-duplicates or when the same
 //! documents appear across independent search sessions.
 //!

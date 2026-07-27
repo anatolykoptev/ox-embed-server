@@ -538,8 +538,9 @@ mod tests {
     }
 
     fn load_splade_or_skip_with_pool(pool_size: usize) -> Option<SpladeModel> {
-        const DEFAULT_DIR: &str = "/home/krolik/deploy/krolik-server/models/splade-v3-distilbert";
-        let dir = std::env::var("SPLADE_TEST_DIR").unwrap_or_else(|_| DEFAULT_DIR.to_string());
+        let default_dir = std::env::var("TEST_SPLADE_DIR")
+            .unwrap_or_else(|_| "/models/splade-v3-distilbert".to_string());
+        let dir = std::env::var("SPLADE_TEST_DIR").unwrap_or(default_dir);
         if !Path::new(&dir).join("tokenizer.json").exists()
             || !Path::new(&dir).join("model.onnx").exists()
         {

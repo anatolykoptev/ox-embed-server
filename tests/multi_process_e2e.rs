@@ -6,7 +6,7 @@
 //! green in CI.
 //!
 //! Run with real model:
-//!   EMBED_MODELS="multilingual-e5-large:/home/krolik/deploy/krolik-server/models/multilingual-e5-large:1024:256:1:false" \
+//!   EMBED_MODELS="multilingual-e5-large:/models/multilingual-e5-large:1024:256:1:false" \
 //!   ORT_DYLIB_PATH=/usr/lib/libonnxruntime.so \
 //!   cargo nextest run --locked --test multi_process_e2e
 

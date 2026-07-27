@@ -6,7 +6,7 @@
 //! `embed_rerank_*` histograms etc.) but those are post-hoc averages.
 //! When debugging a slow chat turn the operator wants to see the EXACT
 //! request that took 12 s, not "p99 was 8 s in the last 5 min". OTEL
-//! traces give per-request span trees correlated with memdb-go's
+//! traces give per-request span trees correlated with the downstream consumer's
 //! existing OTEL spans via the W3C `traceparent` header — so a single
 //! Jaeger query on a chat trace_id surfaces the embed-server span tree
 //! inline with the upstream search, retrieval, and LLM-extract spans.
@@ -19,7 +19,7 @@
 //! - `extract_remote_context` reads the W3C `traceparent` (and optional
 //!   `tracestate`) headers off an axum `HeaderMap`, returning a
 //!   `tracing::Span` that should be set as the parent of the request
-//!   span. This is the link between memdb-go's outgoing trace and our
+//!   span. This is the link between the downstream consumer's outgoing trace and our
 //!   span tree.
 //!
 //! ## What stays disabled
@@ -29,7 +29,7 @@
 //!   the pre-Phase-H.18 baseline. CI / local dev / non-Jaeger envs see
 //!   no change.
 //! - Sampling defaults to `parentbased_traceidratio=0.05` (5 %) when
-//!   the env var is unset, matching memdb-go's setting. Override via
+//!   the env var is unset, matching the downstream consumer's setting. Override via
 //!   `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG` per the spec.
 
 use std::time::Duration;

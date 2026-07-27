@@ -4,5 +4,5 @@ target/
 __pycache__/
 *.pyc
 
-# Off-box static-shape ONNX export output (never committed; rsync'd to pillow)
+# Off-box static-shape ONNX export output (never committed)
 code-rank-embed-static/

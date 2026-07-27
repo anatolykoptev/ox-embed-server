@@ -1,10 +1,10 @@
 # embed-server Roadmap
 
-Status of the multi-model Rust inference sidecar on the `krolik` server. Updated as phases ship.
+Status of the multi-model Rust inference sidecar on the production host. Updated as phases ship.
 
-**Live**: `http://embed-server:8082` inside the Docker network, `127.0.0.1:8082` on host. Auto-deployed via dozor webhook on every push to `main`.
+**Live**: `http://embed-server:8082` inside the Docker network, `127.0.0.1:8082` on host. Auto-deployed via the deployment system on every push to `main`.
 
-**Related doc**: `docs/plans/2026-04-18-embed-server-phase-2.md` — detailed, task-level implementation plan for Phases C–G.
+**Related doc**: `docs/ROADMAP.md` — detailed, task-level implementation plan for Phases C–G.
 
 ---
 
@@ -21,7 +21,7 @@ Supervisor + N worker child processes (one per ONNX model). Each worker owns iso
 - bincode → postcard (RUSTSEC-2025-0141, upstream unmaintained).
 - Dockerfile ships both binaries (`embed-server` + `embed-worker`) via `cargo build --bins`.
 
-Architecture: `docs/architecture/multi-process.md`. Implementation log: `docs/superpowers/plans/2026-05-12-multi-process-refactor.md`.
+Architecture: `docs/architecture/multi-process.md`. Implementation log: `docs/architecture/multi-process.md`.
 
 **Live**: prod compose has `EMBED_MULTI_PROCESS=1` since 2026-05-12. Disable: set to `"0"` + `docker compose up -d --no-deps --force-recreate embed-server` (byte-identical fallback).
 
@@ -52,7 +52,7 @@ Architecture: `docs/architecture/multi-process.md`. Implementation log: `docs/su
 
 **Observed metrics (post-deploy)**: padding waste 5-10% — batcher correctly avoids long+short mixing.
 
-### Phase E — `/v1/rerank` endpoint + BGE reranker integration ([PR #12](https://github.com/anatolykoptev/ox-embed-server/pull/12))
+### Phase E — `/v1/rerank` endpoint + BGE reranker integration ([PR #12](https://github.com/ox/embed-server/pull/12))
 - `RerankerModel` struct (parallel to `EmbedModel`), reuses Phase B batcher semantics for `(query, doc)` pair coalescing.
 - `RERANKER_MODELS=bge-reranker-v2-m3:/models-reranker:512:true` env parsing.
 - Endpoint `POST /v1/rerank` — Cohere-compatible JSON: `{model?, query, documents, top_n?}` → `{model, results: [{index, relevance_score}]}` sorted DESC.
@@ -65,13 +65,13 @@ Architecture: `docs/architecture/multi-process.md`. Implementation log: `docs/su
 
 ## 🔜 Next up
 
-Rough effort = **focused implementation hours** (not calendar time — each phase adds CI wait + dozor build ≈ +5 min overhead).
+Rough effort = **focused implementation hours** (not calendar time — each phase adds CI wait + the deployment system build ≈ +5 min overhead).
 
 ---
 
 ## Phase H — Karpathy throughput sprint (2026-05-01 added)
 
-Findings from competitive research (TEI, Infinity, vLLM) + ML expert review during memdb-go LoCoMo eval session. Server is **already best-in-class on ARM ONNX + INT8** per competitive audit; remaining gains come from *application-level* features and *model-level* swaps, NOT batcher microopts.
+Findings from competitive research (TEI, Infinity, vLLM) + ML expert review during the downstream consumer LoCoMo eval session. Server is **already best-in-class on ARM ONNX + INT8** per competitive audit; remaining gains come from *application-level* features and *model-level* swaps, NOT batcher microopts.
 
 ### H.1 — `RERANKER_BATCH_MAX` env (separate from embed `BATCH_MAX`) ✅ shipped 2026-05-01
 - **Why**: shared `batch_max=8` cap blocked rerank coalescing — 5-doc payloads instantly hit cap, killed concurrent throughput
@@ -94,7 +94,7 @@ Findings from competitive research (TEI, Infinity, vLLM) + ML expert review duri
 - **Why**: 149M params (3.8× smaller than gte-multi 568M) + 8192 max_seq_len (vs 256, eliminates silent doc truncation) + matches 1.2B Nemotron quality
 - **Where**: `RERANKER_MODELS` env now lists both — gte-multi (legacy) + gte-modernbert
 - **Files**: `models/gte-reranker-modernbert-base/{config,tokenizer,model_quantized}.{json,onnx}` (151MB INT8 from Alibaba's HF repo)
-- **Switch**: set `CROSS_ENCODER_MODEL=gte-modernbert` in memdb-go env
+- **Switch**: set `CROSS_ENCODER_MODEL=gte-modernbert` in the downstream consumer env
 
 ### H.5 — Length-sorted batch packing (Infinity pattern) — TODO
 - **Effort**: ~150 LOC + tests
@@ -117,7 +117,7 @@ Findings from competitive research (TEI, Infinity, vLLM) + ML expert review duri
 
 ### H.8 — Combined `/v1/retrieve_and_rerank` endpoint — TODO
 - **Effort**: ~200 LOC
-- **What**: Single endpoint accepts query + dense_emb + sparse_emb + candidate_docs → server does RRF fusion + CE rerank. Saves 3 HTTP RTT per memdb-go search
+- **What**: Single endpoint accepts query + dense_emb + sparse_emb + candidate_docs → server does RRF fusion + CE rerank. Saves 3 HTTP RTT per the downstream consumer search
 - **Payoff**: 30-100ms × D7 fanout (~3 sub-queries) = 90-300ms p95 reduction per chat turn
 - **Risk**: API contract addition; backwards-compat trivial (new endpoint)
 
@@ -145,7 +145,7 @@ Findings from competitive research (TEI, Infinity, vLLM) + ML expert review duri
 ### H.13 — gRPC endpoint — TODO (low priority)
 - **Effort**: ~200 LOC
 - **What**: tonic-based gRPC for `/v1/rerank` + `/v1/embeddings`
-- **Payoff**: ~30% wire overhead reduction. Useful only if memdb-go QPS scales 10×
+- **Payoff**: ~30% wire overhead reduction. Useful only if the downstream consumer QPS scales 10×
 
 ### H.14 — IO binding (ORT pre-allocated tensors) — TODO
 - **Effort**: ~80 LOC
@@ -175,16 +175,16 @@ Findings from competitive research (TEI, Infinity, vLLM) + ML expert review duri
 #### Phase D — Response cache
 **Effort**: ~3-4 h
 **What**: LRU `HashMap<(String model, [u8; 32] sha256), Vec<f32>>` in a new `src/cache.rs` module. Wire into `api.rs` ahead of the batcher: hit → return instantly, miss → normal path + populate. Env `CACHE_MAX_ENTRIES=10000` (default).
-**Payoff**: MemDB re-queries the same memory search strings a lot — cache hit turns a ~200ms forward pass into a ~1ms lookup. Expected hit rate on production ≥15 %.
+**Payoff**: the downstream consumer re-queries the same memory search strings a lot — cache hit turns a ~200ms forward pass into a ~1ms lookup. Expected hit rate on production ≥15 %.
 **Risk**: low — isolated module, pure memoization, deterministic embeddings.
 
 ---
 
 ### Priority 2 — ~7-10 h
 
-#### MemDB integration of reranker (separate repo, `anatolykoptev/MemDB`)
+#### the downstream consumer integration of reranker (separate repo, the downstream consumer repo)
 **Effort**: ~3-4 h
-**What**: In `memdb-go`, after retrieving top-50 by embedding, POST to `http://embed-server:8082/v1/rerank`. Flag `MEMDB_RERANKER_ENABLED` for safe rollout.
+**What**: In `the downstream consumer`, after retrieving top-50 by embedding, POST to `http://embed-server:8082/v1/rerank`. Flag `RERANKER_ENABLED` for safe rollout.
 **Dependency**: Phase E shipped ✅.
 
 #### Phase C — Length bucketing
@@ -199,7 +199,7 @@ Findings from competitive research (TEI, Infinity, vLLM) + ML expert review duri
 #### Phase G — `/v1/sparse` endpoint + SPLADE integration
 **Effort**: ~4-6 h
 **What**: `SparseModel` → token-weight map. Endpoint returns `{tokens: [[id, weight], ...]}`. Useful for hybrid retrieval.
-**Payoff**: In go-code and MemDB, replace or complement the current keyword/BM25 half of hybrid RRF. +5-10 % recall on technical content (exact-term matching).
+**Payoff**: In the downstream consumer and the downstream consumer, replace or complement the current keyword/BM25 half of hybrid RRF. +5-10 % recall on technical content (exact-term matching).
 
 #### Phase F — `/v1/ner` endpoint + GLiNER integration
 **Effort**: ~5-7 h (≈2 h just to re-export ONNX properly)
@@ -207,7 +207,7 @@ Findings from competitive research (TEI, Infinity, vLLM) + ML expert review duri
 - Export GLiNER to ONNX via `torch.onnx.export` (the `gliner.save_pretrained(save_onnx=True)` path only wrote pytorch weights)
 - `TokenClassifierModel` struct
 - Endpoint accepts arbitrary labels in the request; returns spans
-**Payoff**: Auto-structure MemDB memories into `{people, projects, technologies, dates, decisions}` — memory becomes a graph.
+**Payoff**: Auto-structure the downstream consumer memories into `{people, projects, technologies, dates, decisions}` — memory becomes a graph.
 
 ---
 
@@ -216,7 +216,7 @@ Findings from competitive research (TEI, Infinity, vLLM) + ML expert review duri
 | Scope | Hours | Calendar |
 |---|---|---|
 | P1 only (polish + cache) | 5-7 h | ~1 day |
-| P1 + P2 (+ MemDB wire-up + bucketing) | 12-17 h | ~2 days |
+| P1 + P2 (+ the downstream consumer wire-up + bucketing) | 12-17 h | ~2 days |
 | Everything through P3 | 21-30 h | ~4-5 days |
 
 ---
