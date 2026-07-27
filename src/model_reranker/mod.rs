@@ -411,6 +411,7 @@ impl RerankerModel {
                     error = %e,
                     "reranker shape warmup failed (continuing with remaining shapes)"
                 );
+                crate::metrics::record_warmup_failed(&self.name, "shape");
             }
         }
         Ok(())
@@ -483,13 +484,16 @@ impl RerankerModel {
                     elapsed_ms = start.elapsed().as_millis() as u64,
                     "reranker session warmed"
                 ),
-                Err(e) => tracing::error!(
-                    model = %self.name,
-                    session = i,
-                    batch,
-                    error = %e,
-                    "reranker session warmup failed (continuing)"
-                ),
+                Err(e) => {
+                    tracing::error!(
+                        model = %self.name,
+                        session = i,
+                        batch,
+                        error = %e,
+                        "reranker session warmup failed (continuing)"
+                    );
+                    crate::metrics::record_warmup_failed(&self.name, "session");
+                }
             }
         }
         Ok(())

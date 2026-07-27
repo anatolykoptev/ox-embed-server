@@ -536,6 +536,7 @@ impl EmbedModel {
                     error = %e,
                     "embed shape warmup failed (continuing with remaining shapes)"
                 );
+                crate::metrics::record_warmup_failed(name, "shape");
             }
         }
         Ok(())
@@ -681,13 +682,16 @@ impl EmbedModel {
                     elapsed_ms = start.elapsed().as_millis() as u64,
                     "embed session warmed"
                 ),
-                Err(e) => tracing::error!(
-                    model = %name,
-                    session = i,
-                    batch,
-                    error = %e,
-                    "embed session warmup failed (continuing)"
-                ),
+                Err(e) => {
+                    tracing::error!(
+                        model = %name,
+                        session = i,
+                        batch,
+                        error = %e,
+                        "embed session warmup failed (continuing)"
+                    );
+                    crate::metrics::record_warmup_failed(name, "session");
+                }
             }
         }
         Ok(())

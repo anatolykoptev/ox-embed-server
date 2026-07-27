@@ -461,6 +461,7 @@ impl SpladeModel {
                     error = %e,
                     "splade shape warmup failed (continuing with remaining shapes)"
                 );
+                crate::metrics::record_warmup_failed(&self.name, "shape");
             }
         }
         Ok(())
@@ -514,13 +515,16 @@ impl SpladeModel {
                     elapsed_ms = start.elapsed().as_millis() as u64,
                     "splade session warmed"
                 ),
-                Err(e) => tracing::error!(
-                    model = %self.name,
-                    session = i,
-                    batch,
-                    error = %e,
-                    "splade session warmup failed (continuing)"
-                ),
+                Err(e) => {
+                    tracing::error!(
+                        model = %self.name,
+                        session = i,
+                        batch,
+                        error = %e,
+                        "splade session warmup failed (continuing)"
+                    );
+                    crate::metrics::record_warmup_failed(&self.name, "session");
+                }
             }
         }
         Ok(())
