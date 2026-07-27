@@ -252,18 +252,35 @@ pub async fn embeddings(
                     .into_response();
             }
             Err(e) => {
+                use crate::supervisor::pool::DispatchError;
                 tracing::error!(model = %model_name, error = ?e, "worker_pool dispatch failed");
                 crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: ErrorDetail {
-                            message: "inference failed".to_string(),
-                            error_type: "server_error",
-                        },
-                    }),
-                )
-                    .into_response();
+                // #97: dispatch timeout (worker respawning) is transient →
+                // 503 + Retry-After so clients retry instead of treating it
+                // as a hard 500 failure.
+                return match &e {
+                    DispatchError::Timeout { .. } => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        [("retry-after", "1")],
+                        Json(ErrorResponse {
+                            error: ErrorDetail {
+                                message: "inference failed: worker respawning".to_string(),
+                                error_type: "rate_limited",
+                            },
+                        }),
+                    )
+                        .into_response(),
+                    _ => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: ErrorDetail {
+                                message: "inference failed".to_string(),
+                                error_type: "server_error",
+                            },
+                        }),
+                    )
+                        .into_response(),
+                };
             }
         };
         (vectors, estimated_total_tokens)

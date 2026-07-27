@@ -462,8 +462,24 @@ pub async fn rerank(
                 );
             }
             Err(e) => {
+                use crate::supervisor::pool::DispatchError;
                 tracing::error!(model = %model_name, error = ?e, "worker_pool rerank dispatch failed");
-                finish!("server_error", server_error("rerank failed".to_string()));
+                // #97: dispatch timeout → 503 + Retry-After (transient).
+                let resp = match &e {
+                    DispatchError::Timeout { .. } => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        [("retry-after", "1")],
+                        Json(ErrorResponse {
+                            error: ErrorDetail {
+                                message: "rerank failed: worker respawning".to_string(),
+                                error_type: "rate_limited",
+                            },
+                        }),
+                    )
+                        .into_response(),
+                    _ => server_error("rerank failed".to_string()),
+                };
+                finish!("server_error", resp);
             }
         }
     }

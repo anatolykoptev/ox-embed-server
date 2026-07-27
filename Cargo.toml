@@ -33,6 +33,7 @@ opentelemetry = "0.30"
 opentelemetry-otlp = { version = "0.30", default-features = false, features = ["grpc-tonic", "trace"] }
 opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"] }
 tracing-opentelemetry = "0.31"
+thiserror = "1"
 
 # Linux-only: glibc `malloc_trim(0)` background task in `main.rs` returns
 # unused trailing arena pages to the OS on a 100 ms cadence (TEI pattern,

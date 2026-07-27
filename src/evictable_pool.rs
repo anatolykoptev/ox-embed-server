@@ -374,11 +374,17 @@ impl<T> Drop for EvictableGuard<T> {
                 // Publishing busy=false while still holding the lock eliminates the
                 // race window that existed when busy.store fired after unlock.
                 self.slot.busy.store(false, Ordering::Release);
-            } else {
-                // Mutex poisoned — we can't return the item safely, but at least
-                // clear busy so the slot isn't permanently stuck.
+            } else if let Err(poisoned) = self.slot.item.lock() {
+                // Mutex poisoned — recover the inner guard (matching the
+                // `acquire()` recovery pattern at lines 139-146) so we can
+                // still return the item to the slot instead of losing it.
+                // `into_inner()` gives us the inner `Option<T>` regardless of
+                // the poison state; the item we hold is still valid.
+                let mut guard = poisoned.into_inner();
+                self.slot.last_used.store(now, Ordering::Relaxed);
+                *guard = Some(item);
                 self.slot.busy.store(false, Ordering::Release);
-                tracing::error!("pool mutex poisoned on guard drop — item lost");
+                tracing::warn!("pool mutex poisoned on guard drop — item recovered");
             }
         }
     }
@@ -596,6 +602,61 @@ mod tests {
             assert!(slot.item.lock().unwrap().is_some(), "item must be returned");
             assert!(!slot.busy.load(AOrdering::Acquire), "busy must be false");
         }
+    }
+
+    // ── #94: poisoned mutex on guard drop must not lose the item ───────────
+    /// Acquire a guard, then poison the slot's mutex from another thread by
+    /// panicking while holding the lock. Drop the guard — the item must be
+    /// recovered into the slot (via `poisoned.into_inner()`) rather than
+    /// lost. The slot must be reusable afterwards.
+    #[test]
+    fn poisoned_mutex_drop_recovers_item() {
+        let pool = Arc::new(EvictablePool::from_items(
+            vec![100u32],
+            0,
+            "poison-test",
+            Arc::new(|| Ok(100u32)),
+        ));
+
+        // Acquire the guard (takes the item out of the slot).
+        let guard = pool.acquire().expect("slot must be acquirable");
+        assert_eq!(*guard, 100u32);
+
+        // Poison the mutex from a separate thread: hold the lock, then panic.
+        // The panic propagates out of the thread (caught by join), leaving the
+        // mutex poisoned.
+        let slot = pool.slots[0].clone();
+        let h = std::thread::spawn(move || {
+            let _lock = slot.item.lock().unwrap();
+            panic!("intentional poison");
+        });
+        assert!(h.join().is_err(), "poison thread must panic");
+
+        // Drop the guard — the Drop impl must recover the item via
+        // poisoned.into_inner() instead of losing it.
+        drop(guard);
+
+        // The slot must contain the item again and busy must be cleared.
+        // The mutex is still poisoned (we recovered via into_inner but didn't
+        // clear the poison flag), so use into_inner() to read.
+        let slot0 = &pool.slots[0];
+        let guard = slot0.item.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(
+            guard.is_some(),
+            "item must be recovered after poisoned drop"
+        );
+        drop(guard);
+        assert!(
+            !slot0.busy.load(AOrdering::Acquire),
+            "busy must be cleared after poisoned drop"
+        );
+
+        // The slot must be reusable: a fresh acquire must succeed (acquire()
+        // already handles poisoned mutex via into_inner() at lines 139-146).
+        let guard2 = pool
+            .acquire()
+            .expect("slot must be reusable after recovery");
+        assert_eq!(*guard2, 100u32);
     }
 
     // ── factory called outside lock (MAJOR 3 rewrite) ───────────────────────
