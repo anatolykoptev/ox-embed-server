@@ -32,6 +32,7 @@ Multi-process (live prod):
 - `EMBED_MULTI_PROCESS=1` — supervisor spawns workers. Set to `0` for monolith rollback.
 - `EMBED_WORKER_BIN=/usr/local/bin/embed-worker` — shipped in image.
 - `EMBED_WORKER_SOCKET_DIR=/tmp/embed-workers` — UDS socket directory.
+- `EMBED_WORKER_SPAWN_DELAY_MS=2000` — stagger between successive worker spawns to smooth cold-load I/O peak (first worker spawns immediately, each subsequent waits this long). `0` = disable (parallel cold-load, original behaviour). 4 workers × 2s = 6s overhead, well within dozor 120s smoke timeout. PR #79.
 
 Models (live prod values):
 - `EMBED_PORT=8082`
