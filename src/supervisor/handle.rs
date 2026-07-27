@@ -501,14 +501,64 @@ impl WorkerSupervisor {
                 }
             };
 
+            // Dispatch the right probe kind for this worker — embed probe
+            // to embed workers, rerank probe to rerank workers, splade probe
+            // to splade workers. A kind mismatch (e.g. embed probe to a
+            // rerank worker) would be a permanent error → false kill.
             let probe = tokio::time::timeout(
                 self.heartbeat_probe_timeout,
-                client.dispatch_embed(self.spec.model.clone(), vec!["test".to_string()], 8),
+                match self.spec.kind {
+                    WorkerKind::Embed => Box::pin(client.dispatch_embed(
+                        self.spec.model.clone(),
+                        vec!["test".to_string()],
+                        8,
+                    ))
+                        as std::pin::Pin<
+                            Box<
+                                dyn std::future::Future<
+                                        Output = std::io::Result<
+                                            crate::ipc::protocol::WorkerResponse,
+                                        >,
+                                    > + Send,
+                            >,
+                        >,
+                    WorkerKind::Rerank => Box::pin(client.dispatch_rerank(
+                        self.spec.model.clone(),
+                        "test".to_string(),
+                        vec!["doc".to_string()],
+                        8,
+                    ))
+                        as std::pin::Pin<
+                            Box<
+                                dyn std::future::Future<
+                                        Output = std::io::Result<
+                                            crate::ipc::protocol::WorkerResponse,
+                                        >,
+                                    > + Send,
+                            >,
+                        >,
+                    WorkerKind::Splade => Box::pin(client.dispatch_splade(
+                        self.spec.model.clone(),
+                        vec!["test".to_string()],
+                        8,
+                        64,
+                        0.01,
+                    ))
+                        as std::pin::Pin<
+                            Box<
+                                dyn std::future::Future<
+                                        Output = std::io::Result<
+                                            crate::ipc::protocol::WorkerResponse,
+                                        >,
+                                    > + Send,
+                            >,
+                        >,
+                },
             )
             .await;
 
             match probe {
-                Ok(Ok(crate::ipc::protocol::WorkerResponse::Embed(_))) => {
+                Ok(Ok(_)) => {
                     if consecutive_fails > 0 {
                         tracing::info!(
                             model = %self.spec.model,
@@ -518,28 +568,6 @@ impl WorkerSupervisor {
                     }
                     consecutive_fails = 0;
                     crate::metrics::record_worker_heartbeat("ok");
-                }
-                Ok(Ok(crate::ipc::protocol::WorkerResponse::Err { message, .. })) => {
-                    consecutive_fails += 1;
-                    tracing::warn!(
-                        model = %self.spec.model,
-                        consecutive_fails,
-                        max_fails = self.heartbeat_max_fails,
-                        error = %message,
-                        "heartbeat probe: worker error"
-                    );
-                    crate::metrics::record_worker_heartbeat("error");
-                }
-                Ok(Ok(unexpected)) => {
-                    consecutive_fails += 1;
-                    tracing::warn!(
-                        model = %self.spec.model,
-                        consecutive_fails,
-                        max_fails = self.heartbeat_max_fails,
-                        kind = %unexpected.kind(),
-                        "heartbeat probe: unexpected response kind"
-                    );
-                    crate::metrics::record_worker_heartbeat("error");
                 }
                 Ok(Err(e)) => {
                     consecutive_fails += 1;

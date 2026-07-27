@@ -1,0 +1,36 @@
+{
+  "kind": "rerank",
+  "size": "long",
+  "url": "http://127.0.0.1:8082/v1/rerank",
+  "model": "gte-multi-rerank",
+  "request_shape": {
+    "endpoint": "/v1/rerank",
+    "docs_per_req": 5,
+    "query_chars": 25,
+    "doc_chars": 2640
+  },
+  "scenarios": [
+    {
+      "concurrency": 1,
+      "iterations": 10,
+      "wall_ms": 22148.5,
+      "throughput_req_per_s": 0.45,
+      "p50_ms": 2044.1,
+      "p90_ms": 3509.7,
+      "p99_ms": 3509.7,
+      "avg_ms": 2214.6,
+      "worst_ms": 3509.7
+    },
+    {
+      "concurrency": 4,
+      "iterations": 20,
+      "wall_ms": 63425.6,
+      "throughput_req_per_s": 0.32,
+      "p50_ms": 12382.9,
+      "p90_ms": 14528.1,
+      "p99_ms": 15237.0,
+      "avg_ms": 11541.4,
+      "worst_ms": 15237.0
+    }
+  ]
+}

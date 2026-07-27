@@ -1,0 +1,4 @@
+embed_token_cache_total{model="gte-multi-rerank",outcome="hit"} 0
+embed_token_cache_total{model="gte-multi-rerank",outcome="miss"} 0
+embed_token_cache_total{model="gte-modernbert",outcome="hit"} 0
+embed_token_cache_total{model="gte-modernbert",outcome="miss"} 0

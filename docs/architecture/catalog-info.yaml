@@ -1,0 +1,35 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: embed-server
+  title: embed-server — Rust embedder sidecar
+  description: |
+    Rust ONNX runtime sidecar для embeddings. Multi-model config через EMBED_MODELS.
+    Loaded models: multilingual-e5-large (1024d text), jina-code-v2 (768d code),
+    gte-multilingual-rerank-base (reranker), splade-cocondenser (sparse).
+    Cold warmup ~46s на 4-core ARM. Заменил Python embed-jina (retired 2026-04-17).
+  annotations:
+    github.com/project-slug: anatolykoptev/embed-server
+    likec4.dev/diagrams: /c4/embed-server/
+    krolik.run/dozor: embed-server
+    krolik.run/port: "8082"
+  links:
+    - url: https://m.krolik.run/c4/embed-server/
+      title: Architecture diagrams
+    - url: https://github.com/anatolykoptev/embed-server
+      title: GitHub repo
+  tags:
+    - rust
+    - embeddings
+    - onnx
+    - inference
+    - sidecar
+    - ai
+spec:
+  type: service
+  lifecycle: production
+  owner: memdb-team
+  system: memdb
+  tier: 1
+  consumesApis:
+    - none
