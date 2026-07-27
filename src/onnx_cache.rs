@@ -122,6 +122,7 @@ impl CacheDir {
                 error = %e,
                 "ONNX_OPT_CACHE_DIR not usable (mkdir failed) — caching disabled"
             );
+            crate::metrics::record_onnx_cache_disabled("mkdir_failed");
             return None;
         }
         if !dir_is_writable(dir) {
@@ -129,6 +130,7 @@ impl CacheDir {
                 dir = %dir.display(),
                 "ONNX_OPT_CACHE_DIR not writable — caching disabled"
             );
+            crate::metrics::record_onnx_cache_disabled("not_writable");
             return None;
         }
         tracing::info!(

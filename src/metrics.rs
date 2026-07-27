@@ -681,6 +681,45 @@ pub fn arena_registration_failed_touch() {
     metrics::counter!("embed_arena_registration_failed_total").absolute(0);
 }
 
+// ── #96: ONNX cache silently disabled ─────────────────────────────────────
+/// Increment when `ONNX_OPT_CACHE_DIR` is explicitly set but unusable
+/// (mkdir failed, not writable). Without this counter, the cache silently
+/// disables and every startup pays full Level3 optimization cost with no
+/// metric visibility — operators can't distinguish "cache working" from
+/// "cache disabled" (issue #96).
+pub fn record_onnx_cache_disabled(reason: &'static str) {
+    metrics::counter!(
+        "embed_onnx_cache_disabled_total",
+        "reason" => reason
+    )
+    .increment(1);
+}
+
+// ── #100: warmup failure ──────────────────────────────────────────────────
+/// Increment when a warmup shape fails. Without this, the first prod
+/// request at that shape pays cold-start cost with no metric visibility
+/// (issue #100).
+pub fn record_warmup_failed(model: &str, phase: &'static str) {
+    metrics::counter!(
+        "embed_warmup_failed_total",
+        "model" => model.to_string(),
+        "phase" => phase
+    )
+    .increment(1);
+}
+
+// ── #101: config fallback ─────────────────────────────────────────────────
+/// Increment when an explicitly-set env var has an invalid value (zero,
+/// unparseable) and the system falls back to the default. Without this,
+/// operators can't detect config drift from typos (issue #101).
+pub fn record_config_fallback(env_var: &'static str) {
+    metrics::counter!(
+        "embed_config_fallback_total",
+        "env_var" => env_var
+    )
+    .increment(1);
+}
+
 /// Increment the token-cache miss counter by `n`.
 ///
 /// See `record_token_cache_hit` for the batch-increment semantic and
