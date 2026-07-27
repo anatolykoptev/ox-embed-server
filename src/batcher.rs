@@ -729,6 +729,40 @@ mod tests {
         crate::metrics::test_prometheus_handle()
     }
 
+    /// Panic-safe guard for the `blocked: Arc<AtomicBool>` test pattern.
+    ///
+    /// Tests that block the worker inside `spawn_blocking` via a
+    /// `while blocked.load() { sleep }` loop MUST release the flag before
+    /// the test future returns — otherwise `#[tokio::test]`'s generated
+    /// `Runtime::drop` (which runs `BlockingPool::shutdown(None)` and
+    /// joins every blocking thread) hangs forever on the stuck
+    /// `spawn_blocking` task. The hang is invisible on a green run
+    /// (the assertion passes, `blocked.store(false)` runs, the thread
+    /// exits) but bites on ANY panic between spawn and the explicit
+    /// `blocked.store(false)`: the unwind drops the `Runtime` while the
+    /// blocking thread is still spinning, and `BlockingPool::drop`
+    /// waits for it indefinitely — reproducing the 30-min CI cancel
+    /// on PR #142 (issue #123 regression window).
+    ///
+    /// `BlockGuard` stores `false` on `Drop`, so a panic unwinds through
+    /// the guard before `Runtime::drop` reaches the blocking pool. The
+    /// explicit `blocked.store(false)` lines in callers are kept (the
+    /// guard is belt-and-suspenders, not a replacement) so the test
+    /// body stays readable.
+    struct BlockGuard {
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl BlockGuard {
+        fn new(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+            Self { flag }
+        }
+    }
+    impl Drop for BlockGuard {
+        fn drop(&mut self) {
+            self.flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     /// Build a batcher tuned for item-count-style tests (pre-B3 semantics):
     /// token budget is set large enough that the max_items cap is what
     /// binds, and non-padded accounting is used so mixing short+long doesn't
@@ -935,6 +969,10 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         let blocked = Arc::new(AtomicBool::new(true));
         let blocked_cl = blocked.clone();
+        // Panic-safety: if any assertion below panics, the guard releases
+        // the flag on unwind so `Runtime::drop` doesn't hang on the
+        // stuck `spawn_blocking` thread (see BlockGuard docs).
+        let _guard = BlockGuard::new(blocked.clone());
         let b = Arc::new(item_cap_batcher(
             "t4",
             move |ids: Vec<Vec<u32>>| {
@@ -1733,6 +1771,11 @@ mod tests {
         let name = "t_80pct";
         let blocked = Arc::new(AtomicBool::new(true));
         let blocked_cl = blocked.clone();
+        // Panic-safety: see BlockGuard docs — without this, a failed
+        // assertion unwinds through `Runtime::drop` while the worker's
+        // `spawn_blocking` is still spinning on `blocked`, hanging the
+        // test runner indefinitely (the PR #142 CI cancel).
+        let _guard = BlockGuard::new(blocked.clone());
         let b = Arc::new(item_cap_batcher(
             name,
             move |ids: Vec<Vec<u32>>| {
@@ -2242,6 +2285,8 @@ mod tests {
 
         let blocked = Arc::new(AtomicBool::new(true));
         let blocked_cl = blocked.clone();
+        // Panic-safety: see BlockGuard docs.
+        let _guard = BlockGuard::new(blocked.clone());
 
         // max_batch_tokens=100, padded=true, wait_ms=50.
         // First item (10 tokens): padded 10*1=10 < 100 → admitted.
@@ -2334,6 +2379,8 @@ mod tests {
 
         let blocked = Arc::new(AtomicBool::new(true));
         let blocked_cl = blocked.clone();
+        // Panic-safety: see BlockGuard docs.
+        let _guard = BlockGuard::new(blocked.clone());
 
         // max_batch_tokens=100, padded=true, wait_ms=50.
         // Single small item (10 tokens): padded 10*1=10 < 100 → admitted,

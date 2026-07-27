@@ -1,0 +1,23 @@
+# Repo-local nextest config — overrides the built-in default on CI runners
+# (which have no ~/.config/nextest/config.toml).
+#
+# The built-in default is `slow-timeout = { period = "60s" }` with NO
+# `terminate-after`: a hung test is marked slow but never killed, so it
+# blocks the job until the workflow's `timeout-minutes` fires. That is
+# exactly how PR #142 hit a 30-min cancel — `backpressure_rejects_at_eighty_percent`
+# panicked mid-flight, `Runtime::drop` joined a stuck `spawn_blocking`
+# thread, and nextest had no authority to terminate it.
+#
+# With `terminate-after = 4` nextest sends SIGTERM to the test's process
+# group after 4 × 30s = 120s, then SIGKILL after a 10s grace period.
+# The panic-safety `BlockGuard` in src/batcher.rs is the primary fix;
+# this config is the belt-and-suspenders backstop for any future hang
+# class that the guard doesn't cover.
+
+[profile.default]
+test-threads = 2
+failure-output = "immediate-final"
+status-level = "pass"
+final-status-level = "slow"
+slow-timeout = { period = "30s", terminate-after = 4, grace-period = "10s" }
+retries = 1
