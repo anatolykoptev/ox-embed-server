@@ -473,6 +473,45 @@ pub fn record_carry(model: &str) {
     .increment(1);
 }
 
+/// Increment the carry-lost counter — fired when a carry item's reply
+/// is resolved with `BatchError::Shutdown` because the worker exited
+/// (channel closed) before the carry could be dispatched.
+///
+/// This is the observability path for the carry-drop-on-abort fix.
+/// Called from `DynamicBatcher::shutdown`'s timeout branch, right before
+/// `worker.abort()` — the reachable path where a stuck worker is aborted
+/// and its in-flight carry item's reply sender is dropped via stack
+/// unwind. A non-zero rate here means shutdown timed out while a carry
+/// item was pending, which operators should never see in healthy
+/// operation (it implies a `dispatch_batch` call was stuck in a long
+/// ONNX inference at shutdown time).
+pub fn record_carry_lost(model: &str) {
+    metrics::counter!(
+        "embed_batcher_carry_lost_total",
+        "model" => model.to_string()
+    )
+    .increment(1);
+}
+
+/// Pre-touch the carry-lost counter to 0 at batcher construction.
+///
+/// Prometheus counters only appear in `/metrics` after the first
+/// `increment`. Without this, "0 carry items lost since boot" is
+/// indistinguishable from "metric not wired" — operators get a false
+/// absence-of-signal. Follows the same pattern as
+/// [`worker_restart_touch`].
+///
+/// Called from `DynamicBatcher::with_tokens_and_max_len` (the single
+/// construction path) so every batcher has its carry-lost counter
+/// visible at value 0 from startup.
+pub fn carry_lost_touch(model: &str) {
+    metrics::counter!(
+        "embed_batcher_carry_lost_total",
+        "model" => model.to_string()
+    )
+    .absolute(0);
+}
+
 /// Increment embedding-cache hit counter by `n` in a single call.
 ///
 /// Positions-in-request semantics: the same text at N positions counts
