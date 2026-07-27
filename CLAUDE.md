@@ -19,7 +19,7 @@ axum HTTP server serving 4 ONNX models for dense embedding, reranking, and spars
 
 ## API
 
-- `POST /v1/embeddings` — OpenAI-compat. 503 + `Retry-After: 1` on queue full, 503 + `Retry-After: 5` during shutdown. Response cache in front.
+- `POST /v1/embeddings` — OpenAI-compat. 429 + `Retry-After: 1` on queue full, 503 + `Retry-After: 5` during shutdown. Response cache in front.
 - `POST /v1/rerank` — Cohere-shape. Documents accepted as plain string or `{"text":...}` (untagged serde). No cache.
 - `POST /embed_sparse` — TEI convention (no `/v1/` prefix). Body: `{"input":["text",...]}` (singular `input`).
 - `GET /health` — `ok`.
