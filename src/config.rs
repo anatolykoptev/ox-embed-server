@@ -1959,18 +1959,15 @@ mod tests {
     fn parse_models_six_segment_defaults_onnx_filename() {
         // 6-segment spec must populate onnx_filename with the legacy default
         // so existing prod configs are byte-identically unchanged.
-        let defs =
-            parse_models("multilingual-e5-large:/models:1024:256:1:false").unwrap();
+        let defs = parse_models("multilingual-e5-large:/models:1024:256:1:false").unwrap();
         assert_eq!(defs[0].onnx_filename, "model_quantized.onnx");
     }
 
     #[test]
     fn parse_models_seven_segment_uses_given_filename() {
         // 7th segment overrides the default — CodeRankEmbed canonical spec.
-        let defs = parse_models(
-            "code-rank-embed:/models-coderank:768:512:0:false:model_int8.onnx",
-        )
-        .unwrap();
+        let defs = parse_models("code-rank-embed:/models-coderank:768:512:0:false:model_int8.onnx")
+            .unwrap();
         assert_eq!(defs[0].onnx_filename, "model_int8.onnx");
         // Other fields parsed normally.
         assert_eq!(defs[0].name, "code-rank-embed");
@@ -1985,8 +1982,7 @@ mod tests {
     fn parse_models_seven_segment_whitespace_trimmed() {
         // Surrounding whitespace on the 7th segment must be stripped
         // (consistent with other field handling).
-        let defs =
-            parse_models("m:/d:768:512:0:false:  model_int8.onnx  ").unwrap();
+        let defs = parse_models("m:/d:768:512:0:false:  model_int8.onnx  ").unwrap();
         assert_eq!(defs[0].onnx_filename, "model_int8.onnx");
     }
 
@@ -1996,10 +1992,7 @@ mod tests {
         // allowing separators would enable path traversal.
         let result = parse_models("m:/d:768:512:0:false:sub/model.onnx");
         let err = result.err().expect("should have been Err");
-        assert!(
-            err.contains("plain filename"),
-            "unexpected error: {err}"
-        );
+        assert!(err.contains("plain filename"), "unexpected error: {err}");
     }
 
     #[test]
@@ -2008,10 +2001,7 @@ mod tests {
         // a separator, because `dir.join("..")` would escape the model dir.
         let result = parse_models("m:/d:768:512:0:false:..");
         let err = result.err().expect("should have been Err");
-        assert!(
-            err.contains("path-traversal"),
-            "unexpected error: {err}"
-        );
+        assert!(err.contains("path-traversal"), "unexpected error: {err}");
     }
 
     #[test]
@@ -2020,10 +2010,7 @@ mod tests {
         // so the operator knows to omit the trailing colon instead.
         let result = parse_models("m:/d:768:512:0:false:");
         let err = result.err().expect("should have been Err");
-        assert!(
-            err.contains("empty"),
-            "unexpected error: {err}"
-        );
+        assert!(err.contains("empty"), "unexpected error: {err}");
     }
 
     #[test]
@@ -2031,10 +2018,7 @@ mod tests {
         // 8 segments is always an error (format: name:dir:dim:max_len:pad_id:has_tti[:onnx_filename]).
         let result = parse_models("m:/d:768:512:0:false:model.onnx:extra");
         let err = result.err().expect("should have been Err");
-        assert!(
-            err.contains("6 or 7"),
-            "unexpected error: {err}"
-        );
+        assert!(err.contains("6 or 7"), "unexpected error: {err}");
     }
 
     #[test]
@@ -2042,10 +2026,7 @@ mod tests {
         // Fewer than 6 fields remain an error (unchanged pre-existing behaviour).
         let result = parse_models("m:/d:768:512:0");
         let err = result.err().expect("should have been Err");
-        assert!(
-            err.contains("6 or 7"),
-            "unexpected error: {err}"
-        );
+        assert!(err.contains("6 or 7"), "unexpected error: {err}");
     }
 
     // -----------------------------------------------------------------

@@ -47,6 +47,7 @@ pub(crate) fn resolve_duration_secs_env(key: &str, default: Duration, source: &s
 /// means "no stagger" rather than "misconfiguration".
 ///
 /// Captured at startup; restart the container to pick up a new value.
+#[allow(dead_code)] // called from src/main.rs (bin) — lib crate can't see cross-crate call
 pub(crate) fn resolve_spawn_stagger_ms(key: &str, default_ms: u64) -> Option<std::time::Duration> {
     match std::env::var(key) {
         Err(_) => {
@@ -79,6 +80,7 @@ pub(crate) fn resolve_spawn_stagger_ms(key: &str, default_ms: u64) -> Option<std
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     // Helper: set an env var for the duration of one test.
     // Tests here are single-threaded (cfg(test) + serial approach via
@@ -101,24 +103,31 @@ mod tests {
     // --- resolve_spawn_stagger_ms ---
 
     #[test]
+    #[serial]
     fn stagger_absent_uses_default() {
         // Env var unset → default 2000ms
         #[allow(deprecated)]
-        let _ = unsafe { std::env::remove_var("EMBED_WORKER_SPAWN_DELAY_MS_TEST1") };
+        unsafe {
+            std::env::remove_var("EMBED_WORKER_SPAWN_DELAY_MS_TEST1")
+        };
         let result = resolve_spawn_stagger_ms("EMBED_WORKER_SPAWN_DELAY_MS_TEST1", 2000);
         assert_eq!(result, Some(std::time::Duration::from_millis(2000)));
     }
 
     #[test]
+    #[serial]
     fn stagger_absent_zero_default_disabled() {
         // Env var unset, default=0 → None (disabled)
         #[allow(deprecated)]
-        let _ = unsafe { std::env::remove_var("EMBED_WORKER_SPAWN_DELAY_MS_TEST2") };
+        unsafe {
+            std::env::remove_var("EMBED_WORKER_SPAWN_DELAY_MS_TEST2")
+        };
         let result = resolve_spawn_stagger_ms("EMBED_WORKER_SPAWN_DELAY_MS_TEST2", 0);
         assert_eq!(result, None);
     }
 
     #[test]
+    #[serial]
     fn stagger_zero_disables() {
         // EMBED_WORKER_SPAWN_DELAY_MS=0 → None (disabled, not an error)
         with_env("EMBED_WORKER_SPAWN_DELAY_MS_TEST3", "0", || {
@@ -128,6 +137,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn stagger_custom_override() {
         // EMBED_WORKER_SPAWN_DELAY_MS=3000 → Some(3s)
         with_env("EMBED_WORKER_SPAWN_DELAY_MS_TEST4", "3000", || {
@@ -137,6 +147,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn stagger_invalid_falls_back_to_default() {
         // Non-numeric value → fallback to default, no panic
         with_env("EMBED_WORKER_SPAWN_DELAY_MS_TEST5", "notanumber", || {
@@ -146,6 +157,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn stagger_invalid_zero_default_falls_back_to_none() {
         // Non-numeric + default=0 → None
         with_env("EMBED_WORKER_SPAWN_DELAY_MS_TEST6", "bad", || {
