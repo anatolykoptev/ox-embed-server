@@ -53,6 +53,28 @@ impl fmt::Display for QueueFullError {
 }
 impl std::error::Error for QueueFullError {}
 
+/// Parse `BATCH_LENGTH_RATIO_THRESHOLD` — when > 0.0, items whose
+/// `max_seq_len` exceeds `accum.max_len * threshold` are carried to
+/// the next batch, reducing padding waste on padded models. Default
+/// 0.0 = disabled (preserves original coalesce behaviour). See
+/// `BatcherConfig::length_ratio_threshold` for the full rationale.
+fn parse_length_ratio_threshold() -> f64 {
+    match std::env::var("BATCH_LENGTH_RATIO_THRESHOLD") {
+        Ok(v) => {
+            let trimmed = v.trim();
+            let parsed = trimmed.parse::<f64>().unwrap_or_else(|_| {
+                panic!("BATCH_LENGTH_RATIO_THRESHOLD must be a float, got {trimmed:?}");
+            });
+            assert!(
+                parsed >= 0.0,
+                "BATCH_LENGTH_RATIO_THRESHOLD must be >= 0.0, got {parsed}"
+            );
+            parsed
+        }
+        Err(_) => 0.0,
+    }
+}
+
 #[derive(Debug)]
 struct Item {
     /// One entry per text in the request. Each entry is the tokenizer's
@@ -139,6 +161,24 @@ struct BatcherConfig {
     /// tests that don't care about this metric — `round_up_seq_len` treats
     /// it as "no cap" and just does `next_power_of_two`.
     model_max_len: usize,
+    /// Length-ratio carry threshold for padded models. When > 0.0, an
+    /// item whose `max_seq_len` exceeds `accum.max_len * threshold` is
+    /// carried to the next batch instead of admitted — preventing short
+    /// items from being padded up to a long outlier's length. 0.0 =
+    /// disabled (default, preserves original coalesce behaviour).
+    ///
+    /// Only applies when `padded_model` is true and the batch already
+    /// has items (the empty-batch starvation guard bypasses it). The
+    /// absolute `max_batch_seq` gate (`seq_capped_by`) fires first —
+    /// items above the hard cap are carried regardless of ratio.
+    ///
+    /// Reasonable values: 1.5 (aggressive, more small batches) to 3.0
+    /// (conservative, only extreme outliers split). Below 1.0 makes
+    /// every longer item carry — too aggressive. Tune via
+    /// `BATCH_LENGTH_RATIO_THRESHOLD` env, watch
+    /// `embed_batch_padding_waste_ratio` and
+    /// `embed_batch_seq_capped_total{reason="length_ratio"}`.
+    length_ratio_threshold: f64,
 }
 
 impl DynamicBatcher {
@@ -205,6 +245,7 @@ impl DynamicBatcher {
     {
         let (tx, rx) = mpsc::channel::<Item>(max_queue);
         let arc_name = Arc::new(name.to_string());
+        let length_ratio_threshold = parse_length_ratio_threshold();
         let cfg = BatcherConfig {
             max_batch_tokens,
             max_batch_items,
@@ -212,6 +253,7 @@ impl DynamicBatcher {
             padded_model,
             wait: Duration::from_millis(wait_ms),
             model_max_len,
+            length_ratio_threshold,
         };
         // Pre-touch the carry-lost counter to 0 so it appears in /metrics
         // from startup (absent counter = "not wired" false-negative).
@@ -516,16 +558,22 @@ async fn run_worker(
                         crate::metrics::record_cancelled(&name);
                         continue;
                     }
-                    // Two independent overflow gates:
+                    // Three independent overflow gates, checked in order
+                    // (most specific first so the reason-tagged counter
+                    // reflects the dominant cause):
                     //  1. `seq_capped_by`: longest sequence in the
-                    //     candidate-augmented batch would exceed
-                    //     `BATCH_MAX_SEQ`. Splits long-doc outliers
-                    //     into their own (possibly B=1) batch so they
-                    //     don't force shorter neighbours to pad up.
-                    //  2. `fits`: items / token-budget caps.
-                    // The seq gate fires only when the batch already
-                    // has items; an empty batch (`accum.items == 0`)
-                    // bypasses it so single-long-doc requests can
+                    //     candidate-augmented batch would exceed the
+                    //     absolute `BATCH_MAX_SEQ` cap. Splits long-doc
+                    //     outliers into their own batch.
+                    //  2. `length_ratio`: (padded models only, env-gated)
+                    //     candidate's `max_seq_len` exceeds
+                    //     `accum.max_len * BATCH_LENGTH_RATIO_THRESHOLD`.
+                    //     Splits length-heterogeneous batches to reduce
+                    //     padding waste. Default 0.0 = disabled.
+                    //  3. `fits`: items / token-budget caps.
+                    // The seq and ratio gates fire only when the batch
+                    // already has items; an empty batch (`accum.items == 0`)
+                    // bypasses them so single-long-doc requests can
                     // always make progress on their own.
                     let seq_overflow = accum.items > 0 && accum.seq_capped_by(&item, &cfg);
                     if seq_overflow {
@@ -536,6 +584,19 @@ async fn run_worker(
                         // overflow.
                         crate::metrics::record_carry(&name);
                         crate::metrics::record_seq_capped(&name);
+                        carry = Some(item);
+                        carry_pending.store(true, std::sync::atomic::Ordering::Release);
+                        break;
+                    }
+                    let length_ratio_overflow = cfg.padded_model
+                        && cfg.length_ratio_threshold > 0.0
+                        && accum.items > 0
+                        && accum.max_len > 0
+                        && (item.max_seq_len() as f64)
+                            > (accum.max_len as f64) * cfg.length_ratio_threshold;
+                    if length_ratio_overflow {
+                        crate::metrics::record_carry(&name);
+                        crate::metrics::record_length_ratio_carry(&name);
                         carry = Some(item);
                         carry_pending.store(true, std::sync::atomic::Ordering::Release);
                         break;
@@ -1245,6 +1306,7 @@ mod tests {
             padded_model: true,
             wait: Duration::from_millis(1),
             model_max_len: usize::MAX,
+            length_ratio_threshold: 0.0,
         };
         // Seed batch with a single 500-token Item.
         let seed = Item {
@@ -1277,6 +1339,7 @@ mod tests {
             padded_model: false,
             wait: Duration::from_millis(1),
             model_max_len: usize::MAX,
+            length_ratio_threshold: 0.0,
         };
         let seed = Item {
             token_ids: vec![vec![0u32; 500]],
@@ -1312,6 +1375,7 @@ mod tests {
             padded_model: false,
             wait: Duration::from_millis(1),
             model_max_len: usize::MAX,
+            length_ratio_threshold: 0.0,
         };
         let two = Item {
             token_ids: vec![vec![1u32], vec![2u32]],
@@ -1327,6 +1391,164 @@ mod tests {
             enqueued_at: Instant::now(),
         };
         assert!(!accum.fits(&one, &cfg));
+    }
+
+    // -----------------------------------------------------------------
+    // #128-B: length-ratio carry gate. Env-gated via
+    // BATCH_LENGTH_RATIO_THRESHOLD, default 0.0 = disabled. When > 0.0,
+    // an item whose max_seq_len exceeds accum.max_len * threshold is
+    // carried to the next batch. These tests exercise the gate logic
+    // directly (no env var needed — the threshold is on BatcherConfig).
+    // -----------------------------------------------------------------
+
+    /// Helper: build a BatcherConfig with the ratio threshold set and
+    /// all other caps relaxed so only the ratio gate can fire.
+    fn ratio_cfg(threshold: f64) -> BatcherConfig {
+        BatcherConfig {
+            max_batch_tokens: usize::MAX,
+            max_batch_items: 100,
+            max_batch_seq: usize::MAX,
+            padded_model: true,
+            wait: Duration::from_millis(1),
+            model_max_len: usize::MAX,
+            length_ratio_threshold: threshold,
+        }
+    }
+
+    #[test]
+    fn length_ratio_gate_disabled_when_threshold_zero() {
+        // threshold=0.0 → gate is a no-op. A 1000-token item after a
+        // 10-token batch must NOT be carried by the ratio gate (it
+        // would still be carried by seq_capped_by if max_batch_seq were
+        // set, but here that's MAX).
+        let cfg = ratio_cfg(0.0);
+        let seed = Item {
+            token_ids: vec![vec![0u32; 10]],
+            reply: oneshot::channel().0,
+            enqueued_at: Instant::now(),
+        };
+        let mut accum = BatchAccum::default();
+        accum.push(&seed);
+        let long_item = Item {
+            token_ids: vec![vec![0u32; 1000]],
+            reply: oneshot::channel().0,
+            enqueued_at: Instant::now(),
+        };
+        // The ratio gate is checked in the coalesce loop, not in fits().
+        // We verify the gate condition directly: with threshold=0.0,
+        // the condition is false (disabled).
+        let gate_fires = cfg.padded_model
+            && cfg.length_ratio_threshold > 0.0
+            && accum.items > 0
+            && accum.max_len > 0
+            && (long_item.max_seq_len() as f64)
+                > (accum.max_len as f64) * cfg.length_ratio_threshold;
+        assert!(!gate_fires, "threshold=0.0 must disable the gate");
+        // fits() must still pass (no other cap binds).
+        assert!(accum.fits(&long_item, &cfg));
+    }
+
+    #[test]
+    fn length_ratio_gate_fires_when_item_exceeds_threshold() {
+        // threshold=2.0, batch max_len=10, item=25. 25 > 10*2=20 → carry.
+        let cfg = ratio_cfg(2.0);
+        let seed = Item {
+            token_ids: vec![vec![0u32; 10]],
+            reply: oneshot::channel().0,
+            enqueued_at: Instant::now(),
+        };
+        let mut accum = BatchAccum::default();
+        accum.push(&seed);
+        let long_item = Item {
+            token_ids: vec![vec![0u32; 25]],
+            reply: oneshot::channel().0,
+            enqueued_at: Instant::now(),
+        };
+        let gate_fires = cfg.padded_model
+            && cfg.length_ratio_threshold > 0.0
+            && accum.items > 0
+            && accum.max_len > 0
+            && (long_item.max_seq_len() as f64)
+                > (accum.max_len as f64) * cfg.length_ratio_threshold;
+        assert!(gate_fires, "25 > 10*2.0=20 must trigger the gate");
+    }
+
+    #[test]
+    fn length_ratio_gate_does_not_fire_when_item_within_threshold() {
+        // threshold=2.0, batch max_len=10, item=20. 20 > 10*2=20? No (not strict).
+        let cfg = ratio_cfg(2.0);
+        let seed = Item {
+            token_ids: vec![vec![0u32; 10]],
+            reply: oneshot::channel().0,
+            enqueued_at: Instant::now(),
+        };
+        let mut accum = BatchAccum::default();
+        accum.push(&seed);
+        let borderline_item = Item {
+            token_ids: vec![vec![0u32; 20]],
+            reply: oneshot::channel().0,
+            enqueued_at: Instant::now(),
+        };
+        let gate_fires = cfg.padded_model
+            && cfg.length_ratio_threshold > 0.0
+            && accum.items > 0
+            && accum.max_len > 0
+            && (borderline_item.max_seq_len() as f64)
+                > (accum.max_len as f64) * cfg.length_ratio_threshold;
+        assert!(!gate_fires, "20 is not > 20 (strict >), gate must not fire");
+    }
+
+    #[test]
+    fn length_ratio_gate_skipped_for_non_padded_model() {
+        // Non-padded model: gate must not fire even if threshold > 0.
+        let cfg = BatcherConfig {
+            max_batch_tokens: usize::MAX,
+            max_batch_items: 100,
+            max_batch_seq: usize::MAX,
+            padded_model: false,
+            wait: Duration::from_millis(1),
+            model_max_len: usize::MAX,
+            length_ratio_threshold: 2.0,
+        };
+        let seed = Item {
+            token_ids: vec![vec![0u32; 10]],
+            reply: oneshot::channel().0,
+            enqueued_at: Instant::now(),
+        };
+        let mut accum = BatchAccum::default();
+        accum.push(&seed);
+        let long_item = Item {
+            token_ids: vec![vec![0u32; 1000]],
+            reply: oneshot::channel().0,
+            enqueued_at: Instant::now(),
+        };
+        let gate_fires = cfg.padded_model
+            && cfg.length_ratio_threshold > 0.0
+            && accum.items > 0
+            && accum.max_len > 0
+            && (long_item.max_seq_len() as f64)
+                > (accum.max_len as f64) * cfg.length_ratio_threshold;
+        assert!(!gate_fires, "non-padded model must skip the ratio gate");
+    }
+
+    #[test]
+    fn length_ratio_gate_skipped_for_empty_batch() {
+        // Empty batch (accum.items == 0): gate must not fire — the
+        // starvation guard lets the first item in regardless.
+        let cfg = ratio_cfg(2.0);
+        let accum = BatchAccum::default(); // empty
+        let long_item = Item {
+            token_ids: vec![vec![0u32; 1000]],
+            reply: oneshot::channel().0,
+            enqueued_at: Instant::now(),
+        };
+        let gate_fires = cfg.padded_model
+            && cfg.length_ratio_threshold > 0.0
+            && accum.items > 0
+            && accum.max_len > 0
+            && (long_item.max_seq_len() as f64)
+                > (accum.max_len as f64) * cfg.length_ratio_threshold;
+        assert!(!gate_fires, "empty batch must skip the ratio gate");
     }
 
     // -----------------------------------------------------------------
@@ -1759,6 +1981,7 @@ mod tests {
             padded_model: true,
             wait: Duration::from_millis(1),
             model_max_len: usize::MAX,
+            length_ratio_threshold: 0.0,
         };
         // Seed: 50-tok item → accum.max_len = 50.
         let seed = Item {

@@ -420,6 +420,22 @@ pub fn record_seq_capped(model: &str) {
     .increment(1);
 }
 
+/// Increment the length-ratio carry counter — fired when a batch is
+/// split because the candidate item's `max_seq_len` exceeds
+/// `accum.max_len * BATCH_LENGTH_RATIO_THRESHOLD` (and the threshold
+/// is > 0.0). Shares the `embed_batch_seq_capped_total` counter family
+/// with `reason="length_ratio"` so dashboards can distinguish the two
+/// carry causes. Only fires when the ratio gate is explicitly enabled
+/// via env — default 0.0 means this counter stays at 0.
+pub fn record_length_ratio_carry(model: &str) {
+    metrics::counter!(
+        "embed_batch_seq_capped_total",
+        "model" => model.to_string(),
+        "reason" => "length_ratio"
+    )
+    .increment(1);
+}
+
 /// Increment the solo-seq-overflow counter — fired when the FIRST item
 /// of an EMPTY batch exceeds `max_batch_seq`.
 ///
