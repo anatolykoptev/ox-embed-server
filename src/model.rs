@@ -4,16 +4,16 @@ use std::time::Instant;
 
 use ndarray::Array2;
 use ort::ep;
+use ort::session::builder::GraphOptimizationLevel;
 use ort::session::RunOptions;
 use ort::session::Session;
-use ort::session::builder::GraphOptimizationLevel;
 use ort::value::Tensor;
-use tokenizers::Tokenizer;
 use tokenizers::utils::truncation::{TruncationDirection, TruncationParams, TruncationStrategy};
+use tokenizers::Tokenizer;
 
 use crate::config::ModelDef;
 use crate::evictable_pool::{AcquireError, EvictablePool};
-use crate::mlock::{MlockedSession, read_and_mlock};
+use crate::mlock::{read_and_mlock, MlockedSession};
 use crate::onnx_cache::{self, CacheDir, LoadPlan};
 use crate::pool;
 
@@ -794,6 +794,15 @@ fn build_one_session(
     intra_threads: usize,
     memory_pattern: bool,
 ) -> Result<MlockedSession, String> {
+    // Defence-in-depth: assert the shared CPU arena is registered BEFORE
+    // any Session::builder() call. The reranker (model_reranker/load.rs)
+    // and splade (model_splade.rs) already do this; the embed path
+    // previously relied only on the worker's startup check
+    // (register_arena_for_worker in src/bin/worker.rs). If a future
+    // refactor bypasses that check, this assert catches it with a clear
+    // panic instead of silently falling back to per-session BFCArena
+    // (unbounded memory growth). See arena.rs:68.
+    crate::arena::assert_arena_registered_before_session();
     // External-data detection MUST happen against the original onnx_path before
     // any cache redirection. If a `<onnx_path>.data` sidecar exists, caching is
     // incoherent (an optimized graph in the cache dir has no `.data` next to it)

@@ -170,9 +170,17 @@ fn install_worker_metrics(model_name: &str) -> PrometheusHandle {
 /// unbounded memory growth.
 ///
 /// Incrementing `embed_arena_registration_failed_total` before returning the
-/// error makes the failure observable in `/metrics` even though the worker
-/// exits immediately afterwards (the supervisor's `/metrics` endpoint
-/// scrapes the worker's last render).
+/// error makes the failure observable — but note the worker exits
+/// immediately after via `?`, so the incremented counter is only scrapeable
+/// via the worker's own metrics port (`EMBED_WORKER_METRICS_PORT`) IF a
+/// scrape happens in the window between increment and process exit. In
+/// practice this window is too short to reliably scrape, so operators
+/// should correlate worker startup failures with
+/// `embed_worker_restart_total{model}` on the supervisor's `/metrics`
+/// instead (the supervisor observes worker exit and increments its own
+/// restart counter). The `embed_arena_registration_failed_total` counter
+/// is still pre-touched to 0 at startup so its presence in a worker
+/// scrape confirms the metric is wired.
 fn handle_arena_registration(result: Result<(), String>) -> anyhow::Result<()> {
     match result {
         Ok(()) => {
