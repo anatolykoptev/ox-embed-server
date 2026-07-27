@@ -36,12 +36,12 @@ jobs:
       - name: Install cargo-nextest
         run: |
           curl -sSfL https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.140/cargo-nextest-0.9.140-aarch64-unknown-linux-gnu.tar.gz \
-            | tar -xz -C ~/.cargo/bin
+            | tar -xz -C ~/.cargo/bin --strip-components=1
 
       - name: Install cargo-deny
         run: |
           curl -sSfL https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-aarch64-unknown-linux-musl.tar.gz \
-            | tar -xz -C ~/.cargo/bin
+            | tar -xz -C ~/.cargo/bin --strip-components=1
 
       - name: fmt
         run: cargo fmt --all -- --check
