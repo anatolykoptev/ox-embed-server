@@ -87,11 +87,15 @@ mod tests {
     fn with_env<F: FnOnce()>(key: &str, val: &str, f: F) {
         // SAFETY: single-threaded test context; no other thread reads this var.
         #[allow(deprecated)]
-        unsafe { std::env::set_var(key, val) };
+        unsafe {
+            std::env::set_var(key, val)
+        };
         f();
         // SAFETY: same as above.
         #[allow(deprecated)]
-        unsafe { std::env::remove_var(key) };
+        unsafe {
+            std::env::remove_var(key)
+        };
     }
 
     // --- resolve_spawn_stagger_ms ---

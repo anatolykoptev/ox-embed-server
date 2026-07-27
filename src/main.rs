@@ -740,10 +740,13 @@ async fn main() {
         // cold-reads from causing an I/O storm under host RAM pressure.
         let mut handles: Vec<_> = Vec::with_capacity(total_workers);
         for (position, spec) in specs.into_iter().enumerate() {
-            if position > 0 {
-                if let Some(delay) = spawn_stagger {
-                    tokio::time::sleep(delay).await;
-                }
+            // Stagger: first worker spawns immediately (position=0); each
+            // subsequent worker waits `spawn_stagger` before its spawn,
+            // giving the previous worker's ONNX read a pagecache head-start.
+            // `spawn_stagger` is `Option<Duration>` — `None` means disabled
+            // (EMBED_WORKER_SPAWN_DELAY_MS=0 or absent with default=0).
+            if let Some(delay) = spawn_stagger.filter(|_| position > 0) {
+                tokio::time::sleep(delay).await;
             }
             let name = spec.model.clone();
             let kind = spec.kind;
