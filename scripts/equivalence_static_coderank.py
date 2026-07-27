@@ -14,9 +14,9 @@ equivalence:
 WHY THIS IS LOAD-BEARING
   The static graph is re-exported from source and re-quantized. If its
   outputs drift from the shipped dynamic path, every vector already in
-  the go-code corpus becomes inconsistent with new ones → a full 57-repo
+  the downstream corpus becomes inconsistent with new ones → a full 57-repo
   reindex is forced (cheap → expensive). This gate BLOCKS promotion.
-  See docs/plans/2026-06-12-coderank-static-shape.md Scenario 3 / ADR-001.
+  See docs/benchmarks/ Scenario 3 / ADR-001.
 
 WHAT IT MIRRORS FROM THE RUST SERVING PATH
   - seq padding: model.rs pads each batch to round_up_seq_len(max, cap)
@@ -34,7 +34,7 @@ WHAT IT MIRRORS FROM THE RUST SERVING PATH
 This runs offline (no embed-server process); both graphs are loaded
 directly via onnxruntime so the dynamic and static paths can be compared
 on identical inputs in one process. Run AFTER export_static_coderank.sh
-and BEFORE rsync'ing anything to pillow.
+and BEFORE deploying anything to the production host.
 
 Usage:
   python3 scripts/equivalence_static_coderank.py \
@@ -272,7 +272,7 @@ def main() -> int:
         print(
             "\n*** REINDEX FORCED *** — the static graph is NOT numerically\n"
             "equivalent to the dynamic path. Do NOT promote without a full\n"
-            "go-code reindex. Investigate the quant recipe / export drift\n"
+            "the downstream consumer reindex. Investigate the quant recipe / export drift\n"
             "(plan ADR-001) before shipping.",
             file=sys.stderr,
         )

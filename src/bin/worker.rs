@@ -28,7 +28,7 @@ use tokio::sync::Semaphore;
 
 /// Default number of ONNX intra-op threads per session.
 ///
-/// 2 is the empirically-tuned value for ARM cores on the krolik host
+/// 2 is the empirically-tuned value for ARM cores on the build host
 /// (24 vCPU / 3 models × pool_size sessions). Increasing beyond 2 stalls
 /// other sessions under concurrent inference. Overridable via
 /// `EMBED_WORKER_INTRA_THREADS`.
@@ -361,7 +361,7 @@ async fn main() -> anyhow::Result<()> {
                 // Bounded-queue admission: await permit instead of instant
                 // reject. With per-request UDS conn (PR #62), burst load
                 // would mass-trigger try_acquire failures + 500-spam to
-                // memdb-go, which retries → amplification cascade. acquire()
+                // the downstream consumer, which retries → amplification cascade. acquire()
                 // queues requests at the worker; supervisor-side
                 // WorkerPool::dispatch_timeout (EMBED_DISPATCH_TIMEOUT_SECS)
                 // caps the upper bound, so a stuck worker still surfaces as

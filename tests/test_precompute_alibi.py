@@ -12,7 +12,7 @@ import pytest
 # Add scripts/ to path so we can import precompute_alibi as a module
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
-ORIG_MODEL = "/home/krolik/deploy/krolik-server/models/jina-code-v2/model_quantized.onnx"
+ORIG_MODEL = os.environ.get("TEST_JINA_MODEL", "/models/jina-code-v2/model_quantized.onnx")
 PATCHED_MODEL = "/tmp/jina_alibi_patched.onnx"
 
 # ---------------------------------------------------------------------------

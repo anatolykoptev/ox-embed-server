@@ -6,7 +6,7 @@ specification {
 }
 
 model {
-  user = person "HTTP client" "memdb-go / go-code / go-nerv / any consumer on the krolik-server Docker network."
+  user = person "HTTP client" "any consumer on the Docker network."
 
   embed_server = system "embed-server" {
     description '''

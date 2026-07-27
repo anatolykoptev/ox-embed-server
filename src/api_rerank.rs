@@ -61,14 +61,14 @@ const SIGMOID_CLAMP: f32 = 50.0;
 
 /// Optional server-side normalization applied to cross-encoder logits
 /// before sort. Default `Sigmoid` returns [0,1] scores compatible with
-/// quality-floor consumers (memdb-go, Mem0, etc). Send `"normalize":"none"`
+/// quality-floor consumers (the downstream consumer, Mem0, etc). Send `"normalize":"none"`
 /// in the request body for raw cross-encoder logits (Cohere/Jina
 /// convention) when the downstream consumer expects them.
 ///
 /// 2026-05-02 — flipped default from `None` to `Sigmoid` after Run #12
-/// LoCoMo F1 regression (-39% vs Run #8). Root cause: memdb-go consumer
+/// LoCoMo F1 regression (-39% vs Run #8). Root cause: the downstream consumer
 /// never sent `"normalize"` → received raw logits (often negative for
-/// top-1) → `MEMDB_CE_QUALITY_FLOOR=0.05` floor dropped 99% of CE
+/// top-1) → the downstream consumer's quality floor (0.05) dropped 99% of CE
 /// results into math fallback (63% low_quality + 36% degraded in prod).
 /// BREAKING for callers that expected raw logits without sending the
 /// field — Cohere SDK consumers must now opt in via `"normalize":"none"`.
@@ -992,7 +992,7 @@ mod tests {
         // Pins the 2026-05-02 default flip: callers that omit `normalize`
         // get sigmoid-normalized [0,1] scores, not raw logits. Regression
         // guard against accidental revert that would re-trigger the
-        // memdb-go quality-floor cliff (Run #12 LoCoMo F1 -39%).
+        // the downstream consumer quality-floor cliff (Run #12 LoCoMo F1 -39%).
         assert_eq!(NormalizeMode::default(), NormalizeMode::Sigmoid);
 
         // End-to-end: omitted field → Option::None → handler's

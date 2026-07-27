@@ -146,7 +146,6 @@ Tuning:
 ## Deploy
 
 ```bash
-cd ~/krolik-server
 docker compose build embed-server
 docker compose up -d embed-server
 ```

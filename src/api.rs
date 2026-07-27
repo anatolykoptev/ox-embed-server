@@ -326,7 +326,7 @@ pub async fn embeddings(
                 Ok(v) => v,
                 Err(crate::batcher::BatchError::QueueFull(e)) => {
                     // E2: queue near capacity (≥80%) → fast-fail with 429
-                    // Too Many Requests + Retry-After: 1. Clients (memdb-go
+                    // Too Many Requests + Retry-After: 1. Clients (the downstream consumer
                     // commit 90b964f1) retry with exp backoff — closed
                     // loop. Previously returned 503, which conflated "queue
                     // full" (retryable) with shutdown (also retryable but

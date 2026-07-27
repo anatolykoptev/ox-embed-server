@@ -51,7 +51,7 @@ Why (most likely, in priority of confidence):
 
 - **Phase 3A** (per-model threading 1×4 vs 2×2). Pool acquire is ~0.6 μs — *not* a bottleneck on this workload. A/B might shift the c=4 saturation behaviour but won't help c=1 single calls. **Lower priority than expected.**
 - **Phase 3B** (ORT spin disable env knob). Already coded in `feat/modernbert-phase2-3` branch. Ship as defensive default — small CPU saving on shared host, no behaviour change unless env flipped.
-- **Phase 3C** (length bucketing). Padding waste ratio = 0 in bench because synthetic fixtures are uniform. **Cannot be evaluated from this bench**. Need to scrape `embed_rerank_padding_waste_ratio` after a few hours of real memdb-go traffic; defer decision.
+- **Phase 3C** (length bucketing). Padding waste ratio = 0 in bench because synthetic fixtures are uniform. **Cannot be evaluated from this bench**. Need to scrape `embed_rerank_padding_waste_ratio` after a few hours of real the downstream consumer traffic; defer decision.
 - **Phase 3D** (int32 input cast). 1-3 % infra win — irrelevant against 25 % model gap.
 
 ## Decision points for the operator
@@ -64,11 +64,11 @@ The plan as written assumed ModernBERT would win on speed and we'd flip prod `CR
    - INT8 dynamic quantization with `nodes_to_exclude` covering the GeGLU FFN gate layers (per arxiv 2405.14428).
    - Re-bench against this same harness; iterate.
    - Effort: half a day for the export pipeline + bench loop.
-3. **Treat ModernBERT as a quality-not-speed swap.** Run a separate quality eval (BEIR or memdb-go LoCoMo) — if quality wins outweigh the 25 % latency cost, the migration is worth the user-perceived slowness. Out of scope for this branch.
+3. **Treat ModernBERT as a quality-not-speed swap.** Run a separate quality eval (BEIR or the downstream consumer LoCoMo) — if quality wins outweigh the 25 % latency cost, the migration is worth the user-perceived slowness. Out of scope for this branch.
 
 ## Bench sweep methodology — caveats
 
-- Bench was interrupted once by a dozor rebuild (HTTP 503 mid-sweep); re-ran fresh against the new container. Numbers above are the clean re-run.
+- Bench was interrupted once by a the deployment system rebuild (HTTP 503 mid-sweep); re-ran fresh against the new container. Numbers above are the clean re-run.
 - `tokenizer_duration_seconds_count` is only 2-3 (vs 88-89 inference calls) because the **token cache (H.7) hit on most repeated bench calls** — bench fires the same `(query, doc)` pair across iterations. Real prod traffic will populate this histogram far more.
 - Concurrency = 4 saturates `MAX_CONCURRENT_RERANK_REQUESTS=4` cap; tail latency at this point reflects backpressure, not raw model speed. Use c=1 cells for clean inference comparison.
 - Padding waste = 0 across the board because fixtures replicate one snippet `--docs-per-req` times. Real production has mixed lengths — this metric will move.

@@ -1,0 +1,59 @@
+name: preflight
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install cargo-nextest
+        run: |
+          curl -sSfL https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.140/cargo-nextest-0.9.140-aarch64-unknown-linux-gnu.tar.gz \
+            | tar -xz -C ~/.cargo/bin
+
+      - name: Install cargo-deny
+        run: |
+          curl -sSfL https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-aarch64-unknown-linux-musl.tar.gz \
+            | tar -xz -C ~/.cargo/bin --strip-components=1
+
+      - name: fmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --locked --all-targets --workspace -- -D warnings
+
+      - name: deny
+        run: cargo deny check
+
+      - name: test
+        run: cargo nextest run --locked --all-targets --workspace
+
+      - name: build
+        run: cargo build --release --locked

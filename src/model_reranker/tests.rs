@@ -14,7 +14,7 @@ use super::RerankerModel;
 /// Resolution order:
 ///   1. `RERANKER_TEST_DIR` env var (CI / alt dev boxes).
 ///   2. Default on-box path
-///      `/home/krolik/deploy/krolik-server/models/gte-multi-rerank`.
+///      the directory passed via `RERANKER_MODELS` env.
 fn load_reranker_or_skip() -> Option<RerankerModel> {
     load_reranker_or_skip_with_pool(1)
 }
@@ -23,8 +23,9 @@ fn load_reranker_or_skip() -> Option<RerankerModel> {
 /// concurrent-pool test can request a 2-session model. Existing tests
 /// stay on the single-session helper unchanged.
 fn load_reranker_or_skip_with_pool(pool_size: usize) -> Option<RerankerModel> {
-    const DEFAULT_DIR: &str = "/home/krolik/deploy/krolik-server/models/gte-multi-rerank";
-    let dir = std::env::var("RERANKER_TEST_DIR").unwrap_or_else(|_| DEFAULT_DIR.to_string());
+    let default_dir = std::env::var("TEST_RERANKER_DIR")
+        .unwrap_or_else(|_| "/models/gte-multi-rerank".to_string());
+    let dir = std::env::var("RERANKER_TEST_DIR").unwrap_or(default_dir);
     if !Path::new(&dir).join("tokenizer.json").exists()
         || !Path::new(&dir).join("model_quantized.onnx").exists()
     {
@@ -210,9 +211,9 @@ fn warmup_runs_for_all_requested_shapes() {
 /// pattern as the rest of this file.
 #[test]
 fn legacy_unsuffixed_static_loads_as_b1() {
-    const DEFAULT_DIR: &str =
-        "/home/krolik/deploy/krolik-server/models/gte-reranker-modernbert-base";
-    let dir = std::env::var("MODERNBERT_TEST_DIR").unwrap_or_else(|_| DEFAULT_DIR.to_string());
+    let default_dir = std::env::var("TEST_MODERNBERT_DIR")
+        .unwrap_or_else(|_| "/models/gte-reranker-modernbert-base".to_string());
+    let dir = std::env::var("MODERNBERT_TEST_DIR").unwrap_or(default_dir);
     let static_legacy = Path::new(&dir).join("model_quantized_static.onnx");
     let dynamic = Path::new(&dir).join("model_quantized.onnx");
     let tok = Path::new(&dir).join("tokenizer.json");

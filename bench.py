@@ -1,11 +1,11 @@
-# /home/krolik/src/embed-server/bench.py
+# bench.py
 """Benchmark harness for embed-server.
 
 Supports `/v1/embeddings` (default) and `/v1/rerank` endpoints, with
 configurable concurrency, batch shape, and output format.
 
 For ModernBERT vs gte-multi head-to-head: see `docs/plans/2026-05-01-modernbert-optimization.md`
-Phase 2 — recommended sweep mirrors the real memdb-go consumer:
+Phase 2 — recommended sweep mirrors the real the downstream consumer consumer:
 `--kind rerank --docs-per-req {5,20,50} --size {short,medium,long}`.
 """
 import argparse
@@ -41,7 +41,7 @@ CODE_MEDIUM = (
 ) * 2
 CODE_LONG = CODE_MEDIUM * 4
 
-# Realistic memdb-go-shaped query: short, declarative, English. Phase 2
+# Realistic the downstream consumer-shaped query: short, declarative, English. Phase 2
 # bench should NOT use a paragraph-length query — that's not what the
 # /v1/rerank handler ever sees in production.
 RERANK_QUERY = "what does the function do"
@@ -158,7 +158,7 @@ def _parse_scenarios(spec: str) -> list[tuple[int, int]]:
 # ---------------------------------------------------------------------
 
 DEFAULT_SCENARIOS_EMBED = "1x20,4x40,10x40,20x40,40x40"
-# Rerank-specific defaults mirror the real memdb-go consumer pattern:
+# Rerank-specific defaults mirror the real the downstream consumer consumer pattern:
 # `MAX_CONCURRENT_RERANK_REQUESTS=4` server-side cap → benching above c=4
 # only measures 429 backoff. D7 sub-query fanout produces 3-5 parallel
 # calls per chat turn, so c=1/4/10 covers the operational envelope.
@@ -195,7 +195,7 @@ def main() -> None:
         type=int,
         default=5,
         help="Documents per /v1/rerank request. Ignored for --kind text|code. "
-        "Default 5 mirrors memdb-go's typical D7 sub-query candidate count.",
+        "Default 5 mirrors the downstream consumer's typical D7 sub-query candidate count.",
     )
     p.add_argument(
         "--scenarios",

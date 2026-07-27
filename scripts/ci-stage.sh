@@ -5,7 +5,7 @@
 # Usage: scripts/ci-stage.sh <name> <cmd> [args...]
 #   $ scripts/ci-stage.sh fmt cargo fmt --all -- --check
 #
-# Pattern is the same shape dozor uses for compose deploys: every phase
+# Pattern is the same shape the deployment system uses for compose deploys: every phase
 # writes to its own log under $LOGDIR (default /tmp/embed-server-ci) and
 # the operator can post-mortem any failed stage by `cat`-ing that file.
 set -o pipefail

@@ -13,7 +13,7 @@ The current `jina-code-v2` ONNX file ships with only `[input_ids, attention_mask
 inputs (no `token_type_ids`), which avoids the 3-named-input code path in `ort`
 that triggered the 1000x slowdown. With that file, `embed-server` runs jina
 natively in Rust — the Python `embed-jina` sidecar was retired in April 2026
-and archived at `github.com:anatolykoptev/ox-embed-jina` (tag `retired-2026-04-17`).
+and archived at `a private archive repo` (tag `retired-2026-04-17`).
 
 Verified in prod: jina-code-v2 p50 ~1.7 s single-query, ~2.4 s at conc=4
 (Oracle ARM Neoverse-N1, 4 vCPU). No 30 s outliers observed.
@@ -24,7 +24,7 @@ pykeio/ort releases remains prudent.
 
 ### Problem
 
-The Rust `ort` crate produces 1000x slower inference for certain BERT-family ONNX models on ARM (Neoverse-N1 / Oracle Cloud A1). Specifically:
+The Rust `ort` crate produces 1000x slower inference for certain BERT-family ONNX models on ARM (Neoverse-N1 / ARM cloud instance). Specifically:
 
 | Model | ort (Rust) | Python onnxruntime | Go onnxruntime_go |
 |-------|-----------|-------------------|-------------------|
@@ -149,7 +149,7 @@ Key requirements:
 **Status:** RESOLVED (2026-05-09 3-layer fix; **architecturally eliminated 2026-05-12 multi-process refactor — jina-code-v2 now runs in its own process with isolated BFCArena, fragmentation cannot cross-poison other models**)
 **Severity:** Critical (~1 failure/min in prod for ~30 min; later 92% error rate from arena fragmentation cycles motivated the multi-process refactor)
 **Date:** 2026-05-09 (incident discovered, escalated, 3-layer fix shipped same day); 2026-05-12 (root cause eliminated via per-process arena isolation)
-**Component:** ox-embed-server batcher + ONNX Runtime BFCArena + downstream HTTP clients (memdb-go, go-code via go-kit/embed.Client)
+**Component:** ox-embed-server batcher + ONNX Runtime BFCArena + downstream HTTP clients (the downstream consumer, the downstream consumer via the shared client library/embed.Client)
 
 ### TL;DR
 
@@ -165,7 +165,7 @@ B × H × S² × 4 bytes  =  100 × 12 × 512² × 4  =  1,258,291,200 bytes  (1
 
 | Layer | Pre-incident value | Effect on bug |
 |---|---|---|
-| memdb-go `texts []string` | unbounded | sends 100-doc arrays |
+| the downstream consumer `texts []string` | unbounded | sends 100-doc arrays |
 | ox-embed-server batcher | first-item-admit unconditional | bypasses BATCH_MAX=8 |
 | jina max_len | **512** (PR #80, May 7) | quadratic scratch growth — was 256 before |
 | `EMBED_ARENA_MAX_MEM_BYTES` | 3 GiB (PR #98) | leaves only ~1.16 GiB free for scratch |
@@ -175,7 +175,7 @@ Each PR was safe in isolation. The combination + the latent unbounded-array bug 
 
 ### Discovery
 
-`mcp__go-code__debug_investigate` on the embed-server service window after PR #48 deploy showed:
+`debug investigation` on the embed-server service window after PR #48 deploy showed:
 
 - `embed_request_duration_seconds_p99` spike **×93.77**
 - `embed_inference_failures_total` rate **+Inf** (counter appeared from zero)
@@ -188,7 +188,7 @@ Three passes of `debug_investigate` traced the root cause from latency symptom �
 2. **Pass 2 (after PR #102 EvictablePool rollback)**: failures **continued** — proof EvictablePool was a victim, not the cause. Pointed at pool=2 + arena cap interaction.
 3. **Pass 3 (after PR #103 arena 3→4 GiB raise)**: failures STILL continued at lower rate. `embed_inference_attention_scratch_bytes` histogram showed 35/53 jina inferences in the 1-4 GB bucket. Reverse-math: `1.258 GB / (12 × 4) = B × S²` → with S=512, `B=100`. With BATCH_MAX=8, this is impossible from coalesced batches — must be **single Item with n_texts=100**.
 
-`mcp__go-code__understand` on `EmbedModel.embed_tokens` + `BatchAccum.fits` confirmed the batcher first-item-admit gate.
+`code analysis` on `EmbedModel.embed_tokens` + `BatchAccum.fits` confirmed the batcher first-item-admit gate.
 
 ### Resolution — 3-layer fix shipped 2026-05-09
 
@@ -201,7 +201,7 @@ Three passes of `debug_investigate` traced the root cause from latency symptom �
   - `embed_input_array_rejected_total{model,reason}` counter — rejects observed
   - `embed_batcher_first_item_oversize_total{model,reason}` — fires when first-item-admit accepts an Item that would have failed normal `fits()`
 
-**Layer 2 — Client-side chunking in `go-kit/embed.Client` (go-kit PR #48 → tagged v0.49.0; v0.50.0 includes it):**
+**Layer 2 — Client-side chunking in `the shared client library/embed.Client` (the shared client library PR #48 → tagged v0.49.0; v0.50.0 includes it):**
 
 - Transparent client-side chunking: `Client.Embed()` and `Client.EmbedWithResult()` auto-split `len(texts) > chunkSize` into sequential sub-batches (default 32, env `GOKIT_EMBED_CHUNK_SIZE`).
 - Chunking gate placed **above** fallback routing (BLOCKER fix from review): fallback-wired clients also chunk. `dispatchChunk()` helper preserves fallback semantics per chunk.
@@ -212,10 +212,10 @@ Three passes of `debug_investigate` traced the root cause from latency symptom �
 
 **Layer 3 — Downstream consumers:**
 
-- `memdb-go` PR #311 (commit `63ad3876`): bumped go-kit to v0.50.0, removed wrapper-level chunking duplicate from `internal/embedder/http.go` (PR #310 was a temporary defense-in-depth pre-go-kit-lift). `MEMDB_EMBED_CHUNK_SIZE` aliased to `WithChunkSize` opt at construction so existing operator config keeps working.
-- `go-code` PR #91 (commit `dc9d25a`): already on go-kit v0.50.0 (transparent protection — no code change at call sites).
+- `the downstream consumer` PR #311 (commit `63ad3876`): bumped the shared client library to v0.50.0, removed wrapper-level chunking duplicate from `internal/embedder/http.go` (PR #310 was a temporary defense-in-depth pre-the shared client library-lift). `EMBED_CHUNK_SIZE` aliased to `WithChunkSize` opt at construction so existing operator config keeps working.
+- `the downstream consumer` PR #91 (commit `dc9d25a`): already on the shared client library v0.50.0 (transparent protection — no code change at call sites).
 
-**krolik-server compose updates (PR sequence):**
+**the deploy repo compose updates (PR sequence):**
 
 - PR #98 (pre-incident): `EMBED_ARENA_MAX_MEM_BYTES` 6→3 GiB
 - PR #99 (pre-incident): `EMBED_SESSION_POOL_SIZE` 1→2 (latency win)
@@ -238,7 +238,7 @@ curl -s -X POST http://127.0.0.1:8082/v1/embeddings \
 # Server cap counter:
 curl -s http://127.0.0.1:8082/metrics | grep embed_input_array_rejected_total
 
-# Client chunking metric (memdb-go side, after first chunked call):
+# Client chunking metric (the downstream consumer side, after first chunked call):
 curl -s http://127.0.0.1:8080/metrics | grep embed_chunks_per_call
 # Expects: histogram with sample count > 0; sum equals total chunk count
 ```
@@ -249,29 +249,29 @@ curl -s http://127.0.0.1:8080/metrics | grep embed_chunks_per_call
 2. **`debug_investigate` cross-references metrics + traces + symbols across boundaries.** Single-source observation (logs only, metrics only) would not have pinpointed the batcher first-item-admit path. Three iterative passes narrowed from latency spike → arena cap interaction → unbounded-array root cause.
 3. **Defense in depth.** Server-side cap protects from any future client. Client-side chunking in shared lib protects all current consumers transparently. Either layer alone would have stopped this incident.
 4. **Emergency band-aids must be marked TEMPORARY.** PR #104 (pool=1) stopped the bleeding but degraded p95 latency. The fix isn't complete until the band-aid is removed (PR #107).
-5. **Reviewer is gold for concurrency code.** The go-kit PR #48 reviewer caught a BLOCKER (WithFallback bypassing chunking gate) that would have caused silent failures for any caller using fallback chains. Tests passed before the fix — review caught what tests didn't.
+5. **Reviewer is gold for concurrency code.** The the shared client library PR #48 reviewer caught a BLOCKER (WithFallback bypassing chunking gate) that would have caused silent failures for any caller using fallback chains. Tests passed before the fix — review caught what tests didn't.
 
 ### Cross-references
 
 - ox-embed-server: PRs #46 (ALiBi precompute), #47 (per-model ONNX cache + arena docs), #48 (EvictablePool port), #49 (server cap), #50 (this BUG-004 doc)
-- go-kit: PR #48 → tag v0.49.0/v0.50.0 (lift chunking to shared Client)
-- memdb-go: PR #310 (wrapper chunking — temporary), #311 (cleanup + bump v0.50.0)
-- go-code: PR #91 (bump go-kit v0.50.0)
-- go-search: PR #19 (bump go-kit v0.37.1 → v0.50.0), #20 (explicit `WithChunkSize(32)` opt + dead-code cleanup)
-- krolik-server: PRs #98, #99, #102 (rollback), #103, #104 (band-aid), #107 (restore)
+- the shared client library: PR #48 → tag v0.49.0/v0.50.0 (lift chunking to shared Client)
+- the downstream consumer: PR #310 (wrapper chunking — temporary), #311 (cleanup + bump v0.50.0)
+- the downstream consumer: PR #91 (bump the shared client library v0.50.0)
+- the downstream consumer: PR #19 (bump the shared client library v0.37.1 → v0.50.0), #20 (explicit `WithChunkSize(32)` opt + dead-code cleanup)
+- the deploy repo: PRs #98, #99, #102 (rollback), #103, #104 (band-aid), #107 (restore)
 
 ### Service version map (post-incident)
 
-All consumers of `go-kit/embed.Client` should be on **v0.50.0** to get transparent chunking:
+All consumers of `the shared client library/embed.Client` should be on **v0.50.0** to get transparent chunking:
 
-| Service | go-kit version | Notes |
+| Service | the shared client library version | Notes |
 |---|---|---|
 | `ox-embed-server` | n/a (Rust) | Server-side `EMBED_MAX_INPUT_ARRAY=32` cap |
-| `memdb-go` | v0.50.0 | PR #311 — wrapper chunking removed, delegates to go-kit |
-| `go-code` | v0.50.0 | PR #91 — transparent protection |
-| `go-search` | v0.50.0 | PR #19 + #20 — explicit `WithChunkSize(32)` |
+| `the downstream consumer` | v0.50.0 | PR #311 — wrapper chunking removed, delegates to the shared client library |
+| `the downstream consumer` | v0.50.0 | PR #91 — transparent protection |
+| `the downstream consumer` | v0.50.0 | PR #19 + #20 — explicit `WithChunkSize(32)` |
 
-If a future consumer is added, bump go-kit ≥ v0.49.0 (chunking) or v0.50.0 (chunking + tracing/httpmw) at construction.
+If a future consumer is added, bump the shared client library ≥ v0.49.0 (chunking) or v0.50.0 (chunking + tracing/httpmw) at construction.
 
 ### Known limitations (followup-tracked)
 
@@ -279,11 +279,11 @@ These are gaps deliberately left open at the time of BUG-004 closure. Each has a
 
 1. **`/v1/rerank` documents-array cap** — ✅ **CLOSED by PR #52** (commit on main). Added `RERANK_MAX_INPUT_DOCS` env (default 32), HTTP 400 on overflow, new metrics `embed_rerank_input_docs_size{model="unknown"}` + `embed_rerank_input_docs_rejected_total{model="unknown",reason}` (the `model="unknown"` label is a placeholder for schema symmetry with embed cap counters — the cap fires before model resolution from request body, so the actual model is not yet known at recording time).
 
-2. **`embed_chunks_per_call` histogram low informativeness for go-search** — go-search's pipeline never exceeds 32 texts per call (`MAX_FETCH_URLS+1=9` max, `embedding_answer` caps at 24). The histogram will always show `chunks_per_call=1` for go-search labels. Operators watching `/metrics` see new series with no signal. Not harmful — Noted only.
+2. **`embed_chunks_per_call` histogram low informativeness for the downstream consumer** — the downstream consumer's pipeline never exceeds 32 texts per call (`MAX_FETCH_URLS+1=9` max, `embedding_answer` caps at 24). The histogram will always show `chunks_per_call=1` for the downstream consumer labels. Operators watching `/metrics` see new series with no signal. Not harmful — Noted only.
 
 3. **Verification command portability** — the `seq -s, -f '"x"' 1 33` pattern in the verification block above is bash/Linux only (different `seq` flag semantics on macOS). Operators on macOS workstations should generate the payload differently. Noted; not blocking.
 
-4. **`go-kit/embed` env parsing inconsistency** — go-kit PR #48 introduced env reading inline in `client_v2.go` (warn-on-failure pattern) rather than going through a shared factory.go-style helper. Not a bug — just style drift inside the lib. Noted in PR #48 review NIT.
+4. **`the shared client library/embed` env parsing inconsistency** — the shared client library PR #48 introduced env reading inline in `client_v2.go` (warn-on-failure pattern) rather than going through a shared factory.go-style helper. Not a bug — just style drift inside the lib. Noted in PR #48 review NIT.
 
 5. **`/embed_sparse` (SPLADE) input-array cap not enforced** — `src/api_splade.rs` carries `embed_max_input_array` field on `AppState` (test constructor sets it), but the live handler never checks `req.input.len() > cap`. PR #49 originally claimed both `/v1/embeddings` and `/embed_sparse` were capped — fact-check during PR #52 review showed only `/v1/embeddings` enforces. SPLADE uses a different pool (smaller models, lower scratch) so the immediate OOM risk is lower than embed/rerank, but the same class-of-bug recurrence-risk pattern applies for any future model swap. **Followup PR**: mirror PR #49's pattern in `api_splade.rs`. **Env naming decision (operator tradeoff)**: prefer a separate `SPLADE_MAX_INPUT_ARRAY` (default 32) rather than reusing `EMBED_MAX_INPUT_ARRAY` — SPLADE has different model size, per-text scratch, and traffic pattern (sequential, no batcher, typically single-doc indexing); coupling tuning of two unrelated load profiles via one knob means a future SPLADE model swap silently changes dense embed cap behaviour. Counter labels: reuse `embed_input_array_rejected_total{model,reason}` — `model` label carries the SPLADE model name (e.g. `splade-v3-distilbert`), NOT the endpoint path — sufficient to distinguish series without adding an `endpoint` label that would fork existing dashboards.
 

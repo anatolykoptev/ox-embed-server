@@ -240,7 +240,7 @@ pub struct Config {
     /// memory-pattern / arena-allocation cost so the FIRST production
     /// request at that shape doesn't see the cold-path spike. Default
     /// `[1, 5]` covers the two prod-traffic shapes: batch=1 (the static
-    /// fast-path single-pair calls) and batch=5 (memdb-go's D7 sub-query
+    /// fast-path single-pair calls) and batch=5 (the downstream consumer's D7 sub-query
     /// fanout default). Operators set `RERANK_WARMUP_BATCH_SIZES` to
     /// override (e.g. `1,2,5,10` for boxes serving wider batch ranges).
     pub rerank_warmup_batch_sizes: Vec<usize>,
@@ -248,7 +248,7 @@ pub struct Config {
     ///
     /// Default `[1, 8]`: batch=1 covers the trivial `/v1/embeddings`
     /// caller, batch=8 matches the `texts_per_req=8` default the typical
-    /// memdb-go embedder client uses. Override via
+    /// the downstream consumer embedder client uses. Override via
     /// `EMBED_WARMUP_BATCH_SIZES`.
     pub embed_warmup_batch_sizes: Vec<usize>,
     /// Per-shape warmup batch sizes for SPLADE sparse encoders.
@@ -305,7 +305,7 @@ pub struct Config {
     /// **Why 32**: jina-code-v2 (12 heads, max_len=512) attention scratch
     /// per inference is `B × H × S² × 4`. At the cap:
     ///   32 × 12 × 512² × 4 ≈ 402 MiB (under the 512 MiB safe threshold).
-    /// At 100 texts (the memdb-go client's former default):
+    /// At 100 texts (the downstream consumer client's former default):
     ///   100 × 12 × 512² × 4 ≈ 1.258 GiB → BFCArena OOM (~1/min in prod).
     ///
     /// **Override**: set `EMBED_MAX_INPUT_ARRAY` to a positive integer.

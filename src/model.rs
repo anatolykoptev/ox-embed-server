@@ -1202,15 +1202,14 @@ mod truncation_tests {
     /// 1. `E5_TOKENIZER_PATH` env var (lets CI / other dev boxes point at
     ///    wherever they've staged the model bundle).
     /// 2. Default on-box path
-    ///    `/home/krolik/deploy/krolik-server/models/multilingual-e5-large/tokenizer.json`.
+    ///    `/models/multilingual-e5-large/tokenizer.json`.
     ///
     /// When neither exists, the test returns `None` and the caller
     /// early-returns after printing a visible skip notice. The skip line
     /// is loud on purpose so the test doesn't silently vanish from CI
     /// output the way `#[ignore]` would.
     fn load_tokenizer_or_skip() -> Option<Tokenizer> {
-        const DEFAULT_PATH: &str =
-            "/home/krolik/deploy/krolik-server/models/multilingual-e5-large/tokenizer.json";
+        const DEFAULT_PATH: &str = "/models/multilingual-e5-large/tokenizer.json";
         let p = std::env::var("E5_TOKENIZER_PATH").unwrap_or_else(|_| DEFAULT_PATH.to_string());
         if !std::path::Path::new(&p).exists() {
             eprintln!(

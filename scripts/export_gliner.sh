@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-OUT="${OUT:-/home/krolik/deploy/krolik-server/models/gliner-small-v2.1}"
+OUT="${OUT:-./models/gliner-small-v2.1}"
 VENV="${VENV:-/tmp/venv-embed-export}"
 
 mkdir -p "$OUT"
