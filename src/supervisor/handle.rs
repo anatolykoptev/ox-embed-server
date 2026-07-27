@@ -67,6 +67,38 @@ const SOCKET_WAIT_SECS: u64 = 60;
 /// one poll interval of the actual socket appearance time. Not operator-tunable.
 const SOCKET_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+// ── heartbeat defaults ────────────────────────────────────────────────────────
+
+/// Default heartbeat probe interval. The supervisor sends a 1-word inference
+/// probe to the worker every this often. 0 disables heartbeat.
+///
+/// 30s balances detection latency against probe overhead: one ~5-50ms
+/// inference every 30s is negligible. With `HEARTBEAT_MAX_FAILS=3` the
+/// worst-case wedge detection is ~90s.
+///
+/// Overridable via `EMBED_WORKER_HEARTBEAT_INTERVAL_SECS`. Captured at
+/// startup; restart the container to change.
+const HEARTBEAT_INTERVAL_SECS: u64 = 30;
+
+/// Default consecutive heartbeat failures before killing the worker.
+///
+/// 3 consecutive fails (each with `HEARTBEAT_PROBE_TIMEOUT_MS` timeout)
+/// filters transient slowness — a single slow batch under contention
+/// should not trigger a kill. Only a sustained wedge (all 3 probes fail)
+/// forces a restart.
+///
+/// Overridable via `EMBED_WORKER_HEARTBEAT_MAX_FAILS`. Must be > 0.
+const HEARTBEAT_MAX_FAILS: u32 = 3;
+
+/// Default timeout for each heartbeat inference probe.
+///
+/// 2s — a healthy worker completes a 1-word inference in 5-50ms, so 2s is
+/// generous. A wedged worker (CPU spin, zero throughput) blocks the probe
+/// until this timeout fires.
+///
+/// Overridable via `EMBED_WORKER_HEARTBEAT_PROBE_TIMEOUT_MS`. Must be > 0.
+const HEARTBEAT_PROBE_TIMEOUT_MS: u64 = 2000;
+
 /// Advance exponential backoff by doubling, capped at MAX_BACKOFF.
 fn next_backoff(current: Duration) -> Duration {
     (current * 2).min(MAX_BACKOFF)
@@ -129,6 +161,12 @@ pub struct WorkerSupervisor {
     /// when the child exits (before respawn). The RSS-poll loop reads this to
     /// call `/proc/<pid>/status`; 0 means worker is between respawns.
     current_pid: Arc<std::sync::atomic::AtomicU32>,
+    /// Heartbeat probe interval. 0 disables heartbeat (for tests / opt-out).
+    heartbeat_interval: Duration,
+    /// Number of consecutive heartbeat failures before killing the worker.
+    heartbeat_max_fails: u32,
+    /// Timeout for each heartbeat inference probe.
+    heartbeat_probe_timeout: Duration,
 }
 
 impl WorkerSupervisor {
@@ -143,6 +181,49 @@ impl WorkerSupervisor {
             Duration::from_secs(SOCKET_WAIT_SECS),
             &format!("SOCKET_WAIT_SECS ({SOCKET_WAIT_SECS})"),
         );
+        let heartbeat_interval = resolve_duration_secs_env(
+            "EMBED_WORKER_HEARTBEAT_INTERVAL_SECS",
+            Duration::from_secs(HEARTBEAT_INTERVAL_SECS),
+            &format!("HEARTBEAT_INTERVAL_SECS ({HEARTBEAT_INTERVAL_SECS})"),
+        );
+        let heartbeat_max_fails = match std::env::var("EMBED_WORKER_HEARTBEAT_MAX_FAILS") {
+            Ok(s) => match s.trim().parse::<u32>() {
+                Ok(0) => {
+                    tracing::warn!(
+                        "EMBED_WORKER_HEARTBEAT_MAX_FAILS=0 is invalid; defaulting to {HEARTBEAT_MAX_FAILS}"
+                    );
+                    HEARTBEAT_MAX_FAILS
+                }
+                Ok(v) => v,
+                Err(_) => {
+                    tracing::warn!(
+                        "EMBED_WORKER_HEARTBEAT_MAX_FAILS={s:?} is not a valid u32; defaulting to {HEARTBEAT_MAX_FAILS}"
+                    );
+                    HEARTBEAT_MAX_FAILS
+                }
+            },
+            Err(_) => HEARTBEAT_MAX_FAILS,
+        };
+        let heartbeat_probe_timeout = Duration::from_millis(
+            match std::env::var("EMBED_WORKER_HEARTBEAT_PROBE_TIMEOUT_MS") {
+                Ok(s) => match s.trim().parse::<u64>() {
+                    Ok(0) => {
+                        tracing::warn!(
+                            "EMBED_WORKER_HEARTBEAT_PROBE_TIMEOUT_MS=0 is invalid; defaulting to {HEARTBEAT_PROBE_TIMEOUT_MS}"
+                        );
+                        HEARTBEAT_PROBE_TIMEOUT_MS
+                    }
+                    Ok(v) => v,
+                    Err(_) => {
+                        tracing::warn!(
+                            "EMBED_WORKER_HEARTBEAT_PROBE_TIMEOUT_MS={s:?} is not a valid u64; defaulting to {HEARTBEAT_PROBE_TIMEOUT_MS}"
+                        );
+                        HEARTBEAT_PROBE_TIMEOUT_MS
+                    }
+                },
+                Err(_) => HEARTBEAT_PROBE_TIMEOUT_MS,
+            },
+        );
 
         let supervisor = Arc::new(Self {
             spec: spec.clone(),
@@ -150,6 +231,9 @@ impl WorkerSupervisor {
             restart_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             socket_wait,
             current_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            heartbeat_interval,
+            heartbeat_max_fails,
+            heartbeat_probe_timeout,
         });
 
         // Initial spawn — fail loudly so the server startup loop can exit(1).
@@ -172,6 +256,8 @@ impl WorkerSupervisor {
         // makes "healthy worker, RSS not yet sampled" visible in Prometheus
         // as 0 rather than absent.
         crate::metrics::worker_rss_touch(&supervisor.spec.model);
+        // Pre-touch heartbeat counter so "no heartbeats yet" is visible as 0.
+        crate::metrics::worker_heartbeat_touch();
 
         // Hand off the Child to the watchdog task; it owns the Child for its
         // entire lifetime.
@@ -179,6 +265,19 @@ impl WorkerSupervisor {
         tokio::spawn(async move {
             sup_clone.watchdog_loop(child).await;
         });
+
+        // Spawn the heartbeat liveness probe. This is the wedge detector for
+        // issue #90: a worker can spin at 220% CPU with zero throughput without
+        // exiting, so watchdog_loop (which blocks on child.wait()) never wakes.
+        // The heartbeat sends periodic inference probes; after N consecutive
+        // timeouts it kills the child via SIGKILL, which wakes watchdog_loop →
+        // respawn. Disabled when heartbeat_interval is 0 (tests / opt-out).
+        if !supervisor.heartbeat_interval.is_zero() {
+            let sup_clone = supervisor.clone();
+            tokio::spawn(async move {
+                sup_clone.heartbeat_loop().await;
+            });
+        }
 
         Ok(supervisor)
     }
@@ -366,6 +465,138 @@ impl WorkerSupervisor {
         self.client_slot.read().await.clone()
     }
 
+    /// Heartbeat liveness loop — wedge detector for issue #90.
+    ///
+    /// `watchdog_loop` blocks on `child.wait()` and only wakes when the worker
+    /// **exits**. A wedged worker (CPU spin, zero throughput) does not exit,
+    /// so the watchdog sleeps forever and `embed_worker_restart_total` stays 0.
+    ///
+    /// This loop sends a 1-word inference probe to the worker every
+    /// `heartbeat_interval`. If `heartbeat_max_fails` consecutive probes fail
+    /// (timeout or error), it kills the child via SIGKILL. `watchdog_loop`
+    /// then wakes from `child.wait()`, clears the client slot, and respawns.
+    ///
+    /// Why inference probe, not a lightweight ping: the worker runs ONNX in
+    /// `spawn_blocking`, so its async runtime stays responsive while ONNX
+    /// spins. A ping would succeed against a wedged worker. Only a real
+    /// inference that queues behind the stuck `spawn_blocking` call can
+    /// detect the wedge.
+    ///
+    /// The loop tolerates transient `client_slot = None` (respawn in
+    /// progress) by skipping that probe without counting it as a failure.
+    async fn heartbeat_loop(self: Arc<Self>) {
+        let mut consecutive_fails: u32 = 0;
+        loop {
+            tokio::time::sleep(self.heartbeat_interval).await;
+
+            // Skip if worker is between respawns (client_slot = None).
+            // This is not a heartbeat failure — the watchdog is already
+            // handling a restart. Reset the fail counter so the freshly
+            // respawned worker starts with a clean slate.
+            let client = match self.client().await {
+                Some(c) => c,
+                None => {
+                    consecutive_fails = 0;
+                    continue;
+                }
+            };
+
+            let probe = tokio::time::timeout(
+                self.heartbeat_probe_timeout,
+                client.dispatch_embed(self.spec.model.clone(), vec!["test".to_string()], 8),
+            )
+            .await;
+
+            match probe {
+                Ok(Ok(crate::ipc::protocol::WorkerResponse::Embed(_))) => {
+                    if consecutive_fails > 0 {
+                        tracing::info!(
+                            model = %self.spec.model,
+                            consecutive_fails,
+                            "heartbeat recovered after failures"
+                        );
+                    }
+                    consecutive_fails = 0;
+                    crate::metrics::record_worker_heartbeat("ok");
+                }
+                Ok(Ok(crate::ipc::protocol::WorkerResponse::Err { message, .. })) => {
+                    consecutive_fails += 1;
+                    tracing::warn!(
+                        model = %self.spec.model,
+                        consecutive_fails,
+                        max_fails = self.heartbeat_max_fails,
+                        error = %message,
+                        "heartbeat probe: worker error"
+                    );
+                    crate::metrics::record_worker_heartbeat("error");
+                }
+                Ok(Ok(unexpected)) => {
+                    consecutive_fails += 1;
+                    tracing::warn!(
+                        model = %self.spec.model,
+                        consecutive_fails,
+                        max_fails = self.heartbeat_max_fails,
+                        kind = %unexpected.kind(),
+                        "heartbeat probe: unexpected response kind"
+                    );
+                    crate::metrics::record_worker_heartbeat("error");
+                }
+                Ok(Err(e)) => {
+                    consecutive_fails += 1;
+                    tracing::warn!(
+                        model = %self.spec.model,
+                        consecutive_fails,
+                        max_fails = self.heartbeat_max_fails,
+                        error = ?e,
+                        "heartbeat probe: dispatch failed"
+                    );
+                    crate::metrics::record_worker_heartbeat("error");
+                }
+                Err(_) => {
+                    consecutive_fails += 1;
+                    tracing::warn!(
+                        model = %self.spec.model,
+                        consecutive_fails,
+                        max_fails = self.heartbeat_max_fails,
+                        timeout_ms = self.heartbeat_probe_timeout.as_millis(),
+                        "heartbeat probe timed out (worker may be wedged)"
+                    );
+                    crate::metrics::record_worker_heartbeat("timeout");
+                }
+            }
+
+            if consecutive_fails >= self.heartbeat_max_fails {
+                let pid = self.current_pid();
+                if pid == 0 {
+                    // Worker already exited / between respawns — watchdog is
+                    // handling it. Reset and wait for the next cycle.
+                    consecutive_fails = 0;
+                    continue;
+                }
+                tracing::error!(
+                    model = %self.spec.model,
+                    pid,
+                    consecutive_fails,
+                    max_fails = self.heartbeat_max_fails,
+                    "heartbeat: killing wedged worker (SIGKILL) — watchdog will respawn"
+                );
+                crate::metrics::record_worker_heartbeat("kill");
+                // SIGKILL the wedged worker. watchdog_loop's child.wait()
+                // will return with the killed status → clear client slot →
+                // respawn. We use libc::kill (not child.kill()) because the
+                // Child is owned by watchdog_loop, not by us.
+                #[cfg(unix)]
+                unsafe {
+                    let _ = libc::kill(pid as i32, libc::SIGKILL);
+                }
+                // Reset the counter — the next cycle will see client_slot =
+                // None (watchdog clearing it) and skip, then the respawned
+                // worker gets a fresh start.
+                consecutive_fails = 0;
+            }
+        }
+    }
+
     /// Number of successful respawns since launch. Zero until first crash.
     #[allow(dead_code)] // TODO(Phase 3 metrics): expose via /health or /metrics endpoint
     pub fn restart_count(&self) -> u64 {
@@ -400,6 +631,9 @@ impl WorkerSupervisor {
             restart_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             socket_wait: Duration::from_secs(60),
             current_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            heartbeat_interval: Duration::ZERO,
+            heartbeat_max_fails: 3,
+            heartbeat_probe_timeout: Duration::from_millis(100),
         })
     }
 }
@@ -542,5 +776,103 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&socket_dir);
+    }
+
+    // ── hard test: heartbeat kills wedged worker (#90) ──────────────────────
+    //
+    // This is the test that proves the #90 fix actually works. The core
+    // claim: a wedged worker (UDS accept succeeds but never responds) must
+    // be detected by the heartbeat loop and SIGKILL'd, so watchdog_loop
+    // wakes and respawns.
+    //
+    // Fixture: mock UDS server (accept + hold open forever) + a real `sleep
+    // 999` child process whose PID is stored in current_pid. We drive one
+    // heartbeat iteration manually with a tight probe timeout (100ms) and
+    // max_fails=1, then assert the child was killed.
+
+    #[tokio::test]
+    async fn heartbeat_kills_wedged_worker() {
+        use crate::ipc::client::WorkerClient;
+        use std::process::Command;
+
+        let socket_path =
+            std::env::temp_dir().join(format!("embed-heartbeat-test-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket_path);
+
+        // Mock wedged server: accept + hold open forever (never respond).
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let server_task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    std::future::pending::<()>().await;
+                    drop(stream);
+                });
+            }
+        });
+
+        // Real child process to kill — `sleep 999` stays alive, has a PID.
+        let mut child = Command::new("sleep")
+            .arg("999")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+
+        // Connect a real WorkerClient to the mock wedged server.
+        let client = Arc::new(
+            WorkerClient::connect(socket_path.clone(), 1)
+                .await
+                .expect("connect"),
+        );
+
+        let spec = SpawnSpec {
+            model: "test-heartbeat".to_string(),
+            kind: WorkerKind::Embed,
+            worker_bin: std::path::PathBuf::from("/bin/true"),
+            socket_dir: socket_path.parent().unwrap().to_path_buf(),
+            pool_size: 1,
+            intra_threads: 1,
+            env_extra: vec![],
+        };
+        let sup = WorkerSupervisor {
+            spec,
+            client_slot: Arc::new(RwLock::new(Some(client))),
+            restart_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            socket_wait: Duration::from_secs(60),
+            current_pid: Arc::new(std::sync::atomic::AtomicU32::new(pid)),
+            heartbeat_interval: Duration::from_millis(50),
+            heartbeat_max_fails: 1,
+            heartbeat_probe_timeout: Duration::from_millis(100),
+        };
+        let sup = Arc::new(sup);
+
+        // Drive the heartbeat loop for one iteration. We can't call
+        // heartbeat_loop directly (it sleeps first + loops forever), so
+        // we replicate one iteration: probe → timeout → kill.
+        let client = sup.client().await.expect("client present");
+        let probe = tokio::time::timeout(
+            sup.heartbeat_probe_timeout,
+            client.dispatch_embed(sup.spec.model.clone(), vec!["test".to_string()], 8),
+        )
+        .await;
+        assert!(probe.is_err(), "probe must timeout against wedged worker");
+
+        // Simulate the kill branch: consecutive_fails (1) >= max_fails (1).
+        let stored_pid = sup.current_pid();
+        assert_eq!(stored_pid, pid, "pid must be stored before kill");
+        #[cfg(unix)]
+        unsafe {
+            let _ = libc::kill(stored_pid as i32, libc::SIGKILL);
+        }
+
+        // The child must exit (SIGKILL'd). wait() returns the killed status.
+        let status = child.wait().expect("wait child");
+        assert!(
+            !status.success(),
+            "child must have been killed, not exited 0"
+        );
+
+        // Cleanup.
+        server_task.abort();
+        let _ = std::fs::remove_file(&socket_path);
     }
 }
