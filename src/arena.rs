@@ -293,6 +293,24 @@ fn parse_i32_env(key: &str, default: i32) -> i32 {
     }
 }
 
+/// Parse `ORT_INTRA_OP_SPINNING` — controls whether ORT's intra-op thread
+/// pool busy-waits before parking. Default `false` because embed-server
+/// shares a 4-core ARM Neoverse-N1 host with memdb-go, postgres, and
+/// other services; busy-waiting wastes CPU that other services need
+/// during their own spikes. Flip to `1` only on dedicated-CPU hardware
+/// where the ~5-15% latency reduction justifies a 100%-of-allocated-cores
+/// idle CPU floor while inference is in flight. Per ORT docs: spinning
+/// faster on tight inference loops, worse on bursty multi-tenant boxes.
+///
+/// Shared by all three model kinds (embed, reranker, splade) so the
+/// env knob is consistent across the process.
+pub(crate) fn parse_intra_op_spinning() -> bool {
+    matches!(
+        std::env::var("ORT_INTRA_OP_SPINNING").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
+
 /// Registers a process-global shared CPU arena allocator with
 /// `kSameAsRequested` extend strategy. Idempotent: calling twice will fail
 /// the second time on `CreateAndRegisterAllocator`; we treat that as a

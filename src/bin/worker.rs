@@ -245,6 +245,16 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| POOL_SIZE.to_string())
         .parse()?;
 
+    // Initialize the ORT runtime explicitly BEFORE arena registration.
+    // arena::register_shared_cpu_arena documents that it MUST be called
+    // after `ort::init().commit()` — the worker previously relied on
+    // lazy init, which meant the global thread pool options were never
+    // set in the process that actually runs inference.
+    if !ort::init().commit() {
+        tracing::warn!("ort init failed (environment already configured?)");
+    }
+    tracing::info!(model = %model_name, "ort runtime initialized in worker");
+
     // Resolve max_waiters once at startup -- cheaper than re-reading env
     // on every request, and captured by copy into the spawned async tasks.
     let max_waiters =

@@ -43,21 +43,6 @@ fn parse_opt_level() -> GraphOptimizationLevel {
     }
 }
 
-/// Parse `ORT_INTRA_OP_SPINNING` — controls whether ORT's intra-op thread
-/// pool busy-waits before parking. Default `false` because embed-server
-/// shares a 4-core ARM Neoverse-N1 host with memdb-go, postgres, and
-/// other services; busy-waiting wastes CPU that other services need
-/// during their own spikes. Flip to `1` only on dedicated-CPU hardware
-/// where the ~5-15% latency reduction justifies a 100%-of-allocated-cores
-/// idle CPU floor while inference is in flight. Per ORT docs: spinning
-/// faster on tight inference loops, worse on bursty multi-tenant boxes.
-fn parse_intra_op_spinning() -> bool {
-    matches!(
-        std::env::var("ORT_INTRA_OP_SPINNING").as_deref(),
-        Ok("1") | Ok("true") | Ok("yes")
-    )
-}
-
 impl RerankerModel {
     /// Load the ONNX session(s) + tokenizer from `dir`. Expects
     /// `model_quantized.onnx` and `tokenizer.json` at the top level —
@@ -106,7 +91,7 @@ impl RerankerModel {
         }
 
         let opt_level = parse_opt_level();
-        let allow_spinning = parse_intra_op_spinning();
+        let allow_spinning = crate::arena::parse_intra_op_spinning();
         tracing::info!(
             path = %onnx_path.display(),
             ?opt_level,
@@ -431,6 +416,9 @@ fn build_session_pool(
             // only way to stop the spin on a shared multi-tenant CPU.
             .with_intra_op_spinning(allow_spinning)
             .map_err(|e| format!("set intra spinning #{i}: {e}"))?
+            // Inter-op threads: 1 (see model.rs for rationale).
+            .with_inter_threads(1)
+            .map_err(|e| format!("set inter threads #{i}: {e}"))?
             // memory_pattern: per-model knob (EMBED_MEMORY_PATTERN_<MODEL_UPPER>).
             // Default true (back-compat). See config::ModelDef::memory_pattern for rationale.
             .with_memory_pattern(memory_pattern)
