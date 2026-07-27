@@ -351,6 +351,16 @@ pub struct Config {
     /// Set via `EMBED_WORKER_SOCKET_DIR` (default `/tmp/embed-workers`).
     /// Ignored when `multi_process` is `false`.
     pub worker_socket_dir: std::path::PathBuf,
+    /// Timeout for the `/ready` probe inference, in milliseconds.
+    ///
+    /// The readiness probe dispatches a single 1-word embed to the default
+    /// model and waits up to this long. If the worker is wedged (busy-spin
+    /// with zero throughput), the probe times out and `/ready` returns 503,
+    /// letting the container orchestrator or downstream consumer react.
+    ///
+    /// Set via `EMBED_READY_PROBE_TIMEOUT_MS` (default 2000). Must be > 0;
+    /// invalid values fall back to the default.
+    pub ready_probe_timeout_ms: u64,
 }
 
 impl Config {
@@ -631,6 +641,23 @@ impl Config {
             .unwrap_or_else(|_| "/tmp/embed-workers".into())
             .into();
 
+        let ready_probe_timeout_ms = match env::var("EMBED_READY_PROBE_TIMEOUT_MS") {
+            Ok(s) => match s.trim().parse::<u64>() {
+                Ok(0) => {
+                    tracing::warn!("EMBED_READY_PROBE_TIMEOUT_MS=0 is invalid; defaulting to 2000");
+                    2000
+                }
+                Ok(v) => v,
+                Err(_) => {
+                    tracing::warn!(
+                        "EMBED_READY_PROBE_TIMEOUT_MS={s:?} is not a valid u64; defaulting to 2000"
+                    );
+                    2000
+                }
+            },
+            Err(_) => 2000,
+        };
+
         Ok(Config {
             port,
             models,
@@ -664,6 +691,7 @@ impl Config {
             multi_process,
             worker_bin_path,
             worker_socket_dir,
+            ready_probe_timeout_ms,
         })
     }
 }
@@ -2211,5 +2239,40 @@ mod tests {
             std::env::remove_var("EMBED_SESSION_POOL_SIZE_JINA_CODE_V2");
         }
         assert_eq!(size, 1); // 0 rejected → default
+    }
+
+    // ── ready_probe_timeout_ms parsing ───────────────────────────────────────
+
+    fn parse_ready_probe_timeout(raw: Option<&str>) -> u64 {
+        match raw {
+            Some(s) => match s.trim().parse::<u64>() {
+                Ok(0) => 2000,
+                Ok(v) => v,
+                Err(_) => 2000,
+            },
+            None => 2000,
+        }
+    }
+
+    #[test]
+    fn ready_probe_timeout_default_when_unset() {
+        assert_eq!(parse_ready_probe_timeout(None), 2000);
+    }
+
+    #[test]
+    fn ready_probe_timeout_parses_valid_value() {
+        assert_eq!(parse_ready_probe_timeout(Some("5000")), 5000);
+        assert_eq!(parse_ready_probe_timeout(Some("  1000  ")), 1000);
+    }
+
+    #[test]
+    fn ready_probe_timeout_zero_falls_back() {
+        assert_eq!(parse_ready_probe_timeout(Some("0")), 2000);
+    }
+
+    #[test]
+    fn ready_probe_timeout_garbage_falls_back() {
+        assert_eq!(parse_ready_probe_timeout(Some("not-a-number")), 2000);
+        assert_eq!(parse_ready_probe_timeout(Some("")), 2000);
     }
 }

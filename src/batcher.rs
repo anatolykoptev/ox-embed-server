@@ -901,12 +901,9 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
             // Safety net: if the gate logic regresses, fail fast
             // instead of hanging the test runner (#123).
-            let overflow = tokio::time::timeout(
-                Duration::from_secs(5),
-                b.embed_tokens(tok(&[99])),
-            )
-            .await
-            .expect("embed_tokens hung — 80% gate did not reject (regression of #123)");
+            let overflow = tokio::time::timeout(Duration::from_secs(5), b.embed_tokens(tok(&[99])))
+                .await
+                .expect("embed_tokens hung — 80% gate did not reject (regression of #123)");
             assert!(
                 matches!(overflow, Err(BatchError::QueueFull(_))),
                 "got: {overflow:?}"
@@ -1537,12 +1534,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         // Safety net: if the gate logic regresses, fail fast
         // instead of hanging the test runner (#123).
-        let rejected = tokio::time::timeout(
-            Duration::from_secs(5),
-            b.embed_tokens(tok(&[99])),
-        )
-        .await
-        .expect("embed_tokens hung — 80% gate did not reject (regression of #123)");
+        let rejected = tokio::time::timeout(Duration::from_secs(5), b.embed_tokens(tok(&[99])))
+            .await
+            .expect("embed_tokens hung — 80% gate did not reject (regression of #123)");
         assert!(
             matches!(rejected, Err(BatchError::QueueFull(_))),
             "expected QueueFull at 80% threshold, got: {rejected:?}"

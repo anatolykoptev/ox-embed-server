@@ -386,6 +386,22 @@ impl WorkerSupervisor {
     pub fn model(&self) -> &str {
         &self.spec.model
     }
+
+    /// Test-only: create a supervisor with a pre-connected client and no
+    /// child process. The watchdog loop is not spawned — the supervisor
+    /// is a static fixture for testing dispatch paths (e.g. /ready probe
+    /// timeout against a hung worker socket).
+    #[cfg(test)]
+    #[allow(dead_code)] // used by api_health tests in the binary crate
+    pub(crate) fn for_test(spec: SpawnSpec, client: Arc<WorkerClient>) -> Arc<Self> {
+        Arc::new(Self {
+            spec,
+            client_slot: Arc::new(RwLock::new(Some(client))),
+            restart_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            socket_wait: Duration::from_secs(60),
+            current_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        })
+    }
 }
 
 #[cfg(test)]

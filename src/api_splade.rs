@@ -326,6 +326,7 @@ mod tests {
             embed_max_input_array: 32,
             rerank_max_input_docs: 32,
             worker_pool: None,
+            ready_probe_timeout_ms: 2000,
         }
     }
 

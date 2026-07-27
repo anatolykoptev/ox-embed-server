@@ -1,4 +1,5 @@
 mod api;
+mod api_health;
 mod api_rerank;
 mod api_splade;
 mod arena;
@@ -574,6 +575,9 @@ async fn main() {
     // Stamp the gauge with 0 so /metrics exposes `embed_cache_size` from startup,
     // even before the first cache miss populates it.
     crate::metrics::set_cache_size(0);
+    // Pre-touch the ready-probe counter so /metrics shows
+    // `embed_ready_probe_total{result=...}` from startup, not absent.
+    crate::metrics::ready_probe_touch();
     tracing::info!(
         cache_max_entries = cfg.cache_max_entries,
         cache_enabled = cache.is_enabled(),
@@ -840,6 +844,7 @@ async fn main() {
         embed_max_input_array: cfg.embed_max_input_array,
         rerank_max_input_docs: cfg.rerank_max_input_docs,
         worker_pool,
+        ready_probe_timeout_ms: cfg.ready_probe_timeout_ms,
     });
 
     let metrics_handle = prom_handle.clone();
@@ -848,7 +853,8 @@ async fn main() {
     // drain returns.
     let router_state = state.clone();
     let app = Router::new()
-        .route("/health", axum::routing::get(|| async { "ok" }))
+        .route("/health", axum::routing::get(api_health::health))
+        .route("/ready", axum::routing::get(api_health::ready))
         .route(
             "/metrics",
             axum::routing::get(move || {
