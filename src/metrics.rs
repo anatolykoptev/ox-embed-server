@@ -1361,3 +1361,43 @@ mod bucket_label_tests {
         assert_eq!(bytes_b8 as u64, 100_663_296);
     }
 }
+
+// ── readiness probe ───────────────────────────────────────────────────────────
+
+/// Record the outcome of a `/ready` probe.
+///
+/// `result` is one of `"ok"`, `"timeout"`, `"error"`, or `"shutdown"`.
+/// Operators alert on `rate(embed_ready_probe_total{result="timeout"}[5m]) > 0`
+/// to catch a wedged worker before downstream consumers notice.
+pub fn record_ready_probe(result: &str) {
+    metrics::counter!(
+        "embed_ready_probe_total",
+        "result" => result.to_string()
+    )
+    .increment(1);
+}
+
+/// Pre-touch the ready-probe counter to 0 so "no probes yet" is visible
+/// in Prometheus as a present-but-zero series, not absent.
+pub fn ready_probe_touch() {
+    metrics::counter!(
+        "embed_ready_probe_total",
+        "result" => "ok".to_string()
+    )
+    .absolute(0);
+    metrics::counter!(
+        "embed_ready_probe_total",
+        "result" => "timeout".to_string()
+    )
+    .absolute(0);
+    metrics::counter!(
+        "embed_ready_probe_total",
+        "result" => "error".to_string()
+    )
+    .absolute(0);
+    metrics::counter!(
+        "embed_ready_probe_total",
+        "result" => "shutdown".to_string()
+    )
+    .absolute(0);
+}

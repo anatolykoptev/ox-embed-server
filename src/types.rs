@@ -155,6 +155,9 @@ pub struct AppState {
     /// dispatches through worker processes; rerank/splade remain in-process
     /// until their IPC protocol support lands (followup wave).
     pub worker_pool: Option<Arc<crate::supervisor::WorkerPool>>,
+    /// Timeout for the `/ready` probe inference, in milliseconds.
+    /// Resolved from `EMBED_READY_PROBE_TIMEOUT_MS` (default 2000).
+    pub ready_probe_timeout_ms: u64,
 }
 
 // --- Request types ---
