@@ -595,9 +595,7 @@ impl WorkerSupervisor {
                     as std::pin::Pin<
                         Box<
                             dyn std::future::Future<
-                                    Output = std::io::Result<
-                                        crate::ipc::protocol::WorkerResponse,
-                                    >,
+                                    Output = std::io::Result<crate::ipc::protocol::WorkerResponse>,
                                 > + Send,
                         >,
                     >,
@@ -610,9 +608,7 @@ impl WorkerSupervisor {
                     as std::pin::Pin<
                         Box<
                             dyn std::future::Future<
-                                    Output = std::io::Result<
-                                        crate::ipc::protocol::WorkerResponse,
-                                    >,
+                                    Output = std::io::Result<crate::ipc::protocol::WorkerResponse>,
                                 > + Send,
                         >,
                     >,
@@ -626,9 +622,7 @@ impl WorkerSupervisor {
                     as std::pin::Pin<
                         Box<
                             dyn std::future::Future<
-                                    Output = std::io::Result<
-                                        crate::ipc::protocol::WorkerResponse,
-                                    >,
+                                    Output = std::io::Result<crate::ipc::protocol::WorkerResponse>,
                                 > + Send,
                         >,
                     >,
@@ -1108,7 +1102,11 @@ mod tests {
         }
     }
 
-    async fn supervisor_for(mock: &MockWorker, kind: WorkerKind, pid: u32) -> Arc<WorkerSupervisor> {
+    async fn supervisor_for(
+        mock: &MockWorker,
+        kind: WorkerKind,
+        pid: u32,
+    ) -> Arc<WorkerSupervisor> {
         use crate::ipc::client::WorkerClient;
         let client = Arc::new(
             WorkerClient::connect(mock.socket_path.clone(), 1)
@@ -1215,7 +1213,10 @@ mod tests {
         let outcome = sup.heartbeat_tick(&mut fails).await;
 
         assert_eq!(outcome, HeartbeatOutcome::Ok);
-        assert_eq!(fails, 0, "a good beat must reset the consecutive-fail count");
+        assert_eq!(
+            fails, 0,
+            "a good beat must reset the consecutive-fail count"
+        );
 
         // The child must STILL be running — nothing was killed.
         #[cfg(unix)]
@@ -1294,7 +1295,10 @@ mod tests {
         let outcome = sup.heartbeat_tick(&mut fails).await;
 
         assert_eq!(outcome, HeartbeatOutcome::Skipped);
-        assert_eq!(fails, 0, "a respawn window must not count against the worker");
+        assert_eq!(
+            fails, 0,
+            "a respawn window must not count against the worker"
+        );
     }
 
     /// The default probe timeout must stay above the model latency this
