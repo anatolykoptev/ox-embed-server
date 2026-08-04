@@ -76,5 +76,22 @@ additional_cargo_args = ["--locked"]
 # caught — a timeout). 5x the baseline, with a floor so a fast suite does not
 # produce an absurdly tight bound, keeps timeouts meaningful without flagging
 # healthy-but-slow mutants as caught-by-timeout noise.
+#
+# The floor is 30s against an ~8s baseline (613 tests). It was 60s, which cost a
+# full minute per infinite-loop mutant for no extra signal — measured on krolik,
+# where `evict_idle -> 1` and a bucket-boundary mutant each burned the whole 60s.
 timeout_multiplier = 5.0
-minimum_test_timeout = 60
+minimum_test_timeout = 30
+
+# ── Exclusions inside otherwise-in-scope files ──────────────────────────────
+#
+# `apply_histogram_buckets` alone is 236 of the crate's ~940 mutants — a quarter
+# of the entire run — and every one of them mutates a Prometheus BUCKET
+# BOUNDARY (`16.0 * MIB` -> `16.0 / MIB`). Bucket edges are a tuning choice,
+# not behaviour: no test should assert that a histogram's 7th boundary is
+# exactly 64 MiB, and writing tests to kill these would be writing tests that
+# freeze a knob operators are meant to turn. The rest of metrics.rs — the label
+# and classification logic that alert rules actually read — stays in scope.
+exclude_re = [
+    "apply_histogram_buckets",
+]

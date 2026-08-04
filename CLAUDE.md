@@ -54,7 +54,9 @@ Two lanes, both on GitHub-hosted `ubuntu-24.04-arm` (public repo → free + unli
 
 **`preflight`** — every PR: gitleaks → osv-scanner → fmt → clippy → deny → nextest → release build → **mutants `--in-diff`**.
 
-**`nightly`** (03:00 UTC) — full mutation scope sharded 4×, then a ratchet job; plus `deny`/`osv-scanner` against that day's advisory feeds (a dep does not have to change to become vulnerable), plus the full suite with `--no-fail-fast`.
+**`nightly`** (03:00 UTC) — `deny` + `osv-scanner` against that day's advisory feeds (a dep does not have to change to become vulnerable), plus the full suite with `--no-fail-fast`.
+
+**`nightly` / weekly sweep** (Sundays 04:00 UTC, same workflow) — the full mutation scope sharded 16×, then a ratchet job. Weekly rather than nightly because one mutant costs 150-360s of rebuild: ~700 in-scope mutants is ~20 machine-hours per sweep. The per-PR `--in-diff` run is what protects new code daily; this lane measures and ratchets the standing debt.
 
 Local gates:
 
