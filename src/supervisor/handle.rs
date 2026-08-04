@@ -120,6 +120,22 @@ const HEARTBEAT_MAX_FAILS: u32 = 3;
 /// alone does not change production — the deployed value must be raised too.
 const HEARTBEAT_PROBE_TIMEOUT_MS: u64 = 15_000;
 
+/// jina-code-v2 p50 at concurrency 4 on the deployment hardware, from
+/// `docs/BUGS.md` BUG-001. Not a tuning knob — a recorded measurement.
+const MEASURED_JINA_P50_CONC4_MS: u64 = 2_400;
+
+/// The probe timeout may be retuned, but never back under the latency it is
+/// probing. A compile-time assertion rather than a test on purpose: the failure
+/// this guards is a one-character edit to a constant, and a binary whose wedge
+/// detector will kill healthy workers should not build at all — waiting for a
+/// test run gives it a window to be shipped in.
+const _: () = assert!(
+    HEARTBEAT_PROBE_TIMEOUT_MS >= 4 * MEASURED_JINA_P50_CONC4_MS,
+    "HEARTBEAT_PROBE_TIMEOUT_MS must leave at least 4x headroom over the measured \
+     jina-code-v2 p50-at-conc-4 (docs/BUGS.md BUG-001), or the wedge detector kills \
+     healthy workers under load — as it did 32 times on pillow in three days"
+);
+
 /// Advance exponential backoff by doubling, capped at MAX_BACKOFF.
 fn next_backoff(current: Duration) -> Duration {
     (current * 2).min(MAX_BACKOFF)
@@ -1301,26 +1317,4 @@ mod tests {
         );
     }
 
-    /// The default probe timeout must stay above the model latency this
-    /// hardware actually exhibits under load.
-    ///
-    /// `docs/BUGS.md` BUG-001 records jina-code-v2 at p50 ~1.7s single-query
-    /// and ~2.4s at conc=4 on the deployment box. The original 2s default sat
-    /// BELOW that median, and the probe queues behind the worker's session
-    /// pool, so it measured queue depth rather than liveness: 156 timeouts and
-    /// 32 SIGKILLs of healthy workers on pillow over three days.
-    ///
-    /// This asserts the invariant (headroom over measured p50-at-conc-4), not
-    /// the specific number, so retuning stays possible but silently dropping
-    /// back under the measurement does not.
-    #[test]
-    fn heartbeat_probe_timeout_clears_measured_p50_under_load() {
-        const MEASURED_P50_CONC4_MS: u64 = 2400; // docs/BUGS.md, BUG-001
-        assert!(
-            HEARTBEAT_PROBE_TIMEOUT_MS >= MEASURED_P50_CONC4_MS * 4,
-            "probe timeout {HEARTBEAT_PROBE_TIMEOUT_MS}ms must leave at least 4x headroom over \
-             the measured {MEASURED_P50_CONC4_MS}ms p50-at-conc-4, or the wedge detector kills \
-             healthy workers under load"
-        );
-    }
 }
