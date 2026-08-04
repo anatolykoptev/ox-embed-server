@@ -28,11 +28,13 @@ postcard = { version = "1", default-features = false, features = ["alloc"] }
 # Phase H.18 — OTEL distributed tracing. Pipes tracing::span!/info_span!/
 # #[instrument] into Jaeger via OTLP gRPC, correlated with the downstream consumer traces
 # through the W3C traceparent header. Versions chosen for compatibility:
-# tracing-opentelemetry 0.31 needs opentelemetry 0.30 + opentelemetry_sdk 0.30.
-opentelemetry = "0.30"
-opentelemetry-otlp = { version = "0.30", default-features = false, features = ["grpc-tonic", "trace"] }
-opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"] }
-tracing-opentelemetry = "0.31"
+# Versions move as a set: tracing-opentelemetry 0.33 needs opentelemetry 0.32 +
+# opentelemetry_sdk 0.32. Bumped from the 0.30/0.31 set for GHSA-w9wp-h8wv-79jx
+# (opentelemetry_sdk <= 0.31). Bumping one of the four alone will not resolve.
+opentelemetry = "0.32"
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"] }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+tracing-opentelemetry = "0.33"
 thiserror = "1"
 
 # Linux-only: glibc `malloc_trim(0)` background task in `main.rs` returns

@@ -292,7 +292,14 @@ pub async fn trace_request(
     }
     let parent_cx =
         global::get_text_map_propagator(|prop| prop.extract(&HeaderExtractor(req.headers())));
-    span.set_parent(parent_cx);
+    // tracing-opentelemetry 0.33 made `set_parent` fallible (it was infallible
+    // in 0.31). It fails when the span has no OpenTelemetry layer attached —
+    // i.e. when OTEL is disabled — which is a normal configuration here, not an
+    // error worth a warn on every request. Losing the parent link only breaks
+    // trace correlation for this request, so debug-log it and continue serving.
+    if let Err(e) = span.set_parent(parent_cx) {
+        tracing::debug!(error = %e, "otel: could not attach remote parent context to request span");
+    }
 
     let resp = next.run(req).instrument(span.clone()).await;
     span.record("http.status_code", resp.status().as_u16());
