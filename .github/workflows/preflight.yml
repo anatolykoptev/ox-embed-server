@@ -159,19 +159,42 @@ jobs:
           # Diff against the merge-base, not the base tip: `...` gives the lines
           # THIS branch changed, excluding whatever landed on main meanwhile.
           # Without it, a PR is failed by unmutated lines it never touched.
-          git diff "origin/${{ github.base_ref }}...HEAD" -- 'src/**/*.rs' > /tmp/pr.diff
+          #
+          # Pathspec is `src`, NOT 'src/**/*.rs'. A git pathspec is wildmatch
+          # without FNM_PATHNAME, so `*` does not cross `/` and `src/**/*.rs`
+          # requires at least one intermediate directory: it silently matched
+          # src/ipc/frame.rs and src/supervisor/handle.rs while missing
+          # src/metrics.rs, src/batcher.rs, src/api.rs and every other file
+          # directly in src/. This step reported "nothing to mutate" and passed
+          # green on a PR that changed 158 lines of src/metrics.rs. Caught on
+          # this workflow's own first green run.
+          BASE="origin/${{ github.base_ref }}"
+          git diff "${BASE}...HEAD" -- src > /tmp/pr.diff
           if [ ! -s /tmp/pr.diff ]; then
             echo "No src/ changes in this PR — nothing to mutate."
             exit 0
           fi
           echo "::group::PR diff stat"
-          git diff --stat "origin/${{ github.base_ref }}...HEAD" -- 'src/**/*.rs'
+          git diff --stat "${BASE}...HEAD" -- src
           echo "::endgroup::"
           # Scope (examine_globs) + timeouts live in .cargo/mutants.toml so this
           # workflow and the nightly full run cannot disagree about what is in
           # scope. A MISSED mutant here means: you changed this line, and no
           # test in the suite notices when it is broken.
           cargo mutants --in-diff /tmp/pr.diff --no-shuffle -j 2
+
+          # Self-check against the failure above recurring in a new form. If the
+          # PR touched a file that .cargo/mutants.toml puts IN scope, the run
+          # must have produced a report; an empty mutants.out here means the
+          # diff never reached cargo-mutants, which is indistinguishable from
+          # "all mutants caught" in the exit code alone.
+          if git diff --name-only "${BASE}...HEAD" -- src \
+               | grep -qE '^src/(api_health|batcher|cache|cache_flow|config|evictable_pool|metrics|pool|token_cache|types|worker_waiters)\.rs$|^src/(ipc|supervisor)/.*\.rs$'; then
+            test -s mutants.out/outcomes.json || {
+              echo "::error::This PR changes a file that is in the mutation scope, but cargo-mutants produced no outcomes.json. The gate did not run — do not read this job's green as test-quality evidence."
+              exit 1
+            }
+          fi
 
       - name: Upload mutants report
         if: always() && github.event_name == 'pull_request'
