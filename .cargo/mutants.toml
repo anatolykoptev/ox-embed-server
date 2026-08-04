@@ -29,7 +29,13 @@
 #   src/otel.rs, src/mlock.rs, src/proc.rs — thin wrappers over OTLP export,
 #     mlock(2) and /proc reads. Mutants here are only killable by asserting on
 #     the syscall itself.
-#   src/supervisor/handle.rs — spawns and reaps real child processes.
+#   src/supervisor/handle.rs — only PARTLY: `spawn_and_supervise`,
+#     `watchdog_loop`, `spawn_one` and `clear_on_exit` drive real child
+#     processes, so they are named in `exclude_re` below. The rest of the file —
+#     including `heartbeat_tick`, the wedge detector whose logic is model-free
+#     and unit-tested — IS in scope. Excluding the whole file would exempt the
+#     module with this repo's documented false-green history, which is the
+#     opposite of the point.
 #
 # Widening this list is the goal, not the exception: when a module gains
 # model-free coverage, add it here in the same PR.
@@ -44,6 +50,7 @@ examine_globs = [
     "src/ipc/protocol.rs",
     "src/metrics.rs",
     "src/pool.rs",
+    "src/supervisor/handle.rs",
     "src/supervisor/pool.rs",
     "src/supervisor/util.rs",
     "src/token_cache.rs",
@@ -61,12 +68,33 @@ examine_globs = [
 # 30-minute cancel. nextest terminates it and reports the mutant as caught.
 test_tool = "nextest"
 
-# `--lib`: run only the in-crate unit tests against each mutant. The
-# tests/*.rs integration binaries are all model-gated (they early-return without
-# EMBED_MODELS) so they can never kill a mutant here, but building and linking
-# 11 extra test binaries per mutant would dominate the run — the difference
-# between a gate that fits in a PR and one nobody waits for.
-additional_cargo_test_args = ["--lib"]
+# `--lib` plus the two integration binaries that are NOT model-gated.
+#
+# Most of tests/*.rs early-returns without EMBED_MODELS/RERANKER_MODELS/
+# SPLADE_MODELS, so those can never kill a mutant here and linking eleven extra
+# binaries per mutant would dominate the run. But "all of them are gated" is
+# false, and believing it costs coverage in exactly the wrong direction:
+#
+#   tests/worker_max_waiters.rs            5 tests, no model gate,
+#                                          covers src/worker_waiters.rs (in scope)
+#   tests/worker_inference_observability.rs 1 test, no model gate,
+#                                          covers src/metrics.rs (in scope)
+#
+# Without them a PR touching worker_waiters' per-model override precedence gets
+# its mutant reported MISSED even though tests/worker_max_waiters.rs kills it —
+# and the author's rational response is to duplicate that test into a #[cfg(test)]
+# block or widen the exclusions. A gate that punishes correctly-tested code
+# teaches people to weaken it.
+#
+# (tests/ipc_ping.rs is also ungated but spawns a real worker binary, and
+# tests/rerank_smoke.rs gates on EMBED_SERVER_URL — neither belongs here.)
+additional_cargo_test_args = [
+    "--lib",
+    "--test",
+    "worker_max_waiters",
+    "--test",
+    "worker_inference_observability",
+]
 
 # --locked mirrors every other gate in this repo: a mutation run that quietly
 # updates Cargo.lock is testing a different dependency set than CI.
@@ -94,4 +122,12 @@ minimum_test_timeout = 30
 # and classification logic that alert rules actually read — stays in scope.
 exclude_re = [
     "apply_histogram_buckets",
+    # src/supervisor/handle.rs, the child-process machinery. These need a real
+    # worker binary and a real fork; their mutants would report MISSED for an
+    # environmental reason. Function-level, so heartbeat_tick and the rest of
+    # the file stay in scope.
+    "spawn_and_supervise",
+    "watchdog_loop",
+    "spawn_one",
+    "clear_on_exit",
 ]

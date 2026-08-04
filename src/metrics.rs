@@ -7,6 +7,26 @@ use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 const MIB: f64 = 1024.0 * 1024.0;
 const GIB: f64 = 1024.0 * MIB;
 
+/// Bucket ladder for every `*_duration_seconds` histogram.
+///
+/// Named and pinned rather than inlined because these edges are LOAD-BEARING
+/// OUTSIDE this repo: the private infra repo's
+/// `config/prometheus/alerts-embed-server.yml` runs `histogram_quantile` over
+/// `embed_worker_queue_wait_duration_seconds` in `EmbedWorkerQueueWaitHighJina`
+/// (> 30), `EmbedWorkerQueueWaitHighFastModels` (> 10) and the
+/// `embed:worker_queue_wait_seconds:p95` recording rule. `histogram_quantile`
+/// interpolates BETWEEN bucket edges, so moving one silently changes what those
+/// thresholds mean — with nothing red anywhere.
+///
+/// Mutation testing is excluded from `apply_histogram_buckets`
+/// (see .cargo/mutants.toml: 236 mutants, all of them bucket arithmetic), so
+/// `duration_bucket_ladder_is_pinned` below is the only automated notice that
+/// an edge moved. Changing this list is allowed — changing it ACCIDENTALLY is
+/// what the test stops.
+const DURATION_BUCKETS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+];
+
 /// Apply every embed-server histogram bucket configuration to a
 /// `PrometheusBuilder`.
 ///
@@ -83,12 +103,7 @@ pub fn apply_histogram_buckets(builder: PrometheusBuilder) -> PrometheusBuilder 
         metrics_exporter_prometheus::Matcher::Full("embed_rerank_input_docs_size".to_string());
 
     builder
-        .set_buckets_for_metric(
-            duration_matcher,
-            &[
-                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
-            ],
-        )
+        .set_buckets_for_metric(duration_matcher, DURATION_BUCKETS)
         .expect("set duration buckets")
         .set_buckets_for_metric(
             batch_matcher,
@@ -1521,6 +1536,56 @@ pub fn worker_heartbeat_touch(model: &str) {
             "result" => result.to_string()
         )
         .absolute(0);
+    }
+}
+
+#[cfg(test)]
+mod bucket_ladder_tests {
+    use super::DURATION_BUCKETS;
+
+    /// The `*_duration_seconds` bucket edges are consumed by alert rules in the
+    /// private infra repo, so they are an external contract, not an internal
+    /// detail.
+    ///
+    /// `config/prometheus/alerts-embed-server.yml` runs `histogram_quantile`
+    /// over `embed_worker_queue_wait_duration_seconds` and compares the result
+    /// against 30s (`EmbedWorkerQueueWaitHighJina`), 10s
+    /// (`EmbedWorkerQueueWaitHighFastModels`) and the
+    /// `embed:worker_queue_wait_seconds:p95` recording rule.
+    /// `histogram_quantile` INTERPOLATES between edges, so silently deleting
+    /// the 10.0 or 30.0 boundary changes what those alerts fire on, in a way
+    /// no test and no alert would otherwise notice.
+    ///
+    /// This is a pin, not a design constraint: change the ladder freely, just
+    /// change it here on purpose and re-check the alert thresholds.
+    #[test]
+    fn duration_bucket_ladder_is_pinned() {
+        assert_eq!(
+            DURATION_BUCKETS,
+            &[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0],
+            "the *_duration_seconds bucket ladder changed. Alert rules in the infra repo \
+             (EmbedWorkerQueueWaitHighJina > 30, EmbedWorkerQueueWaitHighFastModels > 10, \
+             embed:worker_queue_wait_seconds:p95) read histogram_quantile off these edges — \
+             update them in the same change, then update this pin."
+        );
+
+        // The alert thresholds must each sit ON an edge, not between two.
+        // A threshold that falls inside a bucket is answered by interpolation
+        // rather than by data, which is how a p95 alert quietly becomes a
+        // function of the bucket layout instead of the latency.
+        for threshold in [10.0_f64, 30.0_f64] {
+            assert!(
+                DURATION_BUCKETS.contains(&threshold),
+                "alert threshold {threshold}s has no matching bucket edge"
+            );
+        }
+
+        // Prometheus requires monotonically increasing edges; a swapped pair
+        // makes histogram_quantile return nonsense rather than erroring.
+        assert!(
+            DURATION_BUCKETS.windows(2).all(|w| w[0] < w[1]),
+            "bucket edges must be strictly increasing"
+        );
     }
 }
 

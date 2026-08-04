@@ -40,7 +40,7 @@ secrets:
 	@$(CI_STAGE) secrets gitleaks dir . --config .gitleaks.toml --no-banner --redact
 
 vulns:
-	@command -v osv-scanner >/dev/null || { echo "osv-scanner not installed — https://github.com/google/osv-scanner/releases (CI pins 2.2.4)"; exit 1; }
+	@command -v osv-scanner >/dev/null || { echo "osv-scanner not installed — https://github.com/google/osv-scanner/releases (CI pins 2.4.0)"; exit 1; }
 	@$(CI_STAGE) vulns osv-scanner scan source --lockfile=Cargo.lock --config=.osv-scanner.toml
 
 audit: deny secrets vulns

@@ -34,7 +34,11 @@ permissions:
 
 concurrency:
   group: nightly-${{ github.ref }}
-  cancel-in-progress: true
+  # NOT cancel-in-progress: both crons and workflow_dispatch share this group on
+  # the same ref, so cancelling would let a manual run — or Monday's 03:00
+  # nightly — silently kill a 16-shard sweep that has been running since Sunday.
+  # A cancelled run notifies nobody, which is the worst of both.
+  cancel-in-progress: false
 
 env:
   NEXTEST_VERSION: 0.9.140
@@ -153,8 +157,11 @@ jobs:
             exit 1
           fi
 
-          missed=$(cat shards/*/outcomes.json | jq '[.outcomes[] | select(.summary == "MissedMutant")] | length' | paste -sd+ | bc)
-          caught=$(cat shards/*/outcomes.json | jq '[.outcomes[] | select(.summary == "CaughtMutant")] | length' | paste -sd+ | bc)
+          # `jq -s add` rather than `paste -sd+ | bc`: bc is not guaranteed
+          # present on the ubuntu-24.04-arm runner image (it is on ubuntu-latest
+          # x86), and jq is already a hard dependency of this step.
+          missed=$(jq '[.outcomes[] | select(.summary == "MissedMutant")] | length' shards/*/outcomes.json | jq -s add)
+          caught=$(jq '[.outcomes[] | select(.summary == "CaughtMutant")] | length' shards/*/outcomes.json | jq -s add)
           total=$((missed + caught))
 
           echo "caught=${caught} missed=${missed} total=${total}"
