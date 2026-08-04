@@ -1562,7 +1562,9 @@ mod bucket_ladder_tests {
     fn duration_bucket_ladder_is_pinned() {
         assert_eq!(
             DURATION_BUCKETS,
-            &[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0],
+            &[
+                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0
+            ],
             "the *_duration_seconds bucket ladder changed. Alert rules in the infra repo \
              (EmbedWorkerQueueWaitHighJina > 30, EmbedWorkerQueueWaitHighFastModels > 10, \
              embed:worker_queue_wait_seconds:p95) read histogram_quantile off these edges — \
