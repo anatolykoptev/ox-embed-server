@@ -174,18 +174,48 @@ pub fn apply_histogram_buckets(builder: PrometheusBuilder) -> PrometheusBuilder 
         .expect("set rerank input docs size buckets")
 }
 
+/// The compiled-in crate version — the only label on `embed_build_info` that a
+/// deploy cannot fake.
+///
+/// `version` (below) carries `EMBED_VERSION`, a hand-written string set in the
+/// deploy compose file (`phase-2-multi-process-pillow` on pillow today). It is
+/// constant across releases, so it can never answer "did the new build actually
+/// reach production?" — the question that matters after a release. `pkg_version`
+/// is `CARGO_PKG_VERSION`, baked at compile time from `Cargo.toml`, which
+/// release-please bumps on every release. Asserting on it is what makes a deploy
+/// verifiable instead of assumed.
+pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Install the supervisor Prometheus recorder and return its rendering handle.
 ///
 /// Delegates bucket configuration to [`apply_histogram_buckets`] (the single
 /// authority) so the supervisor and worker recorders never drift. Stamps
-/// `embed_build_info{version}` to 1.
+/// `embed_build_info{version,pkg_version}` to 1.
 pub fn init(version: &str) -> PrometheusHandle {
     let handle = apply_histogram_buckets(PrometheusBuilder::new())
         .install_recorder()
         .expect("install Prometheus recorder");
 
-    metrics::gauge!("embed_build_info", "version" => version.to_string()).set(1.0);
+    stamp_build_info(version);
     handle
+}
+
+/// Stamp `embed_build_info{version,pkg_version} 1` on the installed recorder.
+///
+/// Split out of [`init`] so it is reachable from a test: `init` installs a
+/// global recorder and can therefore only run once per process, which would
+/// make the assertion below untestable inside the shared test binary.
+pub fn stamp_build_info(version: &str) {
+    // `version` keeps its position and semantics: the Grafana panel at
+    // config/grafana/dashboards/embed-server.json renders `{{version}}` as its
+    // legend, and adding a label is additive for any PromQL query selecting on
+    // the metric name. `pkg_version` is the new, release-tracking label.
+    metrics::gauge!(
+        "embed_build_info",
+        "version" => version.to_string(),
+        "pkg_version" => PKG_VERSION,
+    )
+    .set(1.0);
 }
 
 /// Record a completed request.
@@ -1491,5 +1521,58 @@ pub fn worker_heartbeat_touch(model: &str) {
             "result" => result.to_string()
         )
         .absolute(0);
+    }
+}
+
+#[cfg(test)]
+mod build_info_tests {
+    use super::{PKG_VERSION, stamp_build_info, test_prometheus_handle};
+
+    /// `embed_build_info` must carry the COMPILED-IN crate version.
+    ///
+    /// This is the assertion the post-release deploy check reads: pillow's
+    /// autodeploy scrapes `/metrics` and refuses to report success unless the
+    /// running container advertises the version it just built. Before
+    /// `pkg_version` existed the only label was `version`, sourced from the
+    /// `EMBED_VERSION` env var — a constant string in the deploy compose file,
+    /// identical before and after every release, so the check could not
+    /// distinguish a new build from a stale container that never restarted.
+    ///
+    /// RED-proven three ways: dropping the `pkg_version` label, renaming it,
+    /// and sourcing it from `EMBED_VERSION` instead of `CARGO_PKG_VERSION` each
+    /// fail this test.
+    #[test]
+    fn build_info_carries_compiled_crate_version() {
+        let handle = test_prometheus_handle();
+        stamp_build_info("deploy-tag-that-is-not-the-crate-version");
+        let rendered = handle.render();
+
+        let line = rendered
+            .lines()
+            .find(|l| l.starts_with("embed_build_info{"))
+            .unwrap_or_else(|| {
+                panic!("embed_build_info absent from rendered metrics:\n{rendered}")
+            });
+
+        // The crate version, from Cargo.toml via the compiler — not from any
+        // runtime input the deploy could set to a stale value.
+        assert!(
+            line.contains(&format!("pkg_version=\"{PKG_VERSION}\"")),
+            "embed_build_info must expose pkg_version=\"{PKG_VERSION}\"; got: {line}"
+        );
+
+        // The pre-existing `version` label keeps its meaning (the deploy tag),
+        // so the Grafana panel legend `{{version}}` does not silently change.
+        assert!(
+            line.contains("version=\"deploy-tag-that-is-not-the-crate-version\""),
+            "embed_build_info must still expose the EMBED_VERSION deploy tag; got: {line}"
+        );
+
+        // Guard the whole point of the label: it must not have been wired to
+        // the same source as `version`, which would make it useless again.
+        assert_ne!(
+            PKG_VERSION, "deploy-tag-that-is-not-the-crate-version",
+            "pkg_version must come from CARGO_PKG_VERSION, not the deploy tag"
+        );
     }
 }

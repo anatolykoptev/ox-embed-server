@@ -1,0 +1,31 @@
+# gitleaks — secrets gate, run by .github/workflows/preflight.yml.
+#
+# Extends the upstream default ruleset rather than replacing it: `useDefault`
+# pulls in ~170 maintained provider rules (AWS, GCP, GitHub, Slack, private
+# keys, JWTs). Redefining those by hand is how a secrets gate quietly stops
+# covering the provider you actually use.
+title = "embed-server gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Paths and literals that are not secrets in this repo"
+
+paths = [
+  # Lockfiles: checksum hashes trip the generic high-entropy rules.
+  '''Cargo\.lock''',
+  # The benchmark corpus and ONNX export scripts contain base64-ish tensor
+  # fixtures, not credentials.
+  '''docs/benchmarks/.*''',
+  '''scripts/precompute_alibi\.py''',
+]
+
+regexes = [
+  # Bearer-token PLACEHOLDERS in docs and comments. These are the literal
+  # strings a reader is told to replace, not values.
+  '''Bearer \$?\{?EMBED_TOKEN\}?''',
+  '''Bearer <[A-Za-z0-9_-]+>''',
+  # ONNX/model SHA-256 digests recorded for reproducibility.
+  '''sha256:[a-f0-9]{64}''',
+]

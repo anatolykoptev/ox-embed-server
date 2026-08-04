@@ -1,0 +1,80 @@
+# cargo-mutants — the test-QUALITY gate.
+#
+# fmt/clippy/nextest all pass on a test that asserts nothing. cargo-mutants
+# breaks the source one edit at a time (flip a comparison, drop a call, return
+# Default::default()) and demands that some test go red. A surviving mutant —
+# "MISSED" — is a line the suite does not actually check.
+#
+# Consumed by two lanes, which is why the scope lives HERE and not in either
+# workflow (they must not be able to disagree about what is in scope):
+#   * .github/workflows/preflight.yml — `--in-diff`, only the lines a PR touched.
+#   * .github/workflows/nightly.yml   — the full scope, sharded, non-blocking
+#                                       while the baseline is being paid down.
+
+# ── Scope ───────────────────────────────────────────────────────────────────
+#
+# Deliberately NOT the whole crate. Everything below is model-free logic with a
+# real unit-test suite behind it, so a surviving mutant is a genuine test gap
+# rather than "this needs a 2 GB ONNX file to exercise".
+#
+# Excluded on purpose, and why:
+#   src/model.rs, src/model_reranker/**, src/model_splade.rs, src/arena.rs,
+#   src/onnx_cache.rs — require a real ORT session and model weights; the
+#     integration tests that cover them early-return without EMBED_MODELS, so
+#     every mutant would report MISSED for an environmental reason and the gate
+#     would mean nothing.
+#   src/main.rs, src/bin/worker.rs — process entry points; their behaviour is
+#     covered by the multi-process integration tests, which are equally
+#     model-gated.
+#   src/otel.rs, src/mlock.rs, src/proc.rs — thin wrappers over OTLP export,
+#     mlock(2) and /proc reads. Mutants here are only killable by asserting on
+#     the syscall itself.
+#   src/supervisor/handle.rs — spawns and reaps real child processes.
+#
+# Widening this list is the goal, not the exception: when a module gains
+# model-free coverage, add it here in the same PR.
+examine_globs = [
+    "src/api_health.rs",
+    "src/batcher.rs",
+    "src/cache.rs",
+    "src/cache_flow.rs",
+    "src/config.rs",
+    "src/evictable_pool.rs",
+    "src/ipc/frame.rs",
+    "src/ipc/protocol.rs",
+    "src/metrics.rs",
+    "src/pool.rs",
+    "src/supervisor/pool.rs",
+    "src/supervisor/util.rs",
+    "src/token_cache.rs",
+    "src/types.rs",
+    "src/worker_waiters.rs",
+]
+
+# ── Test invocation ─────────────────────────────────────────────────────────
+
+# nextest, not `cargo test`: the repo's .config/nextest.toml carries
+# `slow-timeout = { period = "30s", terminate-after = 4 }`. A mutant that turns
+# a loop condition into an infinite loop is a NORMAL outcome of mutation
+# testing, and under `cargo test` — which has no authority to kill a hung test —
+# it parks the job until the workflow timeout. That is exactly how PR #142 hit a
+# 30-minute cancel. nextest terminates it and reports the mutant as caught.
+test_tool = "nextest"
+
+# `--lib`: run only the in-crate unit tests against each mutant. The
+# tests/*.rs integration binaries are all model-gated (they early-return without
+# EMBED_MODELS) so they can never kill a mutant here, but building and linking
+# 11 extra test binaries per mutant would dominate the run — the difference
+# between a gate that fits in a PR and one nobody waits for.
+additional_cargo_test_args = ["--lib"]
+
+# --locked mirrors every other gate in this repo: a mutation run that quietly
+# updates Cargo.lock is testing a different dependency set than CI.
+additional_cargo_args = ["--locked"]
+
+# A mutant is expected to be SLOWER than clean code (that is often how it gets
+# caught — a timeout). 5x the baseline, with a floor so a fast suite does not
+# produce an absurdly tight bound, keeps timeouts meaningful without flagging
+# healthy-but-slow mutants as caught-by-timeout noise.
+timeout_multiplier = 5.0
+minimum_test_timeout = 60

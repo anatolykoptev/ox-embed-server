@@ -1,5 +1,23 @@
 name: preflight
 
+# Per-PR gate. Public repo → `ubuntu-24.04-arm`: free, unlimited, and arm64,
+# which is the architecture this actually ships on (pillow is ARM). Keeping the
+# gate on the production architecture is not a detail here — the release profile
+# sets `target-cpu`-sensitive codegen and the ONNX runtime is arch-specific.
+#
+# Gate composition, and why each stage exists:
+#   fmt / clippy / deny / test / build — the pre-existing correctness gate.
+#   gitleaks / osv-scanner            — security gates, mirroring oxpulse-chat's
+#                                       preflight (issue #2799 there: a secret
+#                                       reached main and a release tag before
+#                                       any gate spoke).
+#   mutants                           — the TEST-QUALITY gate. clippy and nextest
+#                                       both pass on a test that asserts nothing.
+#                                       cargo-mutants breaks the code the PR
+#                                       touched and demands that some test
+#                                       notice. Scope + rationale live in
+#                                       .cargo/mutants.toml.
+
 on:
   push:
     branches: [main]
@@ -12,12 +30,26 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Pinned once, consumed by the install steps below. NEVER float these to
+  # `latest` — the next upstream tag silently changes what the gate means.
+  NEXTEST_VERSION: 0.9.140
+  CARGO_DENY_VERSION: 0.20.2
+  CARGO_MUTANTS_VERSION: 25.1.0
+  GITLEAKS_VERSION: 8.30.1
+  OSV_SCANNER_VERSION: 2.2.4
+
 jobs:
   preflight:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
+        with:
+          # `mutants --in-diff` below diffs against the PR base, which needs
+          # real history. The default shallow clone makes that merge-base
+          # unreachable and the step would silently mutate nothing.
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -27,13 +59,52 @@ jobs:
 
       - name: Install cargo-nextest
         run: |
-          curl -sSfL https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.140/cargo-nextest-0.9.140-aarch64-unknown-linux-gnu.tar.gz \
+          curl -sSfL "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/cargo-nextest-${NEXTEST_VERSION}-aarch64-unknown-linux-gnu.tar.gz" \
             | tar -xz -C ~/.cargo/bin
 
       - name: Install cargo-deny
         run: |
-          curl -sSfL https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-aarch64-unknown-linux-musl.tar.gz \
+          curl -sSfL "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/cargo-deny-${CARGO_DENY_VERSION}-aarch64-unknown-linux-musl.tar.gz" \
             | tar -xz -C ~/.cargo/bin --strip-components=1
+
+      - name: Install cargo-mutants
+        run: |
+          curl -sSfL "https://github.com/sourcefrog/cargo-mutants/releases/download/v${CARGO_MUTANTS_VERSION}/cargo-mutants-${CARGO_MUTANTS_VERSION}-aarch64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C ~/.cargo/bin cargo-mutants
+          cargo mutants --version
+
+      - name: Install gitleaks
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_arm64.tar.gz" \
+            | tar -xz -C ~/.cargo/bin gitleaks
+          gitleaks version
+
+      - name: Install osv-scanner
+        run: |
+          curl -sSfL -o ~/.cargo/bin/osv-scanner \
+            "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_arm64"
+          chmod +x ~/.cargo/bin/osv-scanner
+          osv-scanner --version
+
+      # ── security gates ──────────────────────────────────────────────────
+
+      - name: gitleaks (secrets scan)
+        timeout-minutes: 5
+        run: |
+          # Scans the working tree, not history: the point is to stop a secret
+          # from ENTERING main. `--no-banner` keeps the log readable; a finding
+          # exits non-zero and fails the job.
+          gitleaks dir . --config .gitleaks.toml --no-banner --redact
+
+      - name: osv-scanner (dependency vulnerabilities)
+        timeout-minutes: 10
+        run: |
+          # Complements `cargo deny check advisories`: deny reads RustSec only,
+          # OSV also carries GHSA and the distro feeds, so a crate advisory that
+          # lands in GHSA first is caught here days earlier.
+          osv-scanner scan source --lockfile=Cargo.lock --config=.osv-scanner.toml
+
+      # ── correctness gates ───────────────────────────────────────────────
 
       - name: fmt
         run: cargo fmt --all -- --check
@@ -49,3 +120,38 @@ jobs:
 
       - name: build
         run: cargo build --release --locked
+
+      # ── test-quality gate ───────────────────────────────────────────────
+
+      - name: mutants (test quality on changed lines)
+        # PRs only: `--in-diff` needs a base to diff against, and a push to main
+        # has already been through this gate on its PR.
+        if: github.event_name == 'pull_request'
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          # Diff against the merge-base, not the base tip: `...` gives the lines
+          # THIS branch changed, excluding whatever landed on main meanwhile.
+          # Without it, a PR is failed by unmutated lines it never touched.
+          git diff "origin/${{ github.base_ref }}...HEAD" -- 'src/**/*.rs' > /tmp/pr.diff
+          if [ ! -s /tmp/pr.diff ]; then
+            echo "No src/ changes in this PR — nothing to mutate."
+            exit 0
+          fi
+          echo "::group::PR diff stat"
+          git diff --stat "origin/${{ github.base_ref }}...HEAD" -- 'src/**/*.rs'
+          echo "::endgroup::"
+          # Scope (examine_globs) + timeouts live in .cargo/mutants.toml so this
+          # workflow and the nightly full run cannot disagree about what is in
+          # scope. A MISSED mutant here means: you changed this line, and no
+          # test in the suite notices when it is broken.
+          cargo mutants --in-diff /tmp/pr.diff --no-shuffle -j 2
+
+      - name: Upload mutants report
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-in-diff
+          path: mutants.out/
+          if-no-files-found: ignore
+          retention-days: 14

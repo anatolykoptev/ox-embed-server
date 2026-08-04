@@ -1,0 +1,187 @@
+name: nightly
+
+# Heavy gates that do not belong in a per-PR preflight.
+#
+#   full-mutants — the whole mutation scope, not just the lines a PR touched.
+#     preflight's `--in-diff` run can only ever protect NEW code; it says
+#     nothing about the test gaps already sitting in the tree. This lane
+#     measures the whole surface and ratchets it: the missed count may fall,
+#     never rise (see .cargo/mutants-baseline.txt).
+#
+#   fresh-advisories — cargo-deny + osv-scanner against the CURRENT advisory
+#     feeds. A dependency does not have to change for it to become vulnerable;
+#     without a scheduled run, a CVE published today is invisible until somebody
+#     happens to open a PR.
+#
+# Public repo → GitHub-hosted ARM, same as preflight. `schedule` only ever fires
+# on the default branch of this repository, so there is no fork-PR exposure.
+
+on:
+  schedule:
+    - cron: "0 3 * * *" # 03:00 UTC — off-peak, and well clear of the release lane
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NEXTEST_VERSION: 0.9.140
+  CARGO_DENY_VERSION: 0.20.2
+  CARGO_MUTANTS_VERSION: 25.1.0
+  OSV_SCANNER_VERSION: 2.2.4
+
+jobs:
+  full-mutants:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 300
+    strategy:
+      # Sharding is what makes a full run finish overnight instead of timing
+      # out. cargo-mutants partitions the mutant list deterministically, so the
+      # union of the four shards is exactly the full set — no mutant is dropped
+      # and none is tested twice.
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mutants-${{ matrix.shard }}
+
+      - name: Install cargo-nextest
+        run: |
+          curl -sSfL "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/cargo-nextest-${NEXTEST_VERSION}-aarch64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C ~/.cargo/bin
+
+      - name: Install cargo-mutants
+        run: |
+          curl -sSfL "https://github.com/sourcefrog/cargo-mutants/releases/download/v${CARGO_MUTANTS_VERSION}/cargo-mutants-${CARGO_MUTANTS_VERSION}-aarch64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C ~/.cargo/bin cargo-mutants
+
+      - name: mutants (shard ${{ matrix.shard }}/4)
+        run: |
+          set -euo pipefail
+          # Scope and test invocation come from .cargo/mutants.toml — the same
+          # file preflight reads, so the two lanes cannot drift apart.
+          # `|| true`: a MISSED mutant makes cargo-mutants exit non-zero, and
+          # here that is DATA, not a failure — the ratchet below is what decides
+          # pass/fail, and it needs all four shards to have reported.
+          cargo mutants --shard "${{ matrix.shard }}/4" --no-shuffle -j 2 || true
+          test -f mutants.out/outcomes.json || {
+            echo "::error::cargo-mutants produced no outcomes.json — the run aborted before testing anything. This is a harness failure, not a clean shard."
+            exit 1
+          }
+
+      - name: Upload shard outcomes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-shard-${{ matrix.shard }}
+          path: mutants.out/
+          if-no-files-found: error
+          retention-days: 30
+
+  ratchet:
+    needs: full-mutants
+    if: always()
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: mutants-shard-*
+          path: shards/
+
+      - name: Enforce the mutation ratchet
+        run: |
+          set -euo pipefail
+          # Every shard must have reported. Without this, a shard that died on
+          # infrastructure would simply contribute zero missed mutants and the
+          # ratchet would read as an improvement — the exact shape of a gate
+          # that passes because it did not run.
+          found=$(find shards -name outcomes.json | wc -l)
+          if [ "$found" -ne 4 ]; then
+            echo "::error::expected 4 shard outcome files, found ${found}. Refusing to evaluate the ratchet on a partial run."
+            exit 1
+          fi
+
+          missed=$(cat shards/*/outcomes.json | jq '[.outcomes[] | select(.summary == "MissedMutant")] | length' | paste -sd+ | bc)
+          caught=$(cat shards/*/outcomes.json | jq '[.outcomes[] | select(.summary == "CaughtMutant")] | length' | paste -sd+ | bc)
+          total=$((missed + caught))
+
+          echo "caught=${caught} missed=${missed} total=${total}"
+          if [ "$total" -gt 0 ]; then
+            echo "mutation score: $(( caught * 100 / total ))%"
+          fi
+
+          raw=$(tr -d '[:space:]' < .cargo/mutants-baseline.txt)
+          if [ "$raw" = "unset" ]; then
+            # Bootstrap: the very first full run is what MEASURES the baseline —
+            # there is no honest number to commit before it has run once. This
+            # branch is deliberately loud and self-terminating: it prints the
+            # number to commit, and once committed it can never be reached again.
+            echo "::warning::Mutation baseline is still 'unset' — the ratchet is NOT enforcing. Commit ${missed} to .cargo/mutants-baseline.txt to arm it."
+            exit 0
+          fi
+
+          baseline=$raw
+          if [ "$missed" -gt "$baseline" ]; then
+            echo "::error::${missed} missed mutants exceeds the baseline of ${baseline}. Code changed behaviour that no test asserts on — add the missing assertions, or justify and raise .cargo/mutants-baseline.txt in the same PR."
+            exit 1
+          fi
+          if [ "$missed" -lt "$baseline" ]; then
+            echo "::notice::${missed} missed mutants is BELOW the baseline of ${baseline} — lower .cargo/mutants-baseline.txt to ${missed} to lock the improvement in."
+          fi
+
+  fresh-advisories:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-deny
+        run: |
+          curl -sSfL "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/cargo-deny-${CARGO_DENY_VERSION}-aarch64-unknown-linux-musl.tar.gz" \
+            | tar -xz -C ~/.cargo/bin --strip-components=1
+
+      - name: Install osv-scanner
+        run: |
+          curl -sSfL -o ~/.cargo/bin/osv-scanner \
+            "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_arm64"
+          chmod +x ~/.cargo/bin/osv-scanner
+
+      - name: deny (advisories against today's feed)
+        run: cargo deny check advisories
+
+      - name: osv-scanner
+        run: osv-scanner scan source --lockfile=Cargo.lock --config=.osv-scanner.toml
+
+  full-suite:
+    # The per-PR gate runs `--lib` under mutants and the full suite once; this
+    # runs the full suite with the model-gated integration tests present and
+    # `--no-fail-fast`, so one broken binary cannot mask every binary after it.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        run: |
+          curl -sSfL "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/cargo-nextest-${NEXTEST_VERSION}-aarch64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C ~/.cargo/bin
+
+      - name: nextest (full, no-fail-fast)
+        run: cargo nextest run --locked --all-targets --workspace --no-fail-fast

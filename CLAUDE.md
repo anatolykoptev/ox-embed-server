@@ -48,19 +48,37 @@ Batcher:
 - `BATCH_MAX=32`, `BATCH_MAX_TOKENS=16384`, `BATCH_MAX_SEQ=256`, `BATCH_WAIT_MS=30`, `MAX_QUEUE_SIZE=256`.
 - `BATCH_LENGTH_RATIO_THRESHOLD` — (default `0.0` = disabled) when > 0.0, items whose `max_seq_len` exceeds `accum.max_len * threshold` are carried to the next batch to reduce padding waste on padded models.
 
-## Local CI
+## CI
 
-GitHub Actions runs `preflight` on every PR (fmt + clippy + test + build). Local gates:
+Two lanes, both on GitHub-hosted `ubuntu-24.04-arm` (public repo → free + unlimited, and arm64 is what pillow runs).
+
+**`preflight`** — every PR: gitleaks → osv-scanner → fmt → clippy → deny → nextest → release build → **mutants `--in-diff`**.
+
+**`nightly`** (03:00 UTC) — full mutation scope sharded 4×, then a ratchet job; plus `deny`/`osv-scanner` against that day's advisory feeds (a dep does not have to change to become vulnerable), plus the full suite with `--no-fail-fast`.
+
+Local gates:
 
 | Target | What it runs |
 |--------|--------------|
 | `make fmt` | `cargo fmt --all -- --check` |
 | `make clippy` | `cargo clippy --locked --all-targets --workspace -- -D warnings` |
+| `make deny` / `secrets` / `vulns` | cargo-deny · gitleaks · osv-scanner |
+| `make audit` | deny + secrets + vulns |
 | `make test` | `cargo nextest run --locked --all-targets --workspace` |
 | `make build` | `cargo build --release --locked` |
-| `make ci` | lint + test + build (full gate) |
+| `make ci` | lint + audit + test + build (full pre-push gate) |
+| `make mutants-diff` | cargo-mutants on this branch's changed lines — **what preflight gates on** |
+| `make mutants` | cargo-mutants over the full scope (hours; nightly's job) |
 
 `--locked` mandatory on all targets — catches `Cargo.lock` drift.
+
+### Mutation testing
+
+`fmt`, `clippy` and `nextest` all pass on a test that asserts nothing. cargo-mutants breaks the source one edit at a time and requires that some test go red; a surviving ("MISSED") mutant is a line no test actually checks. This repo has shipped that exact defect more than once — `heartbeat_kills_wedged_worker` had zero callers of the function it claimed to prove, and `record_carry_lost` had only its negative case.
+
+Scope, test tool and timeouts live in **`.cargo/mutants.toml`** — one file, read by both lanes, so they cannot drift. Scope is deliberately partial: model-free logic with real unit tests. Anything needing a live ORT session (`model.rs`, `model_reranker/**`, `model_splade.rs`, `arena.rs`, `onnx_cache.rs`) is excluded because its tests early-return without `EMBED_MODELS`, so every mutant would report MISSED for an environmental reason and the gate would mean nothing. **Widening that list as coverage grows is the goal, not the exception.**
+
+`.cargo/mutants-baseline.txt` is the ratchet: nightly fails if the missed count rises above it, and tells you to lower it when it falls. Raising it requires a justification in the same PR.
 
 Integration tests with real models require: `EMBED_MODELS=...` + `RERANKER_MODELS=...` + `SPLADE_MODELS=...` + `ORT_DYLIB_PATH=...` env. Run `--test-threads=1` (parallel OOMs on 4-core 24 GB).
 

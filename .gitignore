@@ -1,5 +1,9 @@
 target/
 
+# cargo-mutants scratch + report dir (CI uploads it as an artifact instead)
+mutants.out/
+mutants.out.old/
+
 # Python tooling (export + equivalence scripts under scripts/, tests/)
 __pycache__/
 *.pyc
