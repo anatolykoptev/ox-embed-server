@@ -13,6 +13,15 @@ useDefault = true
 description = "Paths and literals that are not secrets in this repo"
 
 paths = [
+  # Build output. NOT cosmetic: preflight runs Swatinem/rust-cache BEFORE this
+  # step, which restores target/ into the workspace — so on a warm cache the
+  # scan grew from 1.5 MB of source to 601 MB of compiled artifacts and
+  # vendored dependency sources, and reported 3 findings that exist in neither
+  # this repo's source nor its history (a fresh full clone scans clean).
+  # A secret cannot reach target/ without first being in source, which this
+  # config already covers.
+  '''^target/''',
+  '''^mutants\.out/''',
   # Lockfiles: checksum hashes trip the generic high-entropy rules.
   '''Cargo\.lock''',
   # The benchmark corpus and ONNX export scripts contain base64-ish tensor
