@@ -54,9 +54,14 @@ audit: deny secrets vulns
 # gates on. `mutants` is the full scope — minutes to hours; that is the
 # nightly lane's job, not a pre-push habit.
 
+# Pathspec is `src`, not 'src/**/*.rs'. A git pathspec is wildmatch without
+# FNM_PATHNAME, so `*` does not cross `/` and 'src/**/*.rs' misses every file
+# sitting directly in src/ — which is most of the crate. preflight.yml was
+# fixed for this; this target was not, so `make mutants-diff` reported
+# "no src/ changes" on a PR that changed src/metrics.rs while CI mutated it.
 mutants-diff:
 	@command -v cargo-mutants >/dev/null || { echo "cargo-mutants not installed — cargo install cargo-mutants@25.1.0"; exit 1; }
-	@git diff origin/main...HEAD -- 'src/**/*.rs' > /tmp/embed-mutants.diff
+	@git diff origin/main...HEAD -- src > /tmp/embed-mutants.diff
 	@if [ ! -s /tmp/embed-mutants.diff ]; then echo "▶  mutants-diff  (no src/ changes vs origin/main — skipped)"; else \
 		$(CI_STAGE) mutants-diff cargo mutants --in-diff /tmp/embed-mutants.diff --no-shuffle -j 2; fi
 

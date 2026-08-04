@@ -126,8 +126,17 @@ exclude_re = [
     # worker binary and a real fork; their mutants would report MISSED for an
     # environmental reason. Function-level, so heartbeat_tick and the rest of
     # the file stay in scope.
-    "spawn_and_supervise",
+    #
+    # "spawn_and_supervise" used to be listed here. No such function exists —
+    # it was written from a description rather than from the source, so the
+    # entry excluded nothing and quietly implied coverage of a name that is not
+    # there. The real entry point is `launch`.
+    #
+    # "clear_on_exit" was also listed, on the grounds that it drives a child
+    # process. It does not: it is one atomic store and one RwLock write, it has
+    # a dedicated test (clear_on_exit_clears_pid_before_client_slot), and its
+    # ordering is load-bearing enough that a mutant SHOULD be caught. In scope.
+    "launch",
     "watchdog_loop",
     "spawn_one",
-    "clear_on_exit",
 ]
