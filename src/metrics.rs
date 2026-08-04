@@ -1444,9 +1444,13 @@ pub fn record_ready_probe(result: &str) {
 /// to catch a wedged worker before the heartbeat kills it, and on
 /// `rate(embed_worker_heartbeat_total{result="kill"}[5m]) > 0` to detect
 /// chronic wedging (a worker that keeps getting killed is a deeper problem).
-pub fn record_worker_heartbeat(result: &str) {
+/// `model` matches the label on `embed_worker_restart_total`, so the two can
+/// be joined: a rising `result="kill"` is only actionable once you know which
+/// of the four workers it names.
+pub fn record_worker_heartbeat(model: &str, result: &str) {
     metrics::counter!(
         "embed_worker_heartbeat_total",
+        "model" => model.to_string(),
         "result" => result.to_string()
     )
     .increment(1);
@@ -1479,10 +1483,11 @@ pub fn ready_probe_touch() {
 
 /// Pre-touch the heartbeat counter to 0 for all result labels so "no
 /// heartbeats yet" is visible in Prometheus as present-but-zero, not absent.
-pub fn worker_heartbeat_touch() {
+pub fn worker_heartbeat_touch(model: &str) {
     for result in ["ok", "timeout", "error", "kill"] {
         metrics::counter!(
             "embed_worker_heartbeat_total",
+            "model" => model.to_string(),
             "result" => result.to_string()
         )
         .absolute(0);
