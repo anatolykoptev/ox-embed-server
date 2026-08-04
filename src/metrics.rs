@@ -7,6 +7,26 @@ use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 const MIB: f64 = 1024.0 * 1024.0;
 const GIB: f64 = 1024.0 * MIB;
 
+/// Bucket ladder for every `*_duration_seconds` histogram.
+///
+/// Named and pinned rather than inlined because these edges are LOAD-BEARING
+/// OUTSIDE this repo: the private infra repo's
+/// `config/prometheus/alerts-embed-server.yml` runs `histogram_quantile` over
+/// `embed_worker_queue_wait_duration_seconds` in `EmbedWorkerQueueWaitHighJina`
+/// (> 30), `EmbedWorkerQueueWaitHighFastModels` (> 10) and the
+/// `embed:worker_queue_wait_seconds:p95` recording rule. `histogram_quantile`
+/// interpolates BETWEEN bucket edges, so moving one silently changes what those
+/// thresholds mean — with nothing red anywhere.
+///
+/// Mutation testing is excluded from `apply_histogram_buckets`
+/// (see .cargo/mutants.toml: 236 mutants, all of them bucket arithmetic), so
+/// `duration_bucket_ladder_is_pinned` below is the only automated notice that
+/// an edge moved. Changing this list is allowed — changing it ACCIDENTALLY is
+/// what the test stops.
+const DURATION_BUCKETS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+];
+
 /// Apply every embed-server histogram bucket configuration to a
 /// `PrometheusBuilder`.
 ///
@@ -83,12 +103,7 @@ pub fn apply_histogram_buckets(builder: PrometheusBuilder) -> PrometheusBuilder 
         metrics_exporter_prometheus::Matcher::Full("embed_rerank_input_docs_size".to_string());
 
     builder
-        .set_buckets_for_metric(
-            duration_matcher,
-            &[
-                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
-            ],
-        )
+        .set_buckets_for_metric(duration_matcher, DURATION_BUCKETS)
         .expect("set duration buckets")
         .set_buckets_for_metric(
             batch_matcher,
@@ -174,18 +189,48 @@ pub fn apply_histogram_buckets(builder: PrometheusBuilder) -> PrometheusBuilder 
         .expect("set rerank input docs size buckets")
 }
 
+/// The compiled-in crate version — the only label on `embed_build_info` that a
+/// deploy cannot fake.
+///
+/// `version` (below) carries `EMBED_VERSION`, a hand-written string set in the
+/// deploy compose file (`phase-2-multi-process-pillow` on pillow today). It is
+/// constant across releases, so it can never answer "did the new build actually
+/// reach production?" — the question that matters after a release. `pkg_version`
+/// is `CARGO_PKG_VERSION`, baked at compile time from `Cargo.toml`, which
+/// release-please bumps on every release. Asserting on it is what makes a deploy
+/// verifiable instead of assumed.
+pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Install the supervisor Prometheus recorder and return its rendering handle.
 ///
 /// Delegates bucket configuration to [`apply_histogram_buckets`] (the single
 /// authority) so the supervisor and worker recorders never drift. Stamps
-/// `embed_build_info{version}` to 1.
+/// `embed_build_info{version,pkg_version}` to 1.
 pub fn init(version: &str) -> PrometheusHandle {
     let handle = apply_histogram_buckets(PrometheusBuilder::new())
         .install_recorder()
         .expect("install Prometheus recorder");
 
-    metrics::gauge!("embed_build_info", "version" => version.to_string()).set(1.0);
+    stamp_build_info(version);
     handle
+}
+
+/// Stamp `embed_build_info{version,pkg_version} 1` on the installed recorder.
+///
+/// Split out of [`init`] so it is reachable from a test: `init` installs a
+/// global recorder and can therefore only run once per process, which would
+/// make the assertion below untestable inside the shared test binary.
+pub fn stamp_build_info(version: &str) {
+    // `version` keeps its position and semantics: the Grafana panel at
+    // config/grafana/dashboards/embed-server.json renders `{{version}}` as its
+    // legend, and adding a label is additive for any PromQL query selecting on
+    // the metric name. `pkg_version` is the new, release-tracking label.
+    metrics::gauge!(
+        "embed_build_info",
+        "version" => version.to_string(),
+        "pkg_version" => PKG_VERSION,
+    )
+    .set(1.0);
 }
 
 /// Record a completed request.
@@ -1491,5 +1536,110 @@ pub fn worker_heartbeat_touch(model: &str) {
             "result" => result.to_string()
         )
         .absolute(0);
+    }
+}
+
+#[cfg(test)]
+mod bucket_ladder_tests {
+    use super::DURATION_BUCKETS;
+
+    /// The `*_duration_seconds` bucket edges are consumed by alert rules in the
+    /// private infra repo, so they are an external contract, not an internal
+    /// detail.
+    ///
+    /// `config/prometheus/alerts-embed-server.yml` runs `histogram_quantile`
+    /// over `embed_worker_queue_wait_duration_seconds` and compares the result
+    /// against 30s (`EmbedWorkerQueueWaitHighJina`), 10s
+    /// (`EmbedWorkerQueueWaitHighFastModels`) and the
+    /// `embed:worker_queue_wait_seconds:p95` recording rule.
+    /// `histogram_quantile` INTERPOLATES between edges, so silently deleting
+    /// the 10.0 or 30.0 boundary changes what those alerts fire on, in a way
+    /// no test and no alert would otherwise notice.
+    ///
+    /// This is a pin, not a design constraint: change the ladder freely, just
+    /// change it here on purpose and re-check the alert thresholds.
+    #[test]
+    fn duration_bucket_ladder_is_pinned() {
+        assert_eq!(
+            DURATION_BUCKETS,
+            &[
+                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0
+            ],
+            "the *_duration_seconds bucket ladder changed. Alert rules in the infra repo \
+             (EmbedWorkerQueueWaitHighJina > 30, EmbedWorkerQueueWaitHighFastModels > 10, \
+             embed:worker_queue_wait_seconds:p95) read histogram_quantile off these edges — \
+             update them in the same change, then update this pin."
+        );
+
+        // The alert thresholds must each sit ON an edge, not between two.
+        // A threshold that falls inside a bucket is answered by interpolation
+        // rather than by data, which is how a p95 alert quietly becomes a
+        // function of the bucket layout instead of the latency.
+        for threshold in [10.0_f64, 30.0_f64] {
+            assert!(
+                DURATION_BUCKETS.contains(&threshold),
+                "alert threshold {threshold}s has no matching bucket edge"
+            );
+        }
+
+        // Prometheus requires monotonically increasing edges; a swapped pair
+        // makes histogram_quantile return nonsense rather than erroring.
+        assert!(
+            DURATION_BUCKETS.windows(2).all(|w| w[0] < w[1]),
+            "bucket edges must be strictly increasing"
+        );
+    }
+}
+
+#[cfg(test)]
+mod build_info_tests {
+    use super::{PKG_VERSION, stamp_build_info, test_prometheus_handle};
+
+    /// `embed_build_info` must carry the COMPILED-IN crate version.
+    ///
+    /// This is the assertion the post-release deploy check reads: pillow's
+    /// autodeploy scrapes `/metrics` and refuses to report success unless the
+    /// running container advertises the version it just built. Before
+    /// `pkg_version` existed the only label was `version`, sourced from the
+    /// `EMBED_VERSION` env var — a constant string in the deploy compose file,
+    /// identical before and after every release, so the check could not
+    /// distinguish a new build from a stale container that never restarted.
+    ///
+    /// RED-proven three ways: dropping the `pkg_version` label, renaming it,
+    /// and sourcing it from `EMBED_VERSION` instead of `CARGO_PKG_VERSION` each
+    /// fail this test.
+    #[test]
+    fn build_info_carries_compiled_crate_version() {
+        let handle = test_prometheus_handle();
+        stamp_build_info("deploy-tag-that-is-not-the-crate-version");
+        let rendered = handle.render();
+
+        let line = rendered
+            .lines()
+            .find(|l| l.starts_with("embed_build_info{"))
+            .unwrap_or_else(|| {
+                panic!("embed_build_info absent from rendered metrics:\n{rendered}")
+            });
+
+        // The crate version, from Cargo.toml via the compiler — not from any
+        // runtime input the deploy could set to a stale value.
+        assert!(
+            line.contains(&format!("pkg_version=\"{PKG_VERSION}\"")),
+            "embed_build_info must expose pkg_version=\"{PKG_VERSION}\"; got: {line}"
+        );
+
+        // The pre-existing `version` label keeps its meaning (the deploy tag),
+        // so the Grafana panel legend `{{version}}` does not silently change.
+        assert!(
+            line.contains("version=\"deploy-tag-that-is-not-the-crate-version\""),
+            "embed_build_info must still expose the EMBED_VERSION deploy tag; got: {line}"
+        );
+
+        // Guard the whole point of the label: it must not have been wired to
+        // the same source as `version`, which would make it useless again.
+        assert_ne!(
+            PKG_VERSION, "deploy-tag-that-is-not-the-crate-version",
+            "pkg_version must come from CARGO_PKG_VERSION, not the deploy tag"
+        );
     }
 }

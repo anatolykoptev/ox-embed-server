@@ -1,0 +1,9 @@
+# osv-scanner — dependency-vulnerability gate, run by preflight.yml.
+#
+# Ignores here must stay in lockstep with deny.toml's [advisories].ignore: the
+# two tools read overlapping feeds, and an advisory suppressed in one but not
+# the other fails the build with no way to act on it.
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0436"
+reason = "paste is unmaintained; reached only transitively through tokenizers -> macro_rules_attribute. No upstream fix exists and no safe replacement is published. Mirrors the same suppression in deny.toml."

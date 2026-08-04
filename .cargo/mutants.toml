@@ -1,0 +1,133 @@
+# cargo-mutants — the test-QUALITY gate.
+#
+# fmt/clippy/nextest all pass on a test that asserts nothing. cargo-mutants
+# breaks the source one edit at a time (flip a comparison, drop a call, return
+# Default::default()) and demands that some test go red. A surviving mutant —
+# "MISSED" — is a line the suite does not actually check.
+#
+# Consumed by two lanes, which is why the scope lives HERE and not in either
+# workflow (they must not be able to disagree about what is in scope):
+#   * .github/workflows/preflight.yml — `--in-diff`, only the lines a PR touched.
+#   * .github/workflows/nightly.yml   — the full scope, sharded, non-blocking
+#                                       while the baseline is being paid down.
+
+# ── Scope ───────────────────────────────────────────────────────────────────
+#
+# Deliberately NOT the whole crate. Everything below is model-free logic with a
+# real unit-test suite behind it, so a surviving mutant is a genuine test gap
+# rather than "this needs a 2 GB ONNX file to exercise".
+#
+# Excluded on purpose, and why:
+#   src/model.rs, src/model_reranker/**, src/model_splade.rs, src/arena.rs,
+#   src/onnx_cache.rs — require a real ORT session and model weights; the
+#     integration tests that cover them early-return without EMBED_MODELS, so
+#     every mutant would report MISSED for an environmental reason and the gate
+#     would mean nothing.
+#   src/main.rs, src/bin/worker.rs — process entry points; their behaviour is
+#     covered by the multi-process integration tests, which are equally
+#     model-gated.
+#   src/otel.rs, src/mlock.rs, src/proc.rs — thin wrappers over OTLP export,
+#     mlock(2) and /proc reads. Mutants here are only killable by asserting on
+#     the syscall itself.
+#   src/supervisor/handle.rs — only PARTLY: `spawn_and_supervise`,
+#     `watchdog_loop`, `spawn_one` and `clear_on_exit` drive real child
+#     processes, so they are named in `exclude_re` below. The rest of the file —
+#     including `heartbeat_tick`, the wedge detector whose logic is model-free
+#     and unit-tested — IS in scope. Excluding the whole file would exempt the
+#     module with this repo's documented false-green history, which is the
+#     opposite of the point.
+#
+# Widening this list is the goal, not the exception: when a module gains
+# model-free coverage, add it here in the same PR.
+examine_globs = [
+    "src/api_health.rs",
+    "src/batcher.rs",
+    "src/cache.rs",
+    "src/cache_flow.rs",
+    "src/config.rs",
+    "src/evictable_pool.rs",
+    "src/ipc/frame.rs",
+    "src/ipc/protocol.rs",
+    "src/metrics.rs",
+    "src/pool.rs",
+    "src/supervisor/handle.rs",
+    "src/supervisor/pool.rs",
+    "src/supervisor/util.rs",
+    "src/token_cache.rs",
+    "src/types.rs",
+    "src/worker_waiters.rs",
+]
+
+# ── Test invocation ─────────────────────────────────────────────────────────
+
+# nextest, not `cargo test`: the repo's .config/nextest.toml carries
+# `slow-timeout = { period = "30s", terminate-after = 4 }`. A mutant that turns
+# a loop condition into an infinite loop is a NORMAL outcome of mutation
+# testing, and under `cargo test` — which has no authority to kill a hung test —
+# it parks the job until the workflow timeout. That is exactly how PR #142 hit a
+# 30-minute cancel. nextest terminates it and reports the mutant as caught.
+test_tool = "nextest"
+
+# `--lib` plus the two integration binaries that are NOT model-gated.
+#
+# Most of tests/*.rs early-returns without EMBED_MODELS/RERANKER_MODELS/
+# SPLADE_MODELS, so those can never kill a mutant here and linking eleven extra
+# binaries per mutant would dominate the run. But "all of them are gated" is
+# false, and believing it costs coverage in exactly the wrong direction:
+#
+#   tests/worker_max_waiters.rs            5 tests, no model gate,
+#                                          covers src/worker_waiters.rs (in scope)
+#   tests/worker_inference_observability.rs 1 test, no model gate,
+#                                          covers src/metrics.rs (in scope)
+#
+# Without them a PR touching worker_waiters' per-model override precedence gets
+# its mutant reported MISSED even though tests/worker_max_waiters.rs kills it —
+# and the author's rational response is to duplicate that test into a #[cfg(test)]
+# block or widen the exclusions. A gate that punishes correctly-tested code
+# teaches people to weaken it.
+#
+# (tests/ipc_ping.rs is also ungated but spawns a real worker binary, and
+# tests/rerank_smoke.rs gates on EMBED_SERVER_URL — neither belongs here.)
+additional_cargo_test_args = [
+    "--lib",
+    "--test",
+    "worker_max_waiters",
+    "--test",
+    "worker_inference_observability",
+]
+
+# --locked mirrors every other gate in this repo: a mutation run that quietly
+# updates Cargo.lock is testing a different dependency set than CI.
+additional_cargo_args = ["--locked"]
+
+# A mutant is expected to be SLOWER than clean code (that is often how it gets
+# caught — a timeout). 5x the baseline, with a floor so a fast suite does not
+# produce an absurdly tight bound, keeps timeouts meaningful without flagging
+# healthy-but-slow mutants as caught-by-timeout noise.
+#
+# The floor is 30s against an ~8s baseline (613 tests). It was 60s, which cost a
+# full minute per infinite-loop mutant for no extra signal — measured on krolik,
+# where `evict_idle -> 1` and a bucket-boundary mutant each burned the whole 60s.
+timeout_multiplier = 5.0
+minimum_test_timeout = 30
+
+# ── Exclusions inside otherwise-in-scope files ──────────────────────────────
+#
+# `apply_histogram_buckets` alone is 236 of the crate's ~940 mutants — a quarter
+# of the entire run — and every one of them mutates a Prometheus BUCKET
+# BOUNDARY (`16.0 * MIB` -> `16.0 / MIB`). Bucket edges are a tuning choice,
+# not behaviour: no test should assert that a histogram's 7th boundary is
+# exactly 64 MiB, and writing tests to kill these would be writing tests that
+# freeze a knob operators are meant to turn. The rest of metrics.rs — the label
+# and classification logic that alert rules actually read — stays in scope.
+exclude_re = [
+    "apply_histogram_buckets",
+    # src/supervisor/handle.rs, the child-process machinery. These need a real
+    # worker binary and a real fork; their mutants would report MISSED for an
+    # environmental reason. Function-level, so heartbeat_tick and the rest of
+    # the file stay in scope.
+    "spawn_and_supervise",
+    "watchdog_loop",
+    "spawn_one",
+    "clear_on_exit",
+]
