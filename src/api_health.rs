@@ -187,8 +187,19 @@ pub async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     )
     .await;
 
+    // Three nested Results, not two. The spawn_blocking closure ends in
+    // `model.embed_tokens(&token_ids)` -> Result<_, String>, so the awaited
+    // expression is Result<Result<Result<_, String>, JoinError>, Elapsed>.
+    //
+    // The previous match had three arms over two levels, so `Ok(Ok(_))` bound
+    // the INFERENCE Result — Err included — and answered 200 "ready" while
+    // every inference was failing, incrementing embed_ready_probe_total{ok}.
+    // That is the "wedged while /health stayed 200" incident this endpoint was
+    // added to close, reproduced one branch over: the multi-process arm above
+    // handles WorkerResponse::Err correctly, and only this single-process path
+    // (EMBED_MULTI_PROCESS=0, the documented monolith rollback) was wrong.
     match probe_result {
-        Ok(Ok(_)) => {
+        Ok(Ok(Ok(_))) => {
             crate::metrics::record_ready_probe("ok");
             (
                 StatusCode::OK,
@@ -199,8 +210,8 @@ pub async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 }),
             )
         }
-        Ok(Err(e)) => {
-            tracing::warn!(model = %model_name, error = ?e, "ready probe: inference failed");
+        Ok(Ok(Err(e))) => {
+            tracing::warn!(model = %model_name, error = %e, "ready probe: inference failed");
             crate::metrics::record_ready_probe("error");
             (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -208,6 +219,19 @@ pub async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                     status: "not ready",
                     model: Some(model_name),
                     error: Some(format!("inference failed: {e}")),
+                }),
+            )
+        }
+        Ok(Err(e)) => {
+            // JoinError — the blocking task panicked or was cancelled.
+            tracing::warn!(model = %model_name, error = ?e, "ready probe: probe task panicked");
+            crate::metrics::record_ready_probe("error");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ReadyResponse {
+                    status: "not ready",
+                    model: Some(model_name),
+                    error: Some(format!("probe task panicked: {e}")),
                 }),
             )
         }
