@@ -32,7 +32,7 @@ env:
   NEXTEST_VERSION: 0.9.140
   CARGO_DENY_VERSION: 0.20.2
   CARGO_MUTANTS_VERSION: 25.1.0
-  OSV_SCANNER_VERSION: 2.2.4
+  OSV_SCANNER_VERSION: 2.4.0
 
 jobs:
   full-mutants:
@@ -60,10 +60,27 @@ jobs:
           curl -sSfL "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/cargo-nextest-${NEXTEST_VERSION}-aarch64-unknown-linux-gnu.tar.gz" \
             | tar -xz -C ~/.cargo/bin
 
+      # See preflight.yml for why this is built from source and cached: no
+      # aarch64-linux binary is published for any cargo-mutants release.
+      - name: Cache cargo-mutants binary
+        id: cache-mutants
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-mutants
+          key: cargo-mutants-${{ env.CARGO_MUTANTS_VERSION }}-aarch64
+
       - name: Install cargo-mutants
+        if: steps.cache-mutants.outputs.cache-hit != 'true'
+        run: cargo install cargo-mutants --locked --version "${CARGO_MUTANTS_VERSION}"
+
+      - name: Verify cargo-mutants version
         run: |
-          curl -sSfL "https://github.com/sourcefrog/cargo-mutants/releases/download/v${CARGO_MUTANTS_VERSION}/cargo-mutants-${CARGO_MUTANTS_VERSION}-aarch64-unknown-linux-gnu.tar.gz" \
-            | tar -xz -C ~/.cargo/bin cargo-mutants
+          got="$(cargo mutants --version)"
+          echo "$got"
+          case "$got" in
+            *"${CARGO_MUTANTS_VERSION}"*) ;;
+            *) echo "::error::cargo-mutants is '${got}', expected ${CARGO_MUTANTS_VERSION}"; exit 1 ;;
+          esac
 
       - name: mutants (shard ${{ matrix.shard }}/4)
         run: |
