@@ -72,9 +72,23 @@ const SOCKET_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// Default heartbeat probe interval. The supervisor sends a 1-word inference
 /// probe to the worker every this often. 0 disables heartbeat.
 ///
-/// 30s balances detection latency against probe overhead: one ~5-50ms
-/// inference every 30s is negligible. With `HEARTBEAT_MAX_FAILS=3` the
-/// worst-case wedge detection is ~90s.
+/// 30s balances detection latency against probe overhead: one 1-word
+/// inference every 30s is negligible.
+///
+/// Worst-case wedge detection, with `HEARTBEAT_MAX_FAILS=3` and a 15s probe
+/// timeout: each cycle is `sleep(30s)` plus a probe bounded at 15s = 45s, three
+/// cycles to spend the fail budget = 135s, plus up to one further interval if
+/// the wedge starts just after a good beat — so **135-165s**. (It was ~96-126s
+/// under the old 2s probe timeout; the comment previously said "~90s", which
+/// was wrong even then.) Over that window a wedged worker parks four to five
+/// rounds of client requests, each bounded by `DISPATCH_TIMEOUT_SECS` (30s) in
+/// `supervisor/pool.rs`, so callers see dispatch timeouts throughout — they are
+/// not silently hanging.
+///
+/// That cost is accepted deliberately: a FALSE kill triggers a 5-15s cold model
+/// reload, which lengthens the queue, which makes the next probe likelier to
+/// time out — a positive feedback loop. 40 extra seconds on a genuinely wedged
+/// worker that is already erroring is strictly the better failure.
 ///
 /// Overridable via `EMBED_WORKER_HEARTBEAT_INTERVAL_SECS`. Captured at
 /// startup; restart the container to change.
@@ -524,13 +538,22 @@ impl WorkerSupervisor {
     /// becomes None. This ensures:
     ///   - The RSS-poll loop sees pid=0 (skip) before dispatchers see
     ///     "unavailable" — no window where it reads `/proc/<dead_pid>/status`.
-    ///   - Concurrent observers never see the inconsistent state
-    ///     (pid != 0 && client_slot = None).
     ///
-    /// On respawn (in `watchdog_loop`), the order is intentionally reversed
-    /// (PID set first, then client_slot) — reading a live-but-not-ready PID
-    /// is harmless (just memory stats), and dispatchers correctly see
-    /// "unavailable" until `client_slot` is set.
+    /// Scope of the benefit, stated honestly: this narrows a sub-window, it
+    /// does not close a race. The dominant window is process-death ->
+    /// `child.wait()` returns -> this runs, which is milliseconds and entirely
+    /// unaffected. What the ordering removes is the interval between the atomic
+    /// store and the `RwLock` write acquisition — sub-microsecond and
+    /// uncontended. Concretely it saves at most one `/proc/<dead_pid>/status`
+    /// read returning ENOENT per worker exit, in `supervisor/pool.rs`'s
+    /// `worker_pids`. Worth keeping; not worth believing more of.
+    ///
+    /// It is NOT an invariant that observers never see `pid != 0 &&
+    /// client_slot == None` — the respawn path in `watchdog_loop` deliberately
+    /// uses the opposite order (PID set first, then `client_slot`) and so
+    /// produces exactly that state on every restart. Reading a
+    /// live-but-not-ready PID is harmless (memory stats only), and dispatchers
+    /// correctly see "unavailable" until `client_slot` is set.
     async fn clear_on_exit(&self) {
         // Clear PID FIRST — RSS-poll loop sees pid=0 (skip) before
         // dispatchers see "unavailable" via client_slot=None.
@@ -1235,16 +1258,48 @@ mod tests {
         );
 
         // The child must STILL be running — nothing was killed.
-        #[cfg(unix)]
-        unsafe {
-            assert_eq!(
-                libc::kill(pid as i32, 0),
-                0,
-                "a healthy worker must not be signalled"
-            );
-        }
+        //
+        // `try_wait`, not `libc::kill(pid, 0)`: a SIGKILLed-but-unreaped child
+        // is a zombie, and `kill(pid, 0)` returns 0 for zombies, so that check
+        // would pass even if the kill HAD fired. `try_wait` returning `None`
+        // is the only thing that actually distinguishes "running" from
+        // "killed a moment ago".
+        assert!(
+            child.try_wait().expect("try_wait").is_none(),
+            "a healthy worker must not be signalled — the child has exited"
+        );
         let _ = child.kill();
         let _ = child.wait();
+        let _ = pid;
+    }
+
+    /// The heartbeat LOOP must actually probe — repeatedly.
+    ///
+    /// `heartbeat_tick` is well covered by the tests above, but a tick nobody
+    /// calls is worth nothing: before this, `heartbeat_loop` had exactly one
+    /// caller (production) and zero test callers, which is the same shape as
+    /// the defect this PR fixes, one level up. This drives the real loop
+    /// against a mock worker and asserts the counter moves.
+    ///
+    /// RED-proven: replacing the `self.heartbeat_tick(..).await` call in
+    /// `heartbeat_loop` with a no-op leaves the counter at 0 and fails here.
+    #[tokio::test]
+    async fn heartbeat_loop_probes_repeatedly() {
+        let mock = MockWorker::start("loop", MockReply::Ok).await;
+        let sup = supervisor_for(&mock, WorkerKind::Embed, 0).await;
+
+        let task = tokio::spawn(sup.clone().heartbeat_loop());
+        // The supervisor is built with a 50ms interval; give it room for
+        // several cycles without making the test slow.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        task.abort();
+
+        let probes = mock.kinds_received().len();
+        assert!(
+            probes >= 2,
+            "heartbeat_loop must keep probing on its interval; saw {probes} probe(s) in 400ms \
+             at a 50ms interval"
+        );
     }
 
     /// #135: each worker kind must receive ITS OWN probe variant. An embed
@@ -1316,5 +1371,4 @@ mod tests {
             "a respawn window must not count against the worker"
         );
     }
-
 }
