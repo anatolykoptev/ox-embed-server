@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.8.0](https://github.com/anatolykoptev/ox-embed-server/compare/embed-server-v0.7.0...embed-server-v0.8.0) (2026-08-04)
+
+
+### Features
+
+* **ci,metrics:** mutation testing + secret/vulnerability gates + embed_build_info pkg_version ([#143](https://github.com/anatolykoptev/ox-embed-server/issues/143)) ([f904540](https://github.com/anatolykoptev/ox-embed-server/commit/f9045402c174de2642ddca56608d210b07e80501))
+
+
+### Bug Fixes
+
+* **deps:** clear 10 advisories — openssl, opentelemetry, serial_test ([#144](https://github.com/anatolykoptev/ox-embed-server/issues/144)) ([2b2e8dc](https://github.com/anatolykoptev/ox-embed-server/commit/2b2e8dc64a0b9b30060684cdaefa86037f1b8608))
+* **heartbeat,ready:** stop killing healthy workers; count error replies as failures ([#146](https://github.com/anatolykoptev/ox-embed-server/issues/146)) ([7b217d3](https://github.com/anatolykoptev/ox-embed-server/commit/7b217d32c21980cc8118fd3914920e9eef446439))
+
 ## [0.7.0](https://github.com/anatolykoptev/ox-embed-server/compare/embed-server-v0.6.0...embed-server-v0.7.0) (2026-07-27)
 
 
