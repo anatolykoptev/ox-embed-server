@@ -1988,7 +1988,20 @@ impl StandaloneEmbedder {
             // behaviour, which is what the supervisor path has always used.
             cfg.auto_truncate,
             pool_size,
-            0, // idle_evict_secs — disabled; worker is short-lived
+            // Was a hardcoded `0`, commented "worker is short-lived". It is
+            // not: the module doc on `src/bin/worker.rs` describes exactly
+            // what this process does — load the model once, then loop
+            // accepting UDS connections for the container's lifetime. Measured
+            // on pillow 2026-08-05: four models serving nothing but heartbeats
+            // held ~5 GB resident while `PSIMemoryPressureHigh` was firing.
+            //
+            // `cfg` was already in scope, so the configured value was being
+            // read, validated, and then thrown away — `EMBED_IDLE_EVICT_SECS`
+            // did nothing in multi-process mode, which is production.
+            //
+            // Default is still 0 (eviction off), so this changes no deployed
+            // behaviour until an operator sets the variable. See #167.
+            cfg.idle_evict_secs,
         )?;
         Ok(Self { inner, dims })
     }
