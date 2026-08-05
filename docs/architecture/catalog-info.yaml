@@ -1,22 +1,32 @@
 apiVersion: backstage.io/v1alpha1
 kind: Component
 metadata:
-  name: embed-server
-  title: embed-server — Rust embedder sidecar
+  # Component identity follows the REPOSITORY name. `c4-publish` discovers a
+  # project by the basename of its checkout directory and publishes to
+  # /c4/<basename>/, so a component name that disagrees with the directory is
+  # the same two-names-for-one-thing drift this repo was renamed to remove.
+  # The runtime service is still called `embed-server` — that name lives in
+  # the `krolik.run/dozor` annotation below and is deliberately unchanged.
+  name: ox-embed-server
+  title: ox-embed-server — Rust embedder sidecar
   description: |
     Rust ONNX runtime sidecar для embeddings. Multi-model config через EMBED_MODELS.
     Loaded models: multilingual-e5-large (1024d text), jina-code-v2 (768d code),
     gte-multilingual-rerank-base (reranker), splade-cocondenser (sparse).
     Cold warmup ~46s на 4-core ARM. Заменил Python embed-jina (retired 2026-04-17).
   annotations:
-    github.com/project-slug: anatolykoptev/embed-server
-    likec4.dev/diagrams: /c4/embed-server/
+    # The GitHub repo has been `ox-embed-server` for some time; this slug was
+    # stale before the checkout rename and only resolved because GitHub
+    # redirects a renamed repo silently — so nothing could detect it.
+    github.com/project-slug: anatolykoptev/ox-embed-server
+    likec4.dev/diagrams: /c4/ox-embed-server/
+    # Runtime service name — NOT the repo name. Unchanged.
     krolik.run/dozor: embed-server
     krolik.run/port: "8082"
   links:
-    - url: https://m.krolik.run/c4/embed-server/
+    - url: https://m.krolik.run/c4/ox-embed-server/
       title: Architecture diagrams
-    - url: https://github.com/anatolykoptev/embed-server
+    - url: https://github.com/anatolykoptev/ox-embed-server
       title: GitHub repo
   tags:
     - rust
