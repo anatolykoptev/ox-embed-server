@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.8.2](https://github.com/anatolykoptev/ox-embed-server/compare/embed-server-v0.8.1...embed-server-v0.8.2) (2026-08-05)
+
+
+### Bug Fixes
+
+* **batcher:** make the length-ratio gate's "off" distinguishable from "never fired" ([#158](https://github.com/anatolykoptev/ox-embed-server/issues/158)) ([c203524](https://github.com/anatolykoptev/ox-embed-server/commit/c203524b9280a8c6ca5da657d744a2b29486af98))
+* **ci:** run the bin targets under cargo-mutants — `--lib` saw 144 of 518 tests ([#160](https://github.com/anatolykoptev/ox-embed-server/issues/160)) ([9edb8c4](https://github.com/anatolykoptev/ox-embed-server/commit/9edb8c4e20dd0502761726e340c81ea65d77eacc))
+* **ci:** the mutants self-check demanded outcomes.json, which 0 mutants never writes ([#165](https://github.com/anatolykoptev/ox-embed-server/issues/165)) ([45f493b](https://github.com/anatolykoptev/ox-embed-server/commit/45f493b89add50a2ac8efacd565c7258230fb7a3))
+* **metrics,api:** separate the 503 worker-respawn from 500 in the status label and error_type ([#164](https://github.com/anatolykoptev/ox-embed-server/issues/164)) ([75a198b](https://github.com/anatolykoptev/ox-embed-server/commit/75a198bba6191e200dcb0dde1482ae7bdf87e380))
+* **pool:** take one lock in EvictableGuard::drop, one arm per outcome ([#157](https://github.com/anatolykoptev/ox-embed-server/issues/157)) ([3b26e60](https://github.com/anatolykoptev/ox-embed-server/commit/3b26e6068551a564e433aa583441542adef6ec21))
+
+
+### Performance Improvements
+
+* **model:** split a request into length-homogeneous sub-batches ([#166](https://github.com/anatolykoptev/ox-embed-server/issues/166)) ([8509056](https://github.com/anatolykoptev/ox-embed-server/commit/8509056f3f9abf3b5d0eef0886e8696ccff47a50))
+
 ## [0.8.1](https://github.com/anatolykoptev/ox-embed-server/compare/embed-server-v0.8.0...embed-server-v0.8.1) (2026-08-05)
 
 
