@@ -1767,6 +1767,69 @@ mod subbatch_metric_tests {
 }
 
 #[cfg(test)]
+mod hard_clip_metric_tests {
+    use super::{record_tokenize_hard_clip, test_prometheus_handle, touch_tokenize_hard_clip};
+
+    fn series(rendered: &str, needle: &str) -> Option<f64> {
+        rendered
+            .lines()
+            .find_map(|l| l.strip_prefix(needle))
+            .and_then(|rest| rest.trim().parse::<f64>().ok())
+    }
+
+    /// The zero must be REAL, not an absent series.
+    ///
+    /// This counter's entire job is to be believed when it reads zero — it is
+    /// the only signal that a model loaded with tokenizer truncation off and
+    /// is therefore dropping `[SEP]` (#169). An absent series and a genuine
+    /// zero look identical on a dashboard, which is the `default_unreachable`
+    /// class #167 is about, so the pre-touch is asserted rather than assumed.
+    #[test]
+    fn hard_clip_counter_publishes_a_real_zero_then_counts() {
+        let handle = test_prometheus_handle();
+        let needle = "embed_tokenize_hard_clip_total{model=\"t_hard_clip\"}";
+
+        touch_tokenize_hard_clip("t_hard_clip");
+        assert_eq!(
+            series(&handle.render(), needle),
+            Some(0.0),
+            "pre-touch must publish the series at 0, not leave it absent"
+        );
+
+        record_tokenize_hard_clip("t_hard_clip");
+        record_tokenize_hard_clip("t_hard_clip");
+        assert_eq!(
+            series(&handle.render(), needle),
+            Some(2.0),
+            "each clipped sequence must count once — a mutant recording a \
+             constant would survive an existence-only check"
+        );
+    }
+
+    /// Labels must separate models: a clip on one model must not read as a
+    /// clip on another, or the counter cannot say WHICH model is misloaded —
+    /// which is the only actionable thing it carries.
+    #[test]
+    fn hard_clip_counter_is_per_model() {
+        let handle = test_prometheus_handle();
+        touch_tokenize_hard_clip("t_clip_a");
+        touch_tokenize_hard_clip("t_clip_b");
+        record_tokenize_hard_clip("t_clip_a");
+
+        let r = handle.render();
+        assert_eq!(
+            series(&r, "embed_tokenize_hard_clip_total{model=\"t_clip_a\"}"),
+            Some(1.0)
+        );
+        assert_eq!(
+            series(&r, "embed_tokenize_hard_clip_total{model=\"t_clip_b\"}"),
+            Some(0.0),
+            "an untouched model must stay at its published zero"
+        );
+    }
+}
+
+#[cfg(test)]
 mod build_info_tests {
     use super::{PKG_VERSION, stamp_build_info, test_prometheus_handle};
 
