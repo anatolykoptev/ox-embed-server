@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.8.3](https://github.com/anatolykoptev/ox-embed-server/compare/embed-server-v0.8.2...embed-server-v0.8.3) (2026-08-05)
+
+
+### Bug Fixes
+
+* **model,worker:** tokenizer padding corrupts embeddings; blind clip drops [SEP] ([#170](https://github.com/anatolykoptev/ox-embed-server/issues/170)) ([825470f](https://github.com/anatolykoptev/ox-embed-server/commit/825470f20478eed2086700788cd8083dfd3faf9a))
+* **worker:** honour EMBED_IDLE_EVICT_SECS instead of hardcoding it off ([#168](https://github.com/anatolykoptev/ox-embed-server/issues/168)) ([a80fbf3](https://github.com/anatolykoptev/ox-embed-server/commit/a80fbf3716f4476638c8751065c450d7b8f5310a))
+
 ## [0.8.2](https://github.com/anatolykoptev/ox-embed-server/compare/embed-server-v0.8.1...embed-server-v0.8.2) (2026-08-05)
 
 
