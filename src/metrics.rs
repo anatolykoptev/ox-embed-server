@@ -481,6 +481,36 @@ pub fn record_length_ratio_carry(model: &str) {
     .increment(1);
 }
 
+/// Publish whether the length-ratio carry gate is ENABLED, at batcher
+/// construction.
+///
+/// `BATCH_LENGTH_RATIO_THRESHOLD` defaults to `0.0` (disabled) and no
+/// deployment currently sets it, so `embed_batch_seq_capped_total{
+/// reason="length_ratio"}` reads 0 because the branch is **unreachable**,
+/// not because the condition never occurred. A zero that cannot be
+/// distinguished from "feature off" is how a shipped-but-disabled feature
+/// stays unnoticed — failure class `default_unreachable`.
+///
+/// Read together the two are unambiguous:
+///
+/// | gauge | counter | meaning                         |
+/// |-------|---------|---------------------------------|
+/// | 0     | 0       | gate is off — zero explains itself |
+/// | 1     | 0       | gate is on and genuinely never fired |
+/// | 1     | > 0     | gate is on and splitting batches |
+///
+/// Emitted from the same process that resolves the config and runs the
+/// gate, so it is exactly as reachable in `/metrics` as the counter it
+/// disambiguates: if one is visible, so is the other. (Whether either
+/// crosses the worker boundary in multi-process mode is #136, not this.)
+pub fn length_ratio_gate_enabled(model: &str, enabled: bool) {
+    metrics::gauge!(
+        "embed_length_ratio_gate_enabled",
+        "model" => model.to_string()
+    )
+    .set(if enabled { 1.0 } else { 0.0 });
+}
+
 /// Increment the solo-seq-overflow counter — fired when the FIRST item
 /// of an EMPTY batch exceeds `max_batch_seq`.
 ///
