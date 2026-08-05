@@ -68,7 +68,28 @@ examine_globs = [
 # 30-minute cancel. nextest terminates it and reports the mutant as caught.
 test_tool = "nextest"
 
-# `--lib` plus the two integration binaries that are NOT model-gated.
+# `--lib --bins` plus the two integration binaries that are NOT model-gated.
+#
+# `--bins` is load-bearing and its absence made most of this gate vacuous.
+# `src/main.rs` declares `mod api_health; mod batcher; mod cache; mod cache_flow;
+# mod token_cache; mod types;` — six modules that `src/lib.rs` does NOT expose.
+# They compile into the `bin/embed-server` target only, so their `#[cfg(test)]`
+# tests live there too, and `--lib` never ran a single one of them:
+#
+#     embed-server                     144 tests   <- what --lib ran
+#     embed-server::bin/embed-server   366 tests   <- what it did not
+#     embed-server::bin/embed-worker     8 tests   <- nor this
+#
+# Six of the sixteen files in `examine_globs` are in that second bucket, so
+# every mutant in them was reported MISSED for a purely mechanical reason —
+# the tests that kill them were never invoked. It also hid coverage in the
+# other direction: a mutant in `metrics.rs` (which IS in the lib) survived
+# because the test asserting it lives in `batcher.rs` (which is not).
+#
+# Caught by PR #158, where two new tests that assert a gauge's value directly
+# both failed to kill the mutant that deletes the gauge. Any "MISSED" number
+# measured before this line was added is an artifact and must be re-measured,
+# not compared against.
 #
 # Most of tests/*.rs early-returns without EMBED_MODELS/RERANKER_MODELS/
 # SPLADE_MODELS, so those can never kill a mutant here and linking eleven extra
@@ -90,6 +111,7 @@ test_tool = "nextest"
 # tests/rerank_smoke.rs gates on EMBED_SERVER_URL — neither belongs here.)
 additional_cargo_test_args = [
     "--lib",
+    "--bins",
     "--test",
     "worker_max_waiters",
     "--test",
