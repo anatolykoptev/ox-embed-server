@@ -1886,3 +1886,32 @@ mod build_info_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod worker_heartbeat_touch_tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn worker_heartbeat_touch_preloads_labeled_series() {
+        use crate::metrics::{test_prometheus_handle, worker_heartbeat_touch};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let model = format!(
+            "heartbeat-touch-{}",
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+
+        let handle = test_prometheus_handle();
+        worker_heartbeat_touch(&model);
+        let rendered = handle.render();
+
+        for result in ["ok", "timeout", "error", "kill", "suppressed"] {
+            let expected =
+                format!("embed_worker_heartbeat_total{{model=\"{model}\",result=\"{result}\"}} 0");
+            assert!(
+                rendered.contains(&expected),
+                "worker_heartbeat_touch must pre-touch {expected}; got:\n{rendered}"
+            );
+        }
+    }
+}

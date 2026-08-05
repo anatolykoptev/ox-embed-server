@@ -929,8 +929,12 @@ impl WorkerSupervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::protocol::WorkerResponse;
+    use crate::supervisor::pool::WorkerPool;
     use crate::supervisor::util::resolve_duration_secs_env;
     use serial_test::serial;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, AtomicU64};
     use std::time::Duration;
 
     fn resolve_socket_wait() -> Duration {
@@ -1254,6 +1258,21 @@ mod tests {
         kind: WorkerKind,
         pid: u32,
     ) -> Arc<WorkerSupervisor> {
+        supervisor_with(mock, kind, pid, Duration::from_millis(50), 0).await
+    }
+
+    /// Build a supervisor with a pre-connected mock client and explicit
+    /// heartbeat/freshness state. Used by the #149 boundary tests because the
+    /// default `supervisor_for` interval is too small to deterministically
+    /// exercise the `last > 0` and `now.saturating_sub(last) < interval`
+    /// guards.
+    async fn supervisor_with(
+        mock: &MockWorker,
+        kind: WorkerKind,
+        pid: u32,
+        heartbeat_interval: Duration,
+        last_success_ms: u64,
+    ) -> Arc<WorkerSupervisor> {
         use crate::ipc::client::WorkerClient;
         let client = Arc::new(
             WorkerClient::connect(mock.socket_path.clone(), 1)
@@ -1271,13 +1290,13 @@ mod tests {
                 env_extra: vec![],
             },
             client_slot: Arc::new(RwLock::new(Some(client))),
-            restart_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            restart_count: Arc::new(AtomicU64::new(0)),
             socket_wait: Duration::from_secs(60),
-            current_pid: Arc::new(std::sync::atomic::AtomicU32::new(pid)),
-            heartbeat_interval: Duration::from_millis(50),
+            current_pid: Arc::new(AtomicU32::new(pid)),
+            heartbeat_interval,
             heartbeat_max_fails: 1,
-            heartbeat_probe_timeout: Duration::from_millis(150),
-            last_success_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            heartbeat_probe_timeout: Duration::from_millis(10),
+            last_success_ms: Arc::new(AtomicU64::new(last_success_ms)),
         })
     }
 
@@ -1709,5 +1728,284 @@ mod tests {
             !status.success(),
             "the wedged worker must have been SIGKILLed"
         );
+    }
+
+    /// `record_success` must stamp the real wall clock, not a constant.
+    ///
+    /// The `now_unix_millis -> 1` mutant turns `record_success` into a constant
+    /// stamper; this test bounds the result with `SystemTime::now()` and fails
+    /// if the timestamp is not in that window.
+    #[test]
+    fn record_success_stamps_real_unix_millis() {
+        let sup = Arc::new(WorkerSupervisor {
+            spec: SpawnSpec {
+                model: "test-record-success".to_string(),
+                kind: WorkerKind::Embed,
+                worker_bin: std::path::PathBuf::from("/bin/true"),
+                socket_dir: std::env::temp_dir(),
+                pool_size: 1,
+                intra_threads: 1,
+                env_extra: vec![],
+            },
+            client_slot: Arc::new(RwLock::new(None)),
+            restart_count: Arc::new(AtomicU64::new(0)),
+            socket_wait: Duration::from_secs(60),
+            current_pid: Arc::new(AtomicU32::new(0)),
+            heartbeat_interval: Duration::ZERO,
+            heartbeat_max_fails: 3,
+            heartbeat_probe_timeout: Duration::from_millis(100),
+            last_success_ms: Arc::new(AtomicU64::new(0)),
+        });
+
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .expect("system clock after UNIX_EPOCH");
+        sup.record_success();
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .expect("system clock after UNIX_EPOCH");
+
+        let last = sup.last_success_ms();
+        assert!(
+            last >= before && last <= after,
+            "record_success must stamp the real wall-clock time; got {last}, expected [{before}, {after}]"
+        );
+    }
+
+    // ── #149 dispatch-path stamp polarity ───────────────────────────────────
+    //
+    // `WorkerPool::dispatch_*` stamps `last_success_ms` only when the worker
+    // returns a *non-Err* `WorkerResponse`. The gate deletes the `!` in
+    // `if !matches!(result, WorkerResponse::Err { .. })`, inverting the
+    // condition. Each path needs both arms: success advances the stamp, an
+    // error reply leaves it unchanged.
+
+    async fn make_pool(
+        kind: WorkerKind,
+        reply: MockReply,
+    ) -> (WorkerPool, Arc<WorkerSupervisor>, MockWorker) {
+        let tag = format!(
+            "{}-{}",
+            kind.as_str(),
+            match reply {
+                MockReply::Ok => "ok",
+                MockReply::WorkerError => "err",
+                MockReply::Hang => "hang",
+            }
+        );
+        let mock = MockWorker::start(&tag, reply).await;
+        let sup = supervisor_for(&mock, kind, 0).await;
+        let pool = WorkerPool::new();
+        pool.add(sup.clone()).await;
+        (pool, sup, mock)
+    }
+
+    #[tokio::test]
+    async fn dispatch_embed_stamps_success_and_not_worker_error() {
+        let (pool_ok, sup_ok, _mock_ok) = make_pool(WorkerKind::Embed, MockReply::Ok).await;
+        let before = sup_ok.last_success_ms();
+        let res = pool_ok
+            .dispatch_embed("test-heartbeat", vec!["text".to_string()], 8)
+            .await;
+        assert!(
+            matches!(res, Ok(WorkerResponse::Embed(_))),
+            "embed dispatch must return the ok variant"
+        );
+        assert!(
+            sup_ok.last_success_ms() > before,
+            "a successful embed response must stamp last_success_ms"
+        );
+
+        let (pool_err, sup_err, _mock_err) =
+            make_pool(WorkerKind::Embed, MockReply::WorkerError).await;
+        let res = pool_err
+            .dispatch_embed("test-heartbeat", vec!["text".to_string()], 8)
+            .await;
+        assert!(
+            matches!(res, Ok(WorkerResponse::Err { .. })),
+            "embed dispatch must surface a worker error reply"
+        );
+        assert_eq!(
+            sup_err.last_success_ms(),
+            0,
+            "a worker error response must NOT stamp last_success_ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_rerank_stamps_success_and_not_worker_error() {
+        let (pool_ok, sup_ok, _mock_ok) = make_pool(WorkerKind::Rerank, MockReply::Ok).await;
+        let before = sup_ok.last_success_ms();
+        let res = pool_ok
+            .dispatch_rerank(
+                "test-heartbeat",
+                "query".to_string(),
+                vec!["doc".to_string()],
+                8,
+            )
+            .await;
+        assert!(
+            matches!(res, Ok(WorkerResponse::Rerank(_))),
+            "rerank dispatch must return the ok variant"
+        );
+        assert!(
+            sup_ok.last_success_ms() > before,
+            "a successful rerank response must stamp last_success_ms"
+        );
+
+        let (pool_err, sup_err, _mock_err) =
+            make_pool(WorkerKind::Rerank, MockReply::WorkerError).await;
+        let res = pool_err
+            .dispatch_rerank(
+                "test-heartbeat",
+                "query".to_string(),
+                vec!["doc".to_string()],
+                8,
+            )
+            .await;
+        assert!(
+            matches!(res, Ok(WorkerResponse::Err { .. })),
+            "rerank dispatch must surface a worker error reply"
+        );
+        assert_eq!(
+            sup_err.last_success_ms(),
+            0,
+            "a worker error response must NOT stamp last_success_ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_splade_stamps_success_and_not_worker_error() {
+        let (pool_ok, sup_ok, _mock_ok) = make_pool(WorkerKind::Splade, MockReply::Ok).await;
+        let before = sup_ok.last_success_ms();
+        let res = pool_ok
+            .dispatch_splade("test-heartbeat", vec!["text".to_string()], 8, 64, 0.01)
+            .await;
+        assert!(
+            matches!(res, Ok(WorkerResponse::Splade(_))),
+            "splade dispatch must return the ok variant"
+        );
+        assert!(
+            sup_ok.last_success_ms() > before,
+            "a successful splade response must stamp last_success_ms"
+        );
+
+        let (pool_err, sup_err, _mock_err) =
+            make_pool(WorkerKind::Splade, MockReply::WorkerError).await;
+        let res = pool_err
+            .dispatch_splade("test-heartbeat", vec!["text".to_string()], 8, 64, 0.01)
+            .await;
+        assert!(
+            matches!(res, Ok(WorkerResponse::Err { .. })),
+            "splade dispatch must surface a worker error reply"
+        );
+        assert_eq!(
+            sup_err.last_success_ms(),
+            0,
+            "a worker error response must NOT stamp last_success_ms"
+        );
+    }
+
+    // ── #149 heartbeat freshness guard boundaries ────────────────────────────
+    //
+    // Line 786 is `if last > 0 && now.saturating_sub(last) < interval`.
+    // The three operator mutants are each killed at a boundary where only that
+    // operator differs between the correct and mutant behavior.
+    //
+    // Boundary values are chosen deliberately so the test fails for the mutant
+    // and passes for the original, and the comment explains which side of each
+    // comparison is correct.
+
+    /// A worker that has NEVER stamped (`last_success_ms == 0`) must NOT have
+    /// its probe failure suppressed — even if the heartbeat interval is large
+    /// enough that `now - 0 < interval` is true.
+    ///
+    /// This kills two mutants on line 786:
+    ///   * `>` → `>=`: `0 >= 0` is true, so the right-hand side would suppress.
+    ///   * `&&` → `||`: the right-hand side `now - 0 < interval` is true, so
+    ///     the `||` would suppress.
+    ///
+    /// The correct side: `last > 0` is the strict guard for "has stamped"; an
+    /// un-stamped worker is treated as never fresh, and `&&` requires BOTH the
+    /// stamp-exists and the within-interval conditions to suppress.
+    #[tokio::test]
+    async fn heartbeat_tick_never_suppresses_when_last_success_is_zero() {
+        let mock = MockWorker::start("zero-guard", MockReply::Hang).await;
+        let mut child = std::process::Command::new("sleep")
+            .arg("999")
+            .spawn()
+            .expect("spawn sleep");
+
+        // An interval far larger than any possible wall clock in ms guarantees
+        // `now.saturating_sub(0) < interval` is true, isolating the `>` and `&&`
+        // mutants without depending on the exact value of `now`.
+        let huge = Duration::from_millis(u64::MAX / 2);
+        let sup = supervisor_with(&mock, WorkerKind::Embed, child.id(), huge, 0).await;
+
+        let mut fails = 0;
+        let outcome = sup.heartbeat_tick(&mut fails).await;
+
+        assert_eq!(
+            outcome,
+            HeartbeatOutcome::Killed,
+            "an un-stamped worker with a failing probe must be killed, never suppressed"
+        );
+        let status = child.wait().expect("wait child");
+        assert!(
+            !status.success(),
+            "the un-stamped worker must have been SIGKILLed"
+        );
+        assert_eq!(fails, 0, "fail counter resets after kill");
+    }
+
+    /// The freshness comparison is STRICTLY LESS THAN.
+    ///
+    /// We cannot force `now - last == positive_interval` against a real wall
+    /// clock without asserting on the clock itself, but we CAN force
+    /// `now.saturating_sub(last) == 0` by setting `last` to a value greater than
+    /// any possible `now`, and set `interval` to 0. At the `0 == 0` boundary:
+    ///   * original `<` is false → NOT fresh → Killed.
+    ///   * `<` → `<=` makes it true → Suppressed.
+    ///   * `&&` → `||` with `last > 0` also makes it true → Suppressed.
+    ///
+    /// The correct side: `now.saturating_sub(last) < interval` must be strictly
+    /// less. A success exactly as old as the interval is NOT fresh enough to
+    /// suppress a probe failure.
+    #[tokio::test]
+    async fn heartbeat_tick_freshness_boundary_is_strictly_less_than() {
+        let mock = MockWorker::start("strict-boundary", MockReply::Hang).await;
+        let mut child = std::process::Command::new("sleep")
+            .arg("999")
+            .spawn()
+            .expect("spawn sleep");
+
+        // `last` in the future forces `now.saturating_sub(last)` to 0 via
+        // saturating subtraction. `interval` is 0, so the boundary is `0 == 0`.
+        // The test isolates the `<` vs `<=` and `&&` vs `||` operators.
+        let sup = supervisor_with(
+            &mock,
+            WorkerKind::Embed,
+            child.id(),
+            Duration::ZERO,
+            u64::MAX,
+        )
+        .await;
+
+        let mut fails = 0;
+        let outcome = sup.heartbeat_tick(&mut fails).await;
+
+        assert_eq!(
+            outcome,
+            HeartbeatOutcome::Killed,
+            "freshness at the exact interval boundary must NOT suppress; the comparison must be strict"
+        );
+        let status = child.wait().expect("wait child");
+        assert!(
+            !status.success(),
+            "worker must have been SIGKILLed at the boundary"
+        );
+        assert_eq!(fails, 0, "fail counter resets after kill");
     }
 }
