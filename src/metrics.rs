@@ -430,6 +430,34 @@ pub fn record_padding_waste(model: &str, padded: usize, raw: usize) {
     .record(ratio);
 }
 
+/// Record how many length-homogeneous sub-batches one embed request was
+/// split into (`EmbedModel::embed_tokens`).
+///
+/// `1` means no split happened — either the knob is off, or every text in the
+/// request already fell inside one length band. Paired with
+/// `embed_batch_padding_waste_ratio`, this separates "the split did not help"
+/// from "the split never ran", which a waste ratio alone cannot do.
+pub fn record_subbatch_groups(model: &str, groups: usize) {
+    metrics::histogram!(
+        "embed_subbatch_groups",
+        "model" => model.to_string()
+    )
+    .record(groups as f64);
+}
+
+/// Publish the configured sub-batch length ratio so operators can read the
+/// effective value off `/metrics` instead of reconstructing it from the two
+/// env vars and a default.
+///
+/// A value `<= 1.0` means splitting is disabled for this model.
+pub fn set_subbatch_ratio(model: &str, ratio: f32) {
+    metrics::gauge!(
+        "embed_subbatch_ratio",
+        "model" => model.to_string()
+    )
+    .set(ratio as f64);
+}
+
 /// Record one `malloc_trim(0)` invocation by the Linux-only background
 /// task in `main.rs`.
 ///
