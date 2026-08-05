@@ -169,17 +169,19 @@ jobs:
             echo "mutation score: $(( caught * 100 / total ))%"
           fi
 
-          raw=$(tr -d '[:space:]' < .cargo/mutants-baseline.txt)
-          if [ "$raw" = "unset" ]; then
-            # Bootstrap: the very first full run is what MEASURES the baseline —
-            # there is no honest number to commit before it has run once. This
-            # branch is deliberately loud and self-terminating: it prints the
-            # number to commit, and once committed it can never be reached again.
-            echo "::warning::Mutation baseline is still 'unset' — the ratchet is NOT enforcing. Commit ${missed} to .cargo/mutants-baseline.txt to arm it."
-            exit 0
-          fi
-
-          baseline=$raw
+          # The bootstrap branch that accepted the literal string 'unset' is
+          # gone: it existed only so the FIRST sweep could measure a number
+          # there was no honest way to know in advance, and that sweep has run
+          # (882 mutants, 278 caught, 604 missed). Leaving a never-enforce path
+          # in a gate is how a gate stops being one, so a non-numeric baseline
+          # is now a hard error rather than a silent pass.
+          baseline=$(tr -d '[:space:]' < .cargo/mutants-baseline.txt)
+          case "$baseline" in
+            ''|*[!0-9]*)
+              echo "::error::.cargo/mutants-baseline.txt is '${baseline}', not a number. The ratchet cannot evaluate — fix the file rather than letting the gate pass."
+              exit 1
+              ;;
+          esac
           if [ "$missed" -gt "$baseline" ]; then
             echo "::error::${missed} missed mutants exceeds the baseline of ${baseline}. Code changed behaviour that no test asserts on — add the missing assertions, or justify and raise .cargo/mutants-baseline.txt in the same PR."
             exit 1
