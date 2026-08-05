@@ -82,7 +82,9 @@ Scope, test tool and timeouts live in **`.cargo/mutants.toml`** — one file, re
 
 `.cargo/mutants-baseline.txt` is the ratchet: the weekly sweep fails if the missed count rises above it, and tells you to lower it when it falls. Raising it requires a justification in the same PR. A non-numeric value is a hard error, not a pass.
 
-**Current baseline: 604 missed of 882 mutants — a 31% mutation score.** That is the honest starting point, not a target: roughly two thirds of the in-scope code can be broken without any test noticing. The per-PR `--in-diff` gate is what stops that fraction growing; bringing it down is ordinary work, one module at a time, and every PR that lowers the number should lower the file with it.
+**The recorded baseline is 604 missed of 882 — and that number is an ARTIFACT, not a measurement of this codebase.** It was measured while `additional_cargo_test_args` said `--lib` without `--bins`. `src/main.rs` declares six modules that `src/lib.rs` does not expose (`api_health`, `batcher`, `cache`, `cache_flow`, `token_cache`, `types`), so their tests compile into the `bin/embed-server` target — 366 tests that the gate never invoked, against the 144 it did. Six of the sixteen files in `examine_globs` are in that bucket, and their mutants were all reported MISSED for a mechanical reason.
+
+`--bins` was added once the effect was visible: two tests that assert a gauge's value failed to kill the mutant that deletes that gauge. Until the next weekly sweep re-measures, **604 is a valid upper bound but a loose one** — adding tests can only lower the true count, so the ratchet cannot fire falsely, but it will not catch a small regression either. Lower the file to whatever the next sweep reports; do not compare against 604 as if it described the code.
 
 Integration tests with real models require: `EMBED_MODELS=...` + `RERANKER_MODELS=...` + `SPLADE_MODELS=...` + `ORT_DYLIB_PATH=...` env. Run `--test-threads=1` (parallel OOMs on 4-core 24 GB).
 
