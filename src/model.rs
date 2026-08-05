@@ -344,6 +344,7 @@ impl EmbedModel {
 
         let subbatch_ratio = resolve_subbatch_ratio(&def.name);
         crate::metrics::set_subbatch_ratio(&def.name, subbatch_ratio);
+        crate::metrics::touch_tokenize_hard_clip(&def.name);
 
         Ok(Self {
             name: def.name.clone(),
@@ -394,6 +395,15 @@ impl EmbedModel {
             .map(|e| {
                 let ids = e.get_ids();
                 let len = ids.len().min(self.max_len);
+                if len < ids.len() {
+                    // Reaching here means tokenizer truncation was OFF and this
+                    // blind clip is the only length control — which silently
+                    // drops the trailing [SEP]. With truncation configured the
+                    // tokenizer has already bounded the sequence and this branch
+                    // is unreachable, so a non-zero counter is a regression
+                    // signal, not a workload signal.
+                    crate::metrics::record_tokenize_hard_clip(&self.name);
+                }
                 ids[..len].to_vec()
             })
             .collect())
@@ -1963,7 +1973,20 @@ impl StandaloneEmbedder {
         let inner = EmbedModel::load(
             def,
             intra_threads,
-            false, // auto_truncate — worker does not silently truncate
+            // Was a hardcoded `false`, commented "worker does not silently
+            // truncate". It does: `tokenize` clips with `ids[..max_len]`, and
+            // with tokenizer truncation disabled that clip drops the trailing
+            // [SEP] on every overlong input — the exact defect ROADMAP Phase A
+            // records as fixed by turning auto_truncate ON. `configure_truncation`
+            // also CLEARS the on-disk truncation config (code-rank ships one),
+            // so passing false actively disables working truncation and
+            // substitutes a blind clip.
+            //
+            // `cfg` was already in scope, so — as with `idle_evict_secs` above —
+            // the configured value was parsed, validated and discarded.
+            // AUTO_TRUNCATE defaults to true, so this restores the monolith's
+            // behaviour, which is what the supervisor path has always used.
+            cfg.auto_truncate,
             pool_size,
             0, // idle_evict_secs — disabled; worker is short-lived
         )?;

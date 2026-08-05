@@ -443,6 +443,37 @@ pub fn record_padding_waste(model: &str, padded: usize, raw: usize) {
     .record(ratio);
 }
 
+/// Count sequences cut by `EmbedModel::tokenize`'s defensive clip.
+///
+/// Must stay at zero. The clip only bites when tokenizer truncation is
+/// disabled, and then it drops the trailing `[SEP]` — the tokenizer would
+/// have kept it. Any non-zero value means a model is loading with truncation
+/// off and its embeddings are subtly wrong, which nothing else surfaces.
+///
+/// Pre-touched to 0 by [`touch_tokenize_hard_clip`] at model load, so "no
+/// clipping" is distinguishable from "the counter was never wired" — the
+/// `default_unreachable` ambiguity #167 is about.
+pub fn record_tokenize_hard_clip(model: &str) {
+    metrics::counter!(
+        "embed_tokenize_hard_clip_total",
+        "model" => model.to_string()
+    )
+    .increment(1);
+}
+
+/// Publish `embed_tokenize_hard_clip_total{model} = 0` at model load.
+///
+/// Without this the healthy state is an ABSENT series, which reads exactly
+/// like a counter nobody wired — and this counter's whole job is to be
+/// believed when it says zero.
+pub fn touch_tokenize_hard_clip(model: &str) {
+    metrics::counter!(
+        "embed_tokenize_hard_clip_total",
+        "model" => model.to_string()
+    )
+    .absolute(0);
+}
+
 /// Record how many length-homogeneous sub-batches one embed request was
 /// split into (`EmbedModel::embed_tokens`).
 ///
