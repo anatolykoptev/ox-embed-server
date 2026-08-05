@@ -922,6 +922,7 @@ impl WorkerSupervisor {
             heartbeat_interval: Duration::ZERO,
             heartbeat_max_fails: 3,
             heartbeat_probe_timeout: Duration::from_millis(100),
+            last_success_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 }
