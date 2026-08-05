@@ -82,6 +82,17 @@ tempfile = "3"
 # std::env::set_var. std::env::set_var is unsafe since Rust 1.82 (glibc
 # setenv is non-reentrant); concurrent calls from parallel test threads = UB.
 serial_test = "3"
+# syn — used by the config-reachability detector test (`config_reachability`
+# module in src/config.rs). Parses the crate's own source to derive the
+# Config field inventory and verify every field is read on the worker path.
+# Already a transitive dep (2.0.x in Cargo.lock); pinned here with the
+# `full`/`visit`/`parsing`/`extra-traits` features the AST walk needs.
+syn = { version = "2", features = ["full", "visit", "parsing", "extra-traits"] }
+# proc-macro2 — token-stream scan of macro bodies (`format!`, `tracing::info!`)
+# for the reachability detector. syn's AST visitor does not descend into macro
+# token trees, so reads like `cfg.port` inside `format!(...)` are invisible to
+# the AST walk; this scans them at the token level. Already a transitive dep.
+proc-macro2 = "1"
 
 [lib]
 name = "embed_server"
