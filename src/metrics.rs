@@ -443,6 +443,37 @@ pub fn record_padding_waste(model: &str, padded: usize, raw: usize) {
     .record(ratio);
 }
 
+/// Count sequences cut by `EmbedModel::tokenize`'s defensive clip.
+///
+/// Must stay at zero. The clip only bites when tokenizer truncation is
+/// disabled, and then it drops the trailing `[SEP]` — the tokenizer would
+/// have kept it. Any non-zero value means a model is loading with truncation
+/// off and its embeddings are subtly wrong, which nothing else surfaces.
+///
+/// Pre-touched to 0 by [`touch_tokenize_hard_clip`] at model load, so "no
+/// clipping" is distinguishable from "the counter was never wired" — the
+/// `default_unreachable` ambiguity #167 is about.
+pub fn record_tokenize_hard_clip(model: &str) {
+    metrics::counter!(
+        "embed_tokenize_hard_clip_total",
+        "model" => model.to_string()
+    )
+    .increment(1);
+}
+
+/// Publish `embed_tokenize_hard_clip_total{model} = 0` at model load.
+///
+/// Without this the healthy state is an ABSENT series, which reads exactly
+/// like a counter nobody wired — and this counter's whole job is to be
+/// believed when it says zero.
+pub fn touch_tokenize_hard_clip(model: &str) {
+    metrics::counter!(
+        "embed_tokenize_hard_clip_total",
+        "model" => model.to_string()
+    )
+    .absolute(0);
+}
+
 /// Record how many length-homogeneous sub-batches one embed request was
 /// split into (`EmbedModel::embed_tokens`).
 ///
@@ -1732,6 +1763,69 @@ mod subbatch_metric_tests {
         )
         .expect("gauge must still be present after being set to 0");
         assert_eq!(v, 0.0, "disabled must render 0, not the previous value");
+    }
+}
+
+#[cfg(test)]
+mod hard_clip_metric_tests {
+    use super::{record_tokenize_hard_clip, test_prometheus_handle, touch_tokenize_hard_clip};
+
+    fn series(rendered: &str, needle: &str) -> Option<f64> {
+        rendered
+            .lines()
+            .find_map(|l| l.strip_prefix(needle))
+            .and_then(|rest| rest.trim().parse::<f64>().ok())
+    }
+
+    /// The zero must be REAL, not an absent series.
+    ///
+    /// This counter's entire job is to be believed when it reads zero — it is
+    /// the only signal that a model loaded with tokenizer truncation off and
+    /// is therefore dropping `[SEP]` (#169). An absent series and a genuine
+    /// zero look identical on a dashboard, which is the `default_unreachable`
+    /// class #167 is about, so the pre-touch is asserted rather than assumed.
+    #[test]
+    fn hard_clip_counter_publishes_a_real_zero_then_counts() {
+        let handle = test_prometheus_handle();
+        let needle = "embed_tokenize_hard_clip_total{model=\"t_hard_clip\"}";
+
+        touch_tokenize_hard_clip("t_hard_clip");
+        assert_eq!(
+            series(&handle.render(), needle),
+            Some(0.0),
+            "pre-touch must publish the series at 0, not leave it absent"
+        );
+
+        record_tokenize_hard_clip("t_hard_clip");
+        record_tokenize_hard_clip("t_hard_clip");
+        assert_eq!(
+            series(&handle.render(), needle),
+            Some(2.0),
+            "each clipped sequence must count once — a mutant recording a \
+             constant would survive an existence-only check"
+        );
+    }
+
+    /// Labels must separate models: a clip on one model must not read as a
+    /// clip on another, or the counter cannot say WHICH model is misloaded —
+    /// which is the only actionable thing it carries.
+    #[test]
+    fn hard_clip_counter_is_per_model() {
+        let handle = test_prometheus_handle();
+        touch_tokenize_hard_clip("t_clip_a");
+        touch_tokenize_hard_clip("t_clip_b");
+        record_tokenize_hard_clip("t_clip_a");
+
+        let r = handle.render();
+        assert_eq!(
+            series(&r, "embed_tokenize_hard_clip_total{model=\"t_clip_a\"}"),
+            Some(1.0)
+        );
+        assert_eq!(
+            series(&r, "embed_tokenize_hard_clip_total{model=\"t_clip_b\"}"),
+            Some(0.0),
+            "an untouched model must stay at its published zero"
+        );
     }
 }
 

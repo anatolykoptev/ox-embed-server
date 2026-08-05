@@ -56,8 +56,37 @@ pub fn configure_truncation(
     };
     tokenizer
         .with_truncation(params)
-        .map(|_| ())
-        .map_err(|e| format!("with_truncation: {e}"))
+        .map_err(|e| format!("with_truncation: {e}"))?;
+
+    // Padding is disabled UNCONDITIONALLY, whatever the on-disk
+    // `tokenizer.json` says, because letting the tokenizer pad silently
+    // corrupts embeddings here (#169).
+    //
+    // `EmbedModel::tokenize` returns `encoding.get_ids()` and never reads
+    // `get_attention_mask()`. When the tokenizer pads, those ids already
+    // contain `[PAD]`, and `pool::build_tensors_from_ids` — which derives the
+    // attention mask from the vector's *length* — then marks every pad
+    // position as a real token. The model attends to `[PAD]` and
+    // `mean_pool_normalize` averages it into the output, so a text's vector
+    // depends on how long its batch-mates happened to be.
+    //
+    // Measured on `code-rank-embed` (`"padding": {"strategy":"BatchLongest"}`)
+    // before this change: the same text embedded beside a long document sat at
+    // cosine distance 0.47 from itself embedded alone, rising monotonically
+    // with the companion's length. `multilingual-e5-large`, whose tokenizer
+    // ships `"padding": null`, was flat over the same test — which is what
+    // isolates the cause to this one setting.
+    //
+    // Nothing is lost by disabling it: `build_tensors_from_ids` pads to
+    // `max_seq` using the per-model `pad_id` from `EMBED_MODELS` and builds
+    // the mask from the true length. e5 and jina have run this way in
+    // production for months.
+    //
+    // Unconditional rather than per-model on purpose: a future model shipping
+    // a padded `tokenizer.json` would otherwise reintroduce this in silence,
+    // and the symptom is degraded retrieval quality with no error anywhere.
+    tokenizer.with_padding(None);
+    Ok(())
 }
 
 /// Parse the `ORT_OPT_LEVEL` env var (0..=3) into an ort
@@ -315,6 +344,7 @@ impl EmbedModel {
 
         let subbatch_ratio = resolve_subbatch_ratio(&def.name);
         crate::metrics::set_subbatch_ratio(&def.name, subbatch_ratio);
+        crate::metrics::touch_tokenize_hard_clip(&def.name);
 
         Ok(Self {
             name: def.name.clone(),
@@ -365,6 +395,15 @@ impl EmbedModel {
             .map(|e| {
                 let ids = e.get_ids();
                 let len = ids.len().min(self.max_len);
+                if len < ids.len() {
+                    // Reaching here means tokenizer truncation was OFF and this
+                    // blind clip is the only length control — which silently
+                    // drops the trailing [SEP]. With truncation configured the
+                    // tokenizer has already bounded the sequence and this branch
+                    // is unreachable, so a non-zero counter is a regression
+                    // signal, not a workload signal.
+                    crate::metrics::record_tokenize_hard_clip(&self.name);
+                }
                 ids[..len].to_vec()
             })
             .collect())
@@ -1541,6 +1580,53 @@ mod truncation_tests {
         Some(Tokenizer::from_file(&p).expect("load tokenizer"))
     }
 
+    /// `configure_truncation` must clear tokenizer padding, whatever the
+    /// tokenizer arrived with (#169).
+    ///
+    /// Built in memory rather than from a model file on purpose: the
+    /// file-based helper above SKIPS when no model is present, which is
+    /// every CI run — a padding regression would ship green. This one runs
+    /// everywhere.
+    ///
+    /// Kills the mutant that deletes the `with_padding(None)` call: without
+    /// it the tokenizer keeps `BatchLongest`, `tokenize` returns ids that
+    /// already contain `[PAD]`, `build_tensors_from_ids` marks those
+    /// positions as real tokens, and a text's vector starts depending on its
+    /// batch-mates — measured at cosine 0.47 on `code-rank-embed`.
+    #[test]
+    fn configure_truncation_always_clears_padding() {
+        use tokenizers::models::wordlevel::WordLevel;
+        use tokenizers::{PaddingParams, Tokenizer};
+
+        let mut tok = Tokenizer::new(WordLevel::default());
+        tok.with_padding(Some(PaddingParams::default()));
+        assert!(
+            tok.get_padding().is_some(),
+            "precondition: the tokenizer must start WITH padding, or this \
+             test passes without proving anything"
+        );
+
+        configure_truncation(&mut tok, true, 512).expect("configure_truncation");
+        assert!(
+            tok.get_padding().is_none(),
+            "padding must be cleared — otherwise [PAD] reaches the model as \
+             a real token and corrupts the embedding (#169)"
+        );
+
+        // Also with auto_truncate=false: the padding decision is independent
+        // of the truncation decision, and a future refactor that folds them
+        // together would silently restore the bug for the worker, which is
+        // exactly where it ran (worker loads with auto_truncate=false).
+        let mut tok = Tokenizer::new(WordLevel::default());
+        tok.with_padding(Some(PaddingParams::default()));
+        configure_truncation(&mut tok, false, 512).expect("configure_truncation");
+        assert!(
+            tok.get_padding().is_none(),
+            "padding must be cleared on the auto_truncate=false path too — \
+             that is the path the worker takes"
+        );
+    }
+
     #[test]
     fn configure_truncation_enables_when_auto_true() {
         let Some(mut tok) = load_tokenizer_or_skip() else {
@@ -1887,7 +1973,20 @@ impl StandaloneEmbedder {
         let inner = EmbedModel::load(
             def,
             intra_threads,
-            false, // auto_truncate — worker does not silently truncate
+            // Was a hardcoded `false`, commented "worker does not silently
+            // truncate". It does: `tokenize` clips with `ids[..max_len]`, and
+            // with tokenizer truncation disabled that clip drops the trailing
+            // [SEP] on every overlong input — the exact defect ROADMAP Phase A
+            // records as fixed by turning auto_truncate ON. `configure_truncation`
+            // also CLEARS the on-disk truncation config (code-rank ships one),
+            // so passing false actively disables working truncation and
+            // substitutes a blind clip.
+            //
+            // `cfg` was already in scope, so — as with `idle_evict_secs` above —
+            // the configured value was parsed, validated and discarded.
+            // AUTO_TRUNCATE defaults to true, so this restores the monolith's
+            // behaviour, which is what the supervisor path has always used.
+            cfg.auto_truncate,
             pool_size,
             0, // idle_evict_secs — disabled; worker is short-lived
         )?;
