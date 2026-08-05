@@ -80,9 +80,9 @@ Local gates:
 
 Scope, test tool and timeouts live in **`.cargo/mutants.toml`** — one file, read by both lanes, so they cannot drift. Scope is deliberately partial: model-free logic with real unit tests. Anything needing a live ORT session (`model.rs`, `model_reranker/**`, `model_splade.rs`, `arena.rs`, `onnx_cache.rs`) is excluded because its tests early-return without `EMBED_MODELS`, so every mutant would report MISSED for an environmental reason and the gate would mean nothing. **Widening that list as coverage grows is the goal, not the exception.**
 
-`.cargo/mutants-baseline.txt` is the ratchet: the weekly sweep fails if the missed count rises above it, and tells you to lower it when it falls. Raising it requires a justification in the same PR.
+`.cargo/mutants-baseline.txt` is the ratchet: the weekly sweep fails if the missed count rises above it, and tells you to lower it when it falls. Raising it requires a justification in the same PR. A non-numeric value is a hard error, not a pass.
 
-**While that file reads `unset` the ratchet does NOT enforce** — there is no honest number to commit before a full sweep has measured one, so the first run prints the count and warns instead of comparing. That state is meant to last exactly one sweep; if you are reading this and the file still says `unset`, the gate is not armed and arming it is the job.
+**Current baseline: 604 missed of 882 mutants — a 31% mutation score.** That is the honest starting point, not a target: roughly two thirds of the in-scope code can be broken without any test noticing. The per-PR `--in-diff` gate is what stops that fraction growing; bringing it down is ordinary work, one module at a time, and every PR that lowers the number should lower the file with it.
 
 Integration tests with real models require: `EMBED_MODELS=...` + `RERANKER_MODELS=...` + `SPLADE_MODELS=...` + `ORT_DYLIB_PATH=...` env. Run `--test-threads=1` (parallel OOMs on 4-core 24 GB).
 
