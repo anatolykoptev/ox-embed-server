@@ -1,20 +1,63 @@
+# release-please — opens/updates the release PR, and on merge cuts the tag +
+# GitHub Release.
+#
+# This repo publishes to NO registry. The GitHub Release IS the artifact: dozor
+# subscribes to the release webhook and rebuilds/redeploys the container on
+# pillow. So there is deliberately no build/push job here — the fleet template
+# carries one, and adding it would duplicate the image build and race the
+# deploy dozor already owns.
+#
+# Identity: krolik-release-bot (App 4335933), NOT GITHUB_TOKEN. That difference
+# is the whole reason to bother — a GITHUB_TOKEN-opened release PR receives NO
+# CI runs, so the commit that becomes the tag and ships to production would be
+# merged having passed zero gates. Measured on this repo before the switch:
+#
+#   $ gh pr checks 161
+#   no checks reported on the 'release-please--branches--main--...' branch
+#
+# An App-opened PR gets the full preflight: gitleaks, osv-scanner, fmt, clippy,
+# cargo-deny, nextest, release build, cargo-mutants.
+#
+# A release pipeline is not exercised by its own CI — a pull-request check never
+# reaches this path. The acceptance evidence for any edit here is the NEXT REAL
+# RELEASE. Watch one.
+
 name: release-please
 
 on:
   push:
     branches: [main]
 
-permissions:
-  contents: write
-  pull-requests: write
+# Never cancel a release mid-flight: a cancelled run can leave the release PR
+# and .release-please-manifest.json disagreeing about what has been cut.
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
 
 jobs:
   release-please:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
+      # Mints a short-lived installation token; the action masks and revokes it
+      # automatically. RELEASE_BOT_APP_ID is an identifier rather than a secret,
+      # but every wired fleet repo stores it as a secret — a repo that reads
+      # `vars.` while its neighbours read `secrets.` fails by handing the action
+      # an empty app-id and reporting a credentials error, which points at the
+      # key instead of at the id.
+      - uses: actions/create-github-app-token@v2
+        id: bot-token
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+
       - uses: googleapis/release-please-action@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ steps.bot-token.outputs.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
           target-branch: main
