@@ -258,6 +258,11 @@ impl DynamicBatcher {
         // Pre-touch the carry-lost counter to 0 so it appears in /metrics
         // from startup (absent counter = "not wired" false-negative).
         crate::metrics::carry_lost_touch(&arc_name);
+        // Publish whether the length-ratio gate is on. Its counter reads 0
+        // in every current deployment because the branch is unreachable,
+        // not because it never fired — this gauge is what tells the two
+        // apart. See `metrics::length_ratio_gate_enabled`.
+        crate::metrics::length_ratio_gate_enabled(&arc_name, length_ratio_threshold > 0.0);
         let carry_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let handle = tokio::spawn(run_worker(
             rx,
@@ -1435,8 +1440,21 @@ mod tests {
     // #128-B: length-ratio carry gate. Env-gated via
     // BATCH_LENGTH_RATIO_THRESHOLD, default 0.0 = disabled. When > 0.0,
     // an item whose max_seq_len exceeds accum.max_len * threshold is
-    // carried to the next batch. These tests exercise the gate logic
-    // directly (no env var needed — the threshold is on BatcherConfig).
+    // carried to the next batch.
+    //
+    // READ THIS BEFORE TRUSTING THE THREE TESTS BELOW (#153): each one
+    // re-implements the gate condition *inside the test body* and asserts
+    // on its own copy. None of them calls `run_worker`, so none of them
+    // covers the production branch in the coalesce loop — mutate that
+    // branch and all three stay green. They are arithmetic tests for the
+    // formula, and are kept as such because the boundary cases (strict
+    // `>`, threshold 0.0, non-padded model) are worth pinning cheaply.
+    //
+    // The tests that actually gate the feature are
+    // `length_ratio_gauge_reports_disabled_by_default` and
+    // `length_ratio_gate_fires_through_the_real_loop` at the end of this
+    // section: they drive the real batcher and assert on rendered
+    // /metrics text.
     // -----------------------------------------------------------------
 
     /// Helper: build a BatcherConfig with the ratio threshold set and
@@ -1534,6 +1552,150 @@ mod tests {
             && (borderline_item.max_seq_len() as f64)
                 > (accum.max_len as f64) * cfg.length_ratio_threshold;
         assert!(!gate_fires, "20 is not > 20 (strict >), gate must not fire");
+    }
+
+    // ── #153: the gate as PRODUCTION runs it ───────────────────────────────
+    // The three tests above evaluate a copy of the condition. These two drive
+    // the real coalesce loop and assert on the rendered /metrics text, so a
+    // mutation of the production branch turns them red.
+    //
+    // Both mutate BATCH_LENGTH_RATIO_THRESHOLD, which is process-global state
+    // (`std::env::set_var` is non-reentrant and unsafe since Rust 1.82), so
+    // they carry #[serial] like the EMBED_MAX_WAITERS tests in
+    // src/bin/worker.rs.
+
+    /// Sets `BATCH_LENGTH_RATIO_THRESHOLD` on construction and restores the
+    /// previous value on drop, so a panicking test cannot leak its override
+    /// into the next one.
+    struct RatioEnvGuard(Option<String>);
+
+    impl RatioEnvGuard {
+        fn set(value: Option<&str>) -> Self {
+            let prev = std::env::var("BATCH_LENGTH_RATIO_THRESHOLD").ok();
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var("BATCH_LENGTH_RATIO_THRESHOLD", v),
+                    None => std::env::remove_var("BATCH_LENGTH_RATIO_THRESHOLD"),
+                }
+            }
+            Self(prev)
+        }
+    }
+
+    impl Drop for RatioEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.0 {
+                    Some(v) => std::env::set_var("BATCH_LENGTH_RATIO_THRESHOLD", v),
+                    None => std::env::remove_var("BATCH_LENGTH_RATIO_THRESHOLD"),
+                }
+            }
+        }
+    }
+
+    /// Read a labelled series value out of a Prometheus render. `None` when
+    /// the series is absent — asserted on explicitly, because for a gauge
+    /// published at construction "absent" is itself the bug.
+    fn read_series(rendered: &str, needle: &str) -> Option<f64> {
+        rendered
+            .lines()
+            .find_map(|l| l.strip_prefix(needle))
+            .and_then(|rest| rest.trim().parse::<f64>().ok())
+    }
+
+    /// Default deployment (env unset): the gauge must render 0. That zero is
+    /// what makes the carry counter's zero readable as "gate off" instead of
+    /// "gate on and never fired" — the `default_unreachable` ambiguity #153
+    /// is about.
+    ///
+    /// Kills: deleting the `length_ratio_gate_enabled` call at construction
+    /// (series absent → `None`), and inverting its `threshold > 0.0` argument.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn length_ratio_gauge_reports_disabled_by_default() {
+        let _env = RatioEnvGuard::set(None);
+        let handle = test_prometheus_handle();
+        let name = "t_ratio_gauge_off";
+        let b = DynamicBatcher::with_tokens(
+            name,
+            |ids: Vec<Vec<u32>>| Ok(ids.iter().map(|_| vec![0.0f32; 4]).collect()),
+            /*max_batch_tokens*/ usize::MAX,
+            /*max_batch_items*/ 100,
+            /*max_batch_seq*/ usize::MAX,
+            /*padded_model*/ true,
+            /*wait_ms*/ 5,
+            /*max_queue*/ 16,
+        );
+        let text = handle.render();
+        let needle = format!("embed_length_ratio_gate_enabled{{model=\"{name}\"}}");
+        assert_eq!(
+            read_series(&text, &needle),
+            Some(0.0),
+            "gauge must be published and read 0 when the gate is off:\n{text}"
+        );
+        b.shutdown(Duration::from_millis(200)).await;
+    }
+
+    /// Enabled: the gauge reads 1 AND the production gate actually fires.
+    ///
+    /// Every other cap is relaxed (`usize::MAX` tokens/seq, 100 items), so the
+    /// ratio gate is the ONLY thing that can carry the second item — which is
+    /// what makes the counter assertion specific to this branch.
+    ///
+    /// Kills, in `run_worker`'s coalesce loop: removing the `cfg.padded_model
+    /// &&` term, flipping the final `>` to `>=`, dropping the
+    /// `record_length_ratio_carry` call, and deleting the whole
+    /// `if length_ratio_overflow` block.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn length_ratio_gate_fires_through_the_real_loop() {
+        let _env = RatioEnvGuard::set(Some("2.0"));
+        let handle = test_prometheus_handle();
+        let name = "t_ratio_gate_live";
+        let b = Arc::new(DynamicBatcher::with_tokens(
+            name,
+            |ids: Vec<Vec<u32>>| Ok(ids.iter().map(|_| vec![0.0f32; 4]).collect()),
+            /*max_batch_tokens*/ usize::MAX,
+            /*max_batch_items*/ 100,
+            /*max_batch_seq*/ usize::MAX,
+            /*padded_model*/ true,
+            /*wait_ms*/ 50,
+            /*max_queue*/ 16,
+        );
+
+        // Seed the batch with a 10-token item, then offer a 100-token one
+        // inside the same wait window: 100 > 10 * 2.0, so the ratio gate must
+        // carry it to the next batch.
+        let b_seed = b.clone();
+        let seed = tokio::spawn(async move { b_seed.embed_tokens(vec![vec![0u32; 10]]).await });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let b_long = b.clone();
+        let long = tokio::spawn(async move { b_long.embed_tokens(vec![vec![0u32; 100]]).await });
+        let _ = seed.await;
+        let _ = long.await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let text = handle.render();
+        let gauge = format!("embed_length_ratio_gate_enabled{{model=\"{name}\"}}");
+        assert_eq!(
+            read_series(&text, &gauge),
+            Some(1.0),
+            "gauge must read 1 when the gate is on:\n{text}"
+        );
+        let carried = format!(
+            "embed_batch_seq_capped_total{{model=\"{name}\",reason=\"length_ratio\"}}"
+        );
+        let n = read_series(&text, &carried).unwrap_or(0.0);
+        assert!(
+            n >= 1.0,
+            "the ratio gate must have carried at least once, got {n}:\n{text}"
+        );
+
+        Arc::try_unwrap(b)
+            .ok()
+            .expect("still has clones")
+            .shutdown(Duration::from_millis(200))
+            .await;
     }
 
     #[test]
