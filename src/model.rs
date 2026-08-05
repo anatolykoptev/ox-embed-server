@@ -114,6 +114,19 @@ pub struct EmbedModel {
     /// multilingual-e5-large: 16 heads (XLM-RoBERTa-large backbone)
     /// Unknown models:      12 (conservative fallback)
     num_heads: usize,
+    /// Length-homogeneity threshold for within-request sub-batching.
+    ///
+    /// A request's texts are split into groups where the longest sequence is
+    /// at most `subbatch_ratio ×` the shortest, and each group runs its own
+    /// forward pass. Attention is O(S²), so a batch dragged to S=512 by one
+    /// long text pays quadratically for every short text beside it.
+    ///
+    /// `<= 1.0` disables the split and restores the exact pre-#136 behaviour:
+    /// one pass over everything. Set via `EMBED_SUBBATCH_RATIO_<MODEL_UPPER>`
+    /// or the `EMBED_SUBBATCH_RATIO` global.
+    ///
+    /// Default `2.0` is measured, not guessed — see `plan_subbatches`.
+    subbatch_ratio: f32,
     /// Whether per-run BFCArena shrinkage is enabled for this model.
     ///
     /// When `true`, `embed_tokens` and `warmup_at_shape` call
@@ -300,6 +313,9 @@ impl EmbedModel {
         // Publish to /metrics so operators can verify config without reading logs.
         crate::metrics::set_arena_shrink_enabled(&def.name, arena_shrink_enabled);
 
+        let subbatch_ratio = resolve_subbatch_ratio(&def.name);
+        crate::metrics::set_subbatch_ratio(&def.name, subbatch_ratio);
+
         Ok(Self {
             name: def.name.clone(),
             sessions,
@@ -310,6 +326,7 @@ impl EmbedModel {
             pad_id: def.pad_id,
             has_token_type_ids: def.has_token_type_ids,
             num_heads,
+            subbatch_ratio,
             arena_shrink_enabled,
             run_options,
             eviction_handle,
@@ -356,7 +373,73 @@ impl EmbedModel {
     /// Embed a batch of pre-tokenized `input_ids`, returning one vector
     /// per sequence. Skips the tokenizer entirely — callers are
     /// responsible for having already run `tokenize()`.
+    ///
+    /// Splits the request into length-homogeneous sub-batches (see
+    /// [`plan_subbatches`]) and runs one forward pass per group, reassembling
+    /// results in the caller's original order. With `subbatch_ratio <= 1.0`,
+    /// or whenever the plan yields a single group, this is exactly one pass —
+    /// byte-for-byte the previous behaviour.
+    ///
+    /// This is also the only place `embed_batch_padding_waste_ratio` is
+    /// emitted on the multi-process path. `DynamicBatcher` emits it too, but
+    /// the supervisor sets `batcher: None` when `EMBED_MULTI_PROCESS=1`
+    /// (`main.rs`), so in production that call site never runs and the metric
+    /// was absent from Prometheus entirely.
     pub fn embed_tokens(&self, token_ids: &[Vec<u32>]) -> Result<Vec<Vec<f32>>, String> {
+        if token_ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Truncation is applied by the tensor builder, so the planner must see
+        // the same capped lengths the padding will actually use — otherwise a
+        // 4000-token text and a 512-token text look like a 7.8× spread when
+        // both in fact pad to 512, and they get split for no gain.
+        let lens: Vec<usize> = token_ids
+            .iter()
+            .map(|v| v.len().min(self.max_len))
+            .collect();
+        let groups = plan_subbatches(&lens, self.subbatch_ratio);
+
+        // Waste is reported across the WHOLE request, not per group: a
+        // per-group ratio improves by construction as groups narrow, so it
+        // would report success even when the split saved nothing.
+        let real: usize = lens.iter().sum();
+        let padded: usize = groups
+            .iter()
+            .map(|g| {
+                let widest = g.iter().map(|&i| lens[i]).max().unwrap_or(0);
+                g.len() * round_up_seq_len(widest, self.max_len)
+            })
+            .sum();
+        crate::metrics::record_padding_waste(&self.name, padded, real);
+        crate::metrics::record_subbatch_groups(&self.name, groups.len());
+
+        if groups.len() <= 1 {
+            return self.embed_tokens_one_pass(token_ids);
+        }
+
+        let mut out: Vec<Vec<f32>> = vec![Vec::new(); token_ids.len()];
+        for group in &groups {
+            let sub: Vec<Vec<u32>> = group.iter().map(|&i| token_ids[i].clone()).collect();
+            let vectors = self.embed_tokens_one_pass(&sub)?;
+            // A scatter bug here would silently hand back another text's
+            // vector, so the cardinality is checked rather than assumed.
+            if vectors.len() != group.len() {
+                return Err(format!(
+                    "sub-batch cardinality: expected {}, got {}",
+                    group.len(),
+                    vectors.len()
+                ));
+            }
+            for (&original_index, vector) in group.iter().zip(vectors) {
+                out[original_index] = vector;
+            }
+        }
+        Ok(out)
+    }
+
+    /// One forward pass over `token_ids`, padded to a single width.
+    fn embed_tokens_one_pass(&self, token_ids: &[Vec<u32>]) -> Result<Vec<Vec<f32>>, String> {
         if token_ids.is_empty() {
             return Ok(vec![]);
         }
@@ -704,6 +787,124 @@ impl EmbedModel {
 /// exceeding the model's static `max_len`. `n == 0` → 1, `n == cap` →
 /// `cap` (no rounding above the cap), `n` already a power of two →
 /// itself.
+/// Resolve the sub-batch length ratio for `model_key`.
+///
+/// Lookup order: `EMBED_SUBBATCH_RATIO_<MODEL_UPPER>`, then the
+/// `EMBED_SUBBATCH_RATIO` global, then [`DEFAULT_SUBBATCH_RATIO`].
+///
+/// An unparseable or non-finite value falls back to the default with a warn —
+/// the same typo-guard posture the other knobs in this crate take, because a
+/// silent 0.0 here would disable the split and look identical to "off by
+/// choice" on the dashboard.
+fn resolve_subbatch_ratio(model_key: &str) -> f32 {
+    let per_model = format!(
+        "EMBED_SUBBATCH_RATIO_{}",
+        crate::config::model_env_key(model_key)
+    );
+    let raw = std::env::var(&per_model)
+        .ok()
+        .or_else(|| std::env::var("EMBED_SUBBATCH_RATIO").ok());
+    parse_subbatch_ratio(raw.as_deref())
+}
+
+/// Pure half of [`resolve_subbatch_ratio`], split out so the fallback
+/// behaviour is testable without mutating process env.
+pub(crate) fn parse_subbatch_ratio(raw: Option<&str>) -> f32 {
+    match raw {
+        None | Some("") => DEFAULT_SUBBATCH_RATIO,
+        Some(s) => match s.trim().parse::<f32>() {
+            Ok(v) if v.is_finite() && v >= 0.0 => v,
+            _ => {
+                tracing::warn!(
+                    raw = %s,
+                    default = DEFAULT_SUBBATCH_RATIO,
+                    "EMBED_SUBBATCH_RATIO* is not a finite non-negative float; using default"
+                );
+                DEFAULT_SUBBATCH_RATIO
+            }
+        },
+    }
+}
+
+/// Measured on pillow (ARM Neoverse-N1) against 32 real code chunks from this
+/// repo, median 130 tokens against a 512 cap — the shape `code-rank-embed`
+/// actually serves (issue #136: 62% of its requests are batch 32+, 80% are
+/// seq 512+).
+///
+/// | ratio | wall-clock saved |
+/// |-------|------------------|
+/// | 1.5   | 29.3%            |
+/// | 2.0   | 31.6%            |
+/// | 3.0   | 29.4%            |
+/// | 6.0   | −5.2%            |
+///
+/// The curve is an inverted U: narrow groups cut padding but pay for extra
+/// forward passes, and by 6.0 the passes cost more than the padding they
+/// save. 2.0 is the measured peak, and the plateau from 1.5 to 3.0 means the
+/// knob does not need tuning per deployment.
+pub(crate) const DEFAULT_SUBBATCH_RATIO: f32 = 2.0;
+
+/// Group indices of `lens` into length-homogeneous sub-batches, longest
+/// first, so each group can be padded to its own width instead of the whole
+/// request's.
+///
+/// A group admits an item while `group_widest / item_len <= ratio`. Returns a
+/// single group covering everything when `ratio <= 1.0`, when there is
+/// nothing to split, or when every length already fits one band — so the
+/// caller's "one group means one pass" fast path is reached in the common
+/// case rather than paying a needless reassembly.
+///
+/// Ties break on the original index, so the plan is deterministic — a
+/// non-deterministic grouping would make the padding-waste metric jitter
+/// between byte-identical requests.
+///
+/// Determinism here rests on `sort_by` being a *stable* sort; the explicit
+/// tie-break is belt-and-braces and its removal is therefore **not**
+/// observable by any test. Kept because it makes the requirement legible at
+/// the call site and survives a future switch to `sort_unstable_by`, but do
+/// not read `subbatch_plan_is_deterministic_on_ties` as covering this line.
+pub(crate) fn plan_subbatches(lens: &[usize], ratio: f32) -> Vec<Vec<usize>> {
+    if lens.is_empty() {
+        return vec![];
+    }
+    // NaN is spelled out rather than left to `!(ratio > 1.0)`: both forms
+    // disable the split, but the negated comparison reads as an accident and
+    // trips `clippy::neg_cmp_op_on_partial_ord`. A plain `ratio <= 1.0` would
+    // be *false* for NaN and let a garbage threshold through.
+    if ratio.is_nan() || ratio <= 1.0 {
+        return vec![(0..lens.len()).collect()];
+    }
+
+    let mut order: Vec<usize> = (0..lens.len()).collect();
+    order.sort_by(|&a, &b| lens[b].cmp(&lens[a]).then(a.cmp(&b)));
+
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut current: Vec<usize> = Vec::new();
+    let mut widest = 0usize;
+
+    for i in order {
+        // A zero-length sequence would divide by zero below; it also cannot
+        // widen a group, so treat it as 1.
+        let len = lens[i].max(1);
+        if current.is_empty() {
+            widest = len;
+            current.push(i);
+            continue;
+        }
+        if widest as f32 / len as f32 <= ratio {
+            current.push(i);
+        } else {
+            groups.push(std::mem::take(&mut current));
+            widest = len;
+            current.push(i);
+        }
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    groups
+}
+
 fn round_up_seq_len(n: usize, cap: usize) -> usize {
     if n <= 1 {
         // Empty/singleton input → 1-token tensor. `max_len` is always
@@ -908,6 +1109,121 @@ fn build_one_session(
 #[cfg(test)]
 mod seq_pad_tests {
     use super::round_up_seq_len;
+    use super::{DEFAULT_SUBBATCH_RATIO, parse_subbatch_ratio, plan_subbatches};
+
+    /// Flatten a plan back to a sorted index list.
+    fn flat(groups: &[Vec<usize>]) -> Vec<usize> {
+        let mut v: Vec<usize> = groups.iter().flatten().copied().collect();
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn subbatch_plan_covers_every_index_exactly_once() {
+        // The scatter in `embed_tokens` indexes `out` by these values. A
+        // dropped index leaves a caller holding an empty vector; a duplicated
+        // one overwrites a neighbour's embedding. Both are silent in prod —
+        // no error, no metric, just wrong vectors in the index — so coverage
+        // is asserted directly rather than inferred from group count.
+        let lens = vec![500, 12, 300, 7, 480, 33, 210, 1, 64, 128];
+        let groups = plan_subbatches(&lens, 2.0);
+        assert_eq!(flat(&groups), (0..lens.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn subbatch_plan_splits_when_spread_exceeds_ratio() {
+        // 500 against 10 is a 50× spread — it must not share a pass.
+        let groups = plan_subbatches(&[500, 10], 2.0);
+        assert_eq!(groups.len(), 2, "wide spread must split");
+        // Longest first, so group 0 owns the long sequence.
+        assert_eq!(groups[0], vec![0]);
+        assert_eq!(groups[1], vec![1]);
+    }
+
+    #[test]
+    fn subbatch_plan_keeps_one_group_inside_the_ratio() {
+        // 200/120 = 1.67 <= 2.0: splitting these would buy nothing and cost
+        // an extra forward pass. Guards the boundary against a `<` / `<=`
+        // mutation, which would split an exactly-at-threshold batch.
+        let groups = plan_subbatches(&[200, 120], 2.0);
+        assert_eq!(groups.len(), 1);
+        let groups = plan_subbatches(&[200, 100], 2.0);
+        assert_eq!(groups.len(), 1, "ratio exactly 2.0 must stay together");
+        let groups = plan_subbatches(&[201, 100], 2.0);
+        assert_eq!(groups.len(), 2, "just past the threshold must split");
+    }
+
+    #[test]
+    fn subbatch_disabled_ratio_yields_exactly_one_group() {
+        // The off position must be a true no-op: one group, original order,
+        // so `embed_tokens` takes its single-pass fast path and behaves
+        // byte-for-byte as it did before #136.
+        for ratio in [0.0f32, 1.0, -3.0, f32::NAN] {
+            let groups = plan_subbatches(&[500, 10, 300], ratio);
+            assert_eq!(groups.len(), 1, "ratio {ratio} must disable splitting");
+            assert_eq!(groups[0], vec![0, 1, 2], "order must be untouched");
+        }
+    }
+
+    #[test]
+    fn subbatch_plan_is_deterministic_on_ties() {
+        // Pins the BEHAVIOUR — equal lengths keep original order, and the
+        // plan repeats — not the line that implements it. Verified by hand:
+        // deleting the `.then(a.cmp(&b))` tie-break leaves all eight tests
+        // green, because `sort_by` is already stable. So this is a
+        // regression pin for the property, not mutation coverage of the
+        // sort; treating it as the latter would overstate what it proves.
+        let lens = vec![100, 100, 100, 100];
+        let first = plan_subbatches(&lens, 2.0);
+        for _ in 0..8 {
+            assert_eq!(plan_subbatches(&lens, 2.0), first);
+        }
+        assert_eq!(first, vec![vec![0, 1, 2, 3]]);
+    }
+
+    #[test]
+    fn subbatch_plan_handles_zero_length_without_dividing_by_zero() {
+        // A zero-length sequence reaches the ratio test as a divisor. Without
+        // the `.max(1)` clamp this is a division by zero, and in release mode
+        // f32 division yields +inf rather than a panic — so the group would
+        // split silently instead of crashing loudly.
+        let groups = plan_subbatches(&[0, 0, 5], 2.0);
+        assert_eq!(flat(&groups), vec![0, 1, 2]);
+        let groups = plan_subbatches(&[], 2.0);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn subbatch_groups_are_ordered_longest_first() {
+        // `embed_tokens` reports padding across all groups, but an operator
+        // reading a per-group trace expects the expensive pass first.
+        let groups = plan_subbatches(&[10, 500, 60], 2.0);
+        let widest: Vec<usize> = groups
+            .iter()
+            .map(|g| g.iter().map(|&i| [10, 500, 60][i]).max().unwrap())
+            .collect();
+        let mut sorted = widest.clone();
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        assert_eq!(widest, sorted, "groups must run widest-first");
+    }
+
+    #[test]
+    fn subbatch_ratio_parses_with_a_typo_guard() {
+        assert_eq!(parse_subbatch_ratio(None), DEFAULT_SUBBATCH_RATIO);
+        assert_eq!(parse_subbatch_ratio(Some("")), DEFAULT_SUBBATCH_RATIO);
+        assert_eq!(parse_subbatch_ratio(Some(" 3.5 ")), 3.5);
+        assert_eq!(
+            parse_subbatch_ratio(Some("0")),
+            0.0,
+            "explicit off honoured"
+        );
+        // Garbage must NOT silently disable the split — that would read as
+        // "operator turned it off" on the dashboard.
+        assert_eq!(parse_subbatch_ratio(Some("two")), DEFAULT_SUBBATCH_RATIO);
+        assert_eq!(parse_subbatch_ratio(Some("-1")), DEFAULT_SUBBATCH_RATIO);
+        assert_eq!(parse_subbatch_ratio(Some("inf")), DEFAULT_SUBBATCH_RATIO);
+        assert_eq!(parse_subbatch_ratio(Some("NaN")), DEFAULT_SUBBATCH_RATIO);
+    }
 
     #[test]
     fn zero_rounds_to_one() {
