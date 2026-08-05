@@ -1582,10 +1582,15 @@ pub fn record_ready_probe(result: &str) {
 // ── worker heartbeat (issue #90: wedged-worker detection) ──────────────────────
 
 /// Record a heartbeat probe outcome. Labels:
-/// - `ok`     — probe completed, worker responsive.
-/// - `timeout`— probe timed out (worker may be wedged).
-/// - `error`  — probe returned an error (worker error or dispatch failure).
-/// - `kill`   — N consecutive fails reached, worker SIGKILL'd for respawn.
+/// - `ok`        — probe completed, worker responsive.
+/// - `timeout`   — probe timed out (worker may be wedged).
+/// - `error`     — probe returned an error (worker error or dispatch failure).
+/// - `kill`      — N consecutive fails reached, worker SIGKILL'd for respawn.
+/// - `suppressed`— probe failed but was suppressed because the worker
+///   completed a real inference within the heartbeat interval
+///   (#149). A rising `suppressed` rate under load is expected
+///   and healthy; it means the freshness check is catching
+///   false positives.
 ///
 /// Operators alert on `rate(embed_worker_heartbeat_total{result="timeout"}[5m]) > 0`
 /// to catch a wedged worker before the heartbeat kills it, and on
@@ -1631,7 +1636,7 @@ pub fn ready_probe_touch() {
 /// Pre-touch the heartbeat counter to 0 for all result labels so "no
 /// heartbeats yet" is visible in Prometheus as present-but-zero, not absent.
 pub fn worker_heartbeat_touch(model: &str) {
-    for result in ["ok", "timeout", "error", "kill"] {
+    for result in ["ok", "timeout", "error", "kill", "suppressed"] {
         metrics::counter!(
             "embed_worker_heartbeat_total",
             "model" => model.to_string(),

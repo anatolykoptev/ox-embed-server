@@ -94,10 +94,14 @@ impl WorkerPool {
 
     /// Shared helper: look up the supervisor for `model` and poll until a
     /// live client is available (or `dispatch_timeout` expires).
+    ///
+    /// Returns both the supervisor (so the caller can stamp
+    /// [`WorkerSupervisor::record_success`] on a successful dispatch) and the
+    /// client.
     async fn get_client(
         &self,
         model: &str,
-    ) -> Result<Arc<crate::ipc::client::WorkerClient>, DispatchError> {
+    ) -> Result<(Arc<WorkerSupervisor>, Arc<crate::ipc::client::WorkerClient>), DispatchError> {
         let supervisor = {
             let w = self.workers.read().await;
             w.get(model)
@@ -110,7 +114,7 @@ impl WorkerPool {
         let deadline = std::time::Instant::now() + self.dispatch_timeout;
         loop {
             if let Some(client) = supervisor.client().await {
-                return Ok(client);
+                return Ok((supervisor, client));
             }
             if std::time::Instant::now() >= deadline {
                 return Err(DispatchError::Timeout {
@@ -123,20 +127,31 @@ impl WorkerPool {
     }
 
     /// Dispatch an embed request to the worker registered for `model`.
+    ///
+    /// On a **successful** inference (non-`Err` [`WorkerResponse`]), stamps
+    /// the supervisor's last-success timestamp so the heartbeat freshness
+    /// check can suppress false-positive probe failures under load (#149).
     pub async fn dispatch_embed(
         &self,
         model: &str,
         texts: Vec<String>,
         max_seq_len: u32,
     ) -> Result<WorkerResponse, DispatchError> {
-        let client = self.get_client(model).await?;
-        client
+        let (supervisor, client) = self.get_client(model).await?;
+        let result = client
             .dispatch_embed(model.to_string(), texts, max_seq_len)
             .await
-            .map_err(DispatchError::Ipc)
+            .map_err(DispatchError::Ipc)?;
+        if !matches!(result, crate::ipc::protocol::WorkerResponse::Err { .. }) {
+            supervisor.record_success();
+        }
+        Ok(result)
     }
 
     /// Dispatch a rerank request to the worker registered for `model`.
+    ///
+    /// On a **successful** inference (non-`Err` [`WorkerResponse`]), stamps
+    /// the supervisor's last-success timestamp — see [`dispatch_embed`].
     pub async fn dispatch_rerank(
         &self,
         model: &str,
@@ -144,14 +159,21 @@ impl WorkerPool {
         documents: Vec<String>,
         max_seq_len: u32,
     ) -> Result<WorkerResponse, DispatchError> {
-        let client = self.get_client(model).await?;
-        client
+        let (supervisor, client) = self.get_client(model).await?;
+        let result = client
             .dispatch_rerank(model.to_string(), query, documents, max_seq_len)
             .await
-            .map_err(DispatchError::Ipc)
+            .map_err(DispatchError::Ipc)?;
+        if !matches!(result, crate::ipc::protocol::WorkerResponse::Err { .. }) {
+            supervisor.record_success();
+        }
+        Ok(result)
     }
 
     /// Dispatch a splade request to the worker registered for `model`.
+    ///
+    /// On a **successful** inference (non-`Err` [`WorkerResponse`]), stamps
+    /// the supervisor's last-success timestamp — see [`dispatch_embed`].
     pub async fn dispatch_splade(
         &self,
         model: &str,
@@ -160,11 +182,15 @@ impl WorkerPool {
         top_k: u32,
         min_weight: f32,
     ) -> Result<WorkerResponse, DispatchError> {
-        let client = self.get_client(model).await?;
-        client
+        let (supervisor, client) = self.get_client(model).await?;
+        let result = client
             .dispatch_splade(model.to_string(), texts, max_seq_len, top_k, min_weight)
             .await
-            .map_err(DispatchError::Ipc)
+            .map_err(DispatchError::Ipc)?;
+        if !matches!(result, crate::ipc::protocol::WorkerResponse::Err { .. }) {
+            supervisor.record_success();
+        }
+        Ok(result)
     }
 
     /// Currently registered model names. Useful for /health, /metrics.

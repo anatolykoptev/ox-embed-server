@@ -155,6 +155,19 @@ fn next_backoff(current: Duration) -> Duration {
     (current * 2).min(MAX_BACKOFF)
 }
 
+/// Current wall-clock time as unix milliseconds.
+///
+/// Used by [`WorkerSupervisor::record_success`] to stamp the last-success
+/// timestamp. Returns 0 if the system clock is before `UNIX_EPOCH` (which
+/// would only happen on a misconfigured host); `heartbeat_tick`'s freshness
+/// check treats 0 as "never stamped" and does not suppress.
+fn now_unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Inference kind the worker should load.
 ///
 /// Passed as `EMBED_WORKER_KIND` env to the worker process. The worker
@@ -195,6 +208,14 @@ enum HeartbeatOutcome {
     Failed,
     /// Fail budget spent; the worker was SIGKILLed for the watchdog to respawn.
     Killed,
+    /// The probe failed (timeout / error / worker-error reply) but was
+    /// **suppressed** because the worker completed a real inference within
+    /// the heartbeat interval — proof it is not wedged. The probe queues
+    /// behind the worker's session pool, so under load it measures queue
+    /// depth, not liveness; suppressing a failure when the worker recently
+    /// did real work stops the wedge detector from firing at peak load.
+    /// The fail counter is NOT incremented.
+    Suppressed,
 }
 
 #[derive(Debug, Clone)]
@@ -238,6 +259,20 @@ pub struct WorkerSupervisor {
     heartbeat_max_fails: u32,
     /// Timeout for each heartbeat inference probe.
     heartbeat_probe_timeout: Duration,
+    /// Unix-millis timestamp of the worker's last **successful** real
+    /// inference (stamped by [`WorkerPool::dispatch_*`] on a non-`Err`
+    /// `WorkerResponse`). The heartbeat freshness check suppresses a probe
+    /// failure when this is fresher than `heartbeat_interval` — a worker
+    /// that completed a real inference within the interval is by definition
+    /// not wedged, and the probe queues behind the session pool so under
+    /// load it measures queue depth, not liveness.
+    ///
+    /// Stamped on **success** (response received), NOT on dispatch start:
+    /// a worker stuck on one long request never stamps, so the timestamp
+    /// goes stale and the wedge is still detected. Stamping on dispatch
+    /// start would keep the timestamp fresh via the in-flight request and
+    /// mask the wedge — the exact failure mode this design avoids.
+    last_success_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl WorkerSupervisor {
@@ -305,6 +340,7 @@ impl WorkerSupervisor {
             heartbeat_interval,
             heartbeat_max_fails,
             heartbeat_probe_timeout,
+            last_success_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         });
 
         // Initial spawn — fail loudly so the server startup loop can exit(1).
@@ -681,7 +717,6 @@ impl WorkerSupervisor {
             // already branched on this variant correctly; the heartbeat did
             // not. This arm must stay ABOVE the success arm.
             Ok(Ok(crate::ipc::protocol::WorkerResponse::Err { message, .. })) => {
-                *consecutive_fails += 1;
                 tracing::warn!(
                     model = %self.spec.model,
                     consecutive_fails = *consecutive_fails,
@@ -700,12 +735,10 @@ impl WorkerSupervisor {
                         "heartbeat recovered after failures"
                     );
                 }
-                *consecutive_fails = 0;
                 self.record_heartbeat("ok");
                 false
             }
             Ok(Err(e)) => {
-                *consecutive_fails += 1;
                 tracing::warn!(
                     model = %self.spec.model,
                     consecutive_fails = *consecutive_fails,
@@ -717,7 +750,6 @@ impl WorkerSupervisor {
                 true
             }
             Err(_) => {
-                *consecutive_fails += 1;
                 tracing::warn!(
                     model = %self.spec.model,
                     consecutive_fails = *consecutive_fails,
@@ -731,8 +763,40 @@ impl WorkerSupervisor {
         };
 
         if !failed {
+            *consecutive_fails = 0;
             return HeartbeatOutcome::Ok;
         }
+
+        // Freshness check (#149): suppress a probe failure when the worker
+        // completed a real inference within the heartbeat interval. The probe
+        // is dispatched through the same UDS and queues behind the worker's
+        // session pool, so under load it measures QUEUE DEPTH, not liveness.
+        // A worker that completed a real inference within the interval is by
+        // definition not wedged; suppressing here stops the wedge detector
+        // from firing hardest at peak load (32 false SIGKILLs on pillow in
+        // three days before this check). The probe then only decides liveness
+        // for workers that are otherwise idle — the only case where it
+        // carries information.
+        //
+        // `last > 0` guards the "never stamped" case (fresh worker, no real
+        // dispatch yet): 0 must NOT suppress, or the detector is dead on
+        // arrival for a worker that wedges before its first request.
+        let now = now_unix_millis();
+        let last = self.last_success_ms();
+        if last > 0 && now.saturating_sub(last) < self.heartbeat_interval.as_millis() as u64 {
+            tracing::debug!(
+                model = %self.spec.model,
+                last_success_ms = last,
+                interval_ms = self.heartbeat_interval.as_millis(),
+                "heartbeat probe failed but suppressed — worker completed a real \
+                 inference within the interval (not wedged, just busy)"
+            );
+            self.record_heartbeat("suppressed");
+            return HeartbeatOutcome::Suppressed;
+        }
+
+        *consecutive_fails += 1;
+
         if *consecutive_fails < self.heartbeat_max_fails {
             return HeartbeatOutcome::Failed;
         }
@@ -799,6 +863,29 @@ impl WorkerSupervisor {
         &self.spec.model
     }
 
+    /// Stamp the last-success timestamp to the current unix-millis instant.
+    ///
+    /// Called by [`WorkerPool::dispatch_*`] after a **successful** real
+    /// inference (a non-`Err` [`WorkerResponse`]). The heartbeat freshness
+    /// check suppresses a probe failure when this is fresher than the
+    /// heartbeat interval — see [`heartbeat_tick`].
+    ///
+    /// Stamped on success, NOT on dispatch start: a worker stuck on one long
+    /// request never stamps, so the timestamp goes stale and the wedge is
+    /// still detected. Stamping on dispatch start would keep it fresh via
+    /// the in-flight request and mask the wedge.
+    pub fn record_success(&self) {
+        self.last_success_ms
+            .store(now_unix_millis(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Last successful real-inference timestamp (unix millis), or 0 if the
+    /// worker has never completed a real inference.
+    fn last_success_ms(&self) -> u64 {
+        self.last_success_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Test-only: create a supervisor with a pre-connected client and no
     /// child process. The watchdog loop is not spawned — the supervisor
     /// is a static fixture for testing dispatch paths (e.g. /ready probe
@@ -815,6 +902,7 @@ impl WorkerSupervisor {
             heartbeat_interval: Duration::ZERO,
             heartbeat_max_fails: 3,
             heartbeat_probe_timeout: Duration::from_millis(100),
+            last_success_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -939,6 +1027,7 @@ mod tests {
             heartbeat_interval: Duration::ZERO,
             heartbeat_max_fails: 3,
             heartbeat_probe_timeout: Duration::from_millis(150),
+            last_success_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         });
 
         // Hold a read lock on client_slot so the write in clear_on_exit
@@ -1188,6 +1277,7 @@ mod tests {
             heartbeat_interval: Duration::from_millis(50),
             heartbeat_max_fails: 1,
             heartbeat_probe_timeout: Duration::from_millis(150),
+            last_success_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -1379,6 +1469,7 @@ mod tests {
             heartbeat_interval: Duration::from_millis(50),
             heartbeat_max_fails: 1,
             heartbeat_probe_timeout: Duration::from_millis(150),
+            last_success_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         });
 
         let mut fails = 2;
@@ -1388,6 +1479,235 @@ mod tests {
         assert_eq!(
             fails, 0,
             "a respawn window must not count against the worker"
+        );
+    }
+
+    // ── #149: last-success freshness suppression ─────────────────────────────
+    //
+    // The heartbeat probe is dispatched through the same UDS and queues behind
+    // the worker's session pool, so under load it measures QUEUE DEPTH, not
+    // liveness. A worker that completed a real inference within the heartbeat
+    // interval is by definition not wedged; the freshness check suppresses
+    // the probe failure so the wedge detector stops firing at peak load.
+    //
+    // Three mutations guard this — F1, F2, F3 — and all three matter:
+    //   F1: freshness check always false (never suppress) → false positives return.
+    //   F2: suppression unconditional (always suppress)   → detector is dead.
+    //   F3: stamp on dispatch start, not on success       → wedge masked by
+    //       the in-flight request keeping the timestamp fresh.
+
+    /// F1: a worker that completed a real inference within the heartbeat
+    /// interval is NOT counted as a heartbeat failure.
+    ///
+    /// RED-proven: making the freshness check always evaluate to `false`
+    /// (e.g. `if false && last > 0 && ...`) returns `Failed`/`Killed` here
+    /// instead of `Suppressed`.
+    #[tokio::test]
+    async fn heartbeat_tick_suppresses_failure_when_success_is_fresh() {
+        let mock = MockWorker::start("fresh-success", MockReply::Hang).await;
+        let mut child = std::process::Command::new("sleep")
+            .arg("999")
+            .spawn()
+            .expect("spawn sleep");
+
+        // Use a 1s interval — longer than the 150ms probe timeout, mirroring
+        // production (30s interval vs 15s timeout). With a 50ms interval
+        // (the supervisor_for default), the probe timeout alone (150ms)
+        // would make the timestamp stale before the freshness check runs.
+        let client = Arc::new(
+            crate::ipc::client::WorkerClient::connect(mock.socket_path.clone(), 1)
+                .await
+                .expect("connect to mock worker"),
+        );
+        let sup = Arc::new(WorkerSupervisor {
+            spec: SpawnSpec {
+                model: "test-heartbeat".to_string(),
+                kind: WorkerKind::Embed,
+                worker_bin: std::path::PathBuf::from("/bin/true"),
+                socket_dir: mock.socket_path.parent().unwrap().to_path_buf(),
+                pool_size: 1,
+                intra_threads: 1,
+                env_extra: vec![],
+            },
+            client_slot: Arc::new(RwLock::new(Some(client))),
+            restart_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            socket_wait: Duration::from_secs(60),
+            current_pid: Arc::new(std::sync::atomic::AtomicU32::new(child.id())),
+            heartbeat_interval: Duration::from_secs(1),
+            heartbeat_max_fails: 1,
+            heartbeat_probe_timeout: Duration::from_millis(150),
+            last_success_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        });
+
+        // Stamp a recent successful inference — simulates the pool having
+        // dispatched a real request that completed within the interval.
+        sup.record_success();
+        assert!(
+            sup.last_success_ms() > 0,
+            "record_success must stamp a non-zero timestamp"
+        );
+
+        let mut fails = 0;
+        let outcome = sup.heartbeat_tick(&mut fails).await;
+
+        assert_eq!(
+            outcome,
+            HeartbeatOutcome::Suppressed,
+            "a worker that completed a real inference within the interval \
+             must NOT be counted as a heartbeat failure"
+        );
+        assert_eq!(
+            fails, 0,
+            "the fail counter must NOT increment when the failure is suppressed"
+        );
+
+        // The child must STILL be running — nothing was killed.
+        assert!(
+            child.try_wait().expect("try_wait").is_none(),
+            "a busy worker must not be SIGKILLed when the failure is suppressed"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// F2: an idle worker that has NEVER completed a real inference (no
+    /// last-success timestamp) and fails `max_fails` consecutive probes IS
+    /// still killed. Without this, the fix silently turns the wedge detector
+    /// off — `last_success_ms == 0` must NOT suppress.
+    ///
+    /// RED-proven: making the suppression unconditional (e.g. `if true`) —
+    /// or removing the `last > 0` guard — returns `Suppressed` here instead
+    /// of `Killed`, and the child is not signalled.
+    #[tokio::test]
+    async fn heartbeat_tick_kills_idle_worker_with_no_recent_success() {
+        let mock = MockWorker::start("idle-wedged", MockReply::Hang).await;
+        let mut child = std::process::Command::new("sleep")
+            .arg("999")
+            .spawn()
+            .expect("spawn sleep");
+        let sup = supervisor_for(&mock, WorkerKind::Embed, child.id()).await;
+
+        // No record_success() call — the worker has never completed a real
+        // inference. last_success_ms is 0.
+        assert_eq!(
+            sup.last_success_ms(),
+            0,
+            "a fresh worker must have last_success_ms == 0"
+        );
+
+        let mut fails = 0;
+        let outcome = sup.heartbeat_tick(&mut fails).await;
+
+        assert_eq!(
+            outcome,
+            HeartbeatOutcome::Killed,
+            "an idle worker with no recent success that fails max_fails probes \
+             MUST be killed — the freshness check must not suppress when \
+             last_success_ms is 0"
+        );
+        let status = child.wait().expect("wait child");
+        assert!(
+            !status.success(),
+            "the wedged idle worker must have been SIGKILLed"
+        );
+        assert_eq!(fails, 0, "the fail counter resets after a kill");
+    }
+
+    /// F3: a worker wedged mid-request is still detected.
+    ///
+    /// The stamp must be on **success** (response received), NOT on dispatch
+    /// start. A worker stuck on one long request never stamps, so the
+    /// timestamp goes stale and the wedge is detected. If the stamp were on
+    /// dispatch start, the in-flight request would keep the timestamp fresh
+    /// and mask the wedge — the exact failure mode this test catches.
+    ///
+    /// This test dispatches through the real `WorkerPool::dispatch_embed` path
+    /// (where the stamp lives) against a hanging mock worker, then runs
+    /// `heartbeat_tick` and asserts the worker is killed.
+    ///
+    /// RED-proven: moving `supervisor.record_success()` from after the
+    /// `client.dispatch_embed()` call to before it (dispatch-start stamping)
+    /// stamps the timestamp during the in-flight dispatch, the freshness check
+    /// suppresses the probe failure, and this test sees `Suppressed` instead
+    /// of `Killed`.
+    #[tokio::test]
+    async fn heartbeat_tick_detects_worker_wedged_mid_request() {
+        use crate::supervisor::pool::WorkerPool;
+
+        let mock = MockWorker::start("wedged-midreq", MockReply::Hang).await;
+        let mut child = std::process::Command::new("sleep")
+            .arg("999")
+            .spawn()
+            .expect("spawn sleep");
+
+        // Use a 1s interval — longer than the 150ms probe timeout, mirroring
+        // production (30s interval vs 15s timeout). This ensures that with
+        // the F3 mutation (stamp on dispatch start), the timestamp is still
+        // fresh when the freshness check runs, so the suppression fires and
+        // the test goes RED.
+        let client = Arc::new(
+            crate::ipc::client::WorkerClient::connect(mock.socket_path.clone(), 1)
+                .await
+                .expect("connect to mock worker"),
+        );
+        let sup = Arc::new(WorkerSupervisor {
+            spec: SpawnSpec {
+                model: "test-heartbeat".to_string(),
+                kind: WorkerKind::Embed,
+                worker_bin: std::path::PathBuf::from("/bin/true"),
+                socket_dir: mock.socket_path.parent().unwrap().to_path_buf(),
+                pool_size: 1,
+                intra_threads: 1,
+                env_extra: vec![],
+            },
+            client_slot: Arc::new(RwLock::new(Some(client))),
+            restart_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            socket_wait: Duration::from_secs(60),
+            current_pid: Arc::new(std::sync::atomic::AtomicU32::new(child.id())),
+            heartbeat_interval: Duration::from_secs(1),
+            heartbeat_max_fails: 1,
+            heartbeat_probe_timeout: Duration::from_millis(150),
+            last_success_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        });
+
+        // Register the supervisor in a real WorkerPool so the dispatch goes
+        // through the production stamp path.
+        let pool = WorkerPool::new();
+        pool.add(sup.clone()).await;
+
+        // Start a real dispatch through the pool. The mock worker hangs, so
+        // the dispatch never completes. With stamp-on-success (correct),
+        // record_success is NOT called — the dispatch hasn't succeeded.
+        // With stamp-on-dispatch-start (the F3 mutation), record_success IS
+        // called before the dispatch hangs, stamping a fresh timestamp.
+        //
+        // The 50ms timeout is enough for get_client + (with the mutation)
+        // record_success to execute, but the dispatch itself hangs forever.
+        let _ = tokio::time::timeout(
+            Duration::from_millis(50),
+            pool.dispatch_embed("test-heartbeat", vec!["test".to_string()], 8),
+        )
+        .await;
+
+        // With stamp-on-success: last_success_ms is still 0 (dispatch didn't
+        // complete). With stamp-on-dispatch-start: last_success_ms is now
+        // fresh. We don't assert on the timestamp directly — the
+        // heartbeat_tick outcome is the real proof.
+
+        let mut fails = 0;
+        let outcome = sup.heartbeat_tick(&mut fails).await;
+
+        assert_eq!(
+            outcome,
+            HeartbeatOutcome::Killed,
+            "a worker wedged mid-request must still be detected — the stamp \
+             must be on SUCCESS, not on dispatch start, or the in-flight \
+             request keeps the timestamp fresh and masks the wedge"
+        );
+        let status = child.wait().expect("wait child");
+        assert!(
+            !status.success(),
+            "the wedged worker must have been SIGKILLed"
         );
     }
 }
