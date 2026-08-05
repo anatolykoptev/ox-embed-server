@@ -1661,7 +1661,7 @@ mod tests {
             /*padded_model*/ true,
             /*wait_ms*/ 50,
             /*max_queue*/ 16,
-        );
+        ));
 
         // Seed the batch with a 10-token item, then offer a 100-token one
         // inside the same wait window: 100 > 10 * 2.0, so the ratio gate must
@@ -1682,9 +1682,8 @@ mod tests {
             Some(1.0),
             "gauge must read 1 when the gate is on:\n{text}"
         );
-        let carried = format!(
-            "embed_batch_seq_capped_total{{model=\"{name}\",reason=\"length_ratio\"}}"
-        );
+        let carried =
+            format!("embed_batch_seq_capped_total{{model=\"{name}\",reason=\"length_ratio\"}}");
         let n = read_series(&text, &carried).unwrap_or(0.0);
         assert!(
             n >= 1.0,
