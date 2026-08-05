@@ -2276,3 +2276,380 @@ mod tests {
         assert_eq!(parse_ready_probe_timeout(Some("")), 2000);
     }
 }
+
+// ── config-reachability detector (issue #167) ───────────────────────────────
+//
+// Three times a `Config` field was parsed, range-validated, published to a
+// gauge — and then discarded at the call site, so the knob did nothing in
+// production. Each was found by accident, months apart:
+//
+//   1. BATCH_MAX / BATCH_MAX_TOKENS / BATCH_WAIT_MS / MAX_QUEUE_SIZE /
+//      BATCH_LENGTH_RATIO_THRESHOLD / RERANKER_BATCH_MAX — dead because
+//      `main.rs` sets `batcher: None` in the multi-process branch.
+//   2. EMBED_IDLE_EVICT_SECS — `StandaloneEmbedder::load` passed a literal `0`.
+//   3. AUTO_TRUNCATE — the same function passed a literal `false`.
+//
+// All three took `&cfg` as a parameter and ignored the field. Production runs
+// `EMBED_MULTI_PROCESS=1`, so the worker path (`StandaloneEmbedder::load` →
+// `EmbedModel::load`) is the one that matters.
+//
+// This module is a self-checking detector for that bug class. It derives the
+// ground-truth field set from `struct Config` itself (parsed with `syn`), then
+// enforces two invariants:
+//
+//   INV-1 (orphan knob) — every `pub` field of `Config` must be read as
+//     `<receiver>.<field>` somewhere under `src/`. A field that only appears
+//     in the `Config::from_env` struct literal (parsed but never consumed) is
+//     an orphan. This is what catches a brand-new field that nobody wired up —
+//     without a hand-maintained allowlist, which is the whole failure mode (a
+//     list cannot detect a field missing from itself).
+//
+//   INV-2 (worker-path discard) — `EmbedModel::load` takes several scalar
+//     parameters whose names match `Config` fields (`auto_truncate`,
+//     `idle_evict_secs`, …). `StandaloneEmbedder::load` receives `&cfg`, so
+//     every such parameter that is NOT already a parameter of
+//     `StandaloneEmbedder::load` itself MUST be passed as `cfg.<field>` — not
+//     a literal. Passing a literal is the exact regression that shipped for
+//     `auto_truncate` and `idle_evict_secs`.
+//
+// What this detector FAILS to catch (documented limits):
+//   - Fields read through an aliased receiver (`let c = &cfg; c.field`) — the
+//     scan keys on the identifier `cfg`. This codebase uses `cfg.` uniformly,
+//     so the limit is theoretical; a future alias would need a type-aware
+//     analysis (clippy/flow) this AST walk is not.
+//   - Fields consumed only through a getter method / trait — not present here.
+//   - Rerank and SPLADE worker paths (`StandaloneReranker::load`,
+//     `StandaloneSplade::load`) — follow-up, noted not built. INV-1 still
+//     covers them for orphan detection; INV-2 is embed-only.
+//   - A field whose value flows into `EmbedModel::load` correctly but is then
+//     ignored INSIDE `EmbedModel::load` — that is a deeper invariant, out of
+//     scope; this detector guards the call-site plumbing, not the callee body.
+#[cfg(test)]
+mod config_reachability {
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+
+    use proc_macro2::{TokenStream, TokenTree};
+    use syn::visit::{self, Visit};
+    use syn::{
+        Expr, ExprCall, ExprField, ExprLit, File, FnArg, ImplItem, ImplItemFn, Item, Macro, Member,
+        Pat, Type, Visibility,
+    };
+
+    /// Crate `src/` directory, resolved from the compile-time manifest path so
+    /// the test works regardless of the runtime working directory.
+    fn src_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+    }
+
+    fn parse_rel(rel: &str) -> File {
+        let text = std::fs::read_to_string(src_dir().join(rel))
+            .unwrap_or_else(|e| panic!("read src/{rel}: {e}"));
+        syn::parse_file(&text).unwrap_or_else(|e| panic!("parse src/{rel}: {e}"))
+    }
+
+    /// True iff `self_ty` is a plain path type whose final segment is `name`
+    /// (matches both `impl EmbedModel` and `impl Drop for EmbedModel`).
+    fn type_is(self_ty: &Type, name: &str) -> bool {
+        match self_ty {
+            Type::Path(tp) => tp
+                .path
+                .segments
+                .last()
+                .map(|s| s.ident == name)
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+
+    /// Names of the typed (non-`self`) parameters of a method signature.
+    fn sig_param_names(sig: &syn::Signature) -> Vec<String> {
+        sig.inputs
+            .iter()
+            .filter_map(|a| match a {
+                FnArg::Typed(t) => match &*t.pat {
+                    Pat::Ident(pi) => Some(pi.ident.to_string()),
+                    _ => None,
+                },
+                FnArg::Receiver(_) => None,
+            })
+            .collect()
+    }
+
+    /// The `fn` named `method` inside any `impl <type_name>` block.
+    fn find_impl_fn<'a>(file: &'a File, type_name: &str, method: &str) -> &'a ImplItemFn {
+        for item in &file.items {
+            if let Item::Impl(i) = item
+                && type_is(&i.self_ty, type_name)
+            {
+                for ii in &i.items {
+                    if let ImplItem::Fn(f) = ii
+                        && f.sig.ident == method
+                    {
+                        return f;
+                    }
+                }
+            }
+        }
+        panic!("fn `{method}` not found in any `impl {type_name}`");
+    }
+
+    /// All `pub` named fields of `struct Config` in `src/config.rs`.
+    /// This is the ground truth — derived from the struct, not hand-maintained.
+    fn config_field_names() -> Vec<String> {
+        let file = parse_rel("config.rs");
+        for item in &file.items {
+            if let Item::Struct(s) = item
+                && s.ident == "Config"
+            {
+                return s
+                    .fields
+                    .iter()
+                    .filter_map(|f| {
+                        let is_pub = matches!(f.vis, Visibility::Public(_));
+                        // Skip tuple/unnamed fields — Config has none, but
+                        // stay robust if one is ever added.
+                        is_pub
+                            .then_some(())
+                            .and(f.ident.as_ref())
+                            .map(|i| i.to_string())
+                    })
+                    .collect();
+            }
+        }
+        panic!("struct Config not found in src/config.rs");
+    }
+
+    /// Visitor collecting every `<receiver>.<field>` member access where the
+    /// receiver is the single identifier `cfg` (no leading `::`). This is the
+    /// set of Config fields actually *read* by application code. The
+    /// `Config::from_env` struct literal uses field-init syntax (not a member
+    /// access), so construction does not count as a read — exactly what we
+    /// want: a field parsed but never consumed is invisible here.
+    ///
+    /// Macro bodies (`format!`, `tracing::info!`, …) are opaque to the AST
+    /// visitor, so `cfg.port` inside `format!("…", cfg.port)` would be missed.
+    /// `visit_macro` therefore scans each macro's token stream at the token
+    /// level for the `cfg . <ident>` pattern, recursing into nested groups.
+    struct CfgReads {
+        reads: HashSet<String>,
+    }
+
+    /// Scan a token stream for `cfg . <ident>` member accesses, recursing into
+    /// nested groups (e.g. `format!("{}", inner!(cfg.x))`).
+    fn scan_tokens(ts: &TokenStream, reads: &mut HashSet<String>) {
+        let mut iter = ts.clone().into_iter().peekable();
+        while let Some(tt) = iter.next() {
+            match tt {
+                TokenTree::Ident(ident) if ident == "cfg" => {
+                    if matches!(iter.peek(), Some(TokenTree::Punct(p)) if p.as_char() == '.') {
+                        iter.next(); // consume '.'
+                        if let Some(TokenTree::Ident(field)) = iter.peek() {
+                            reads.insert(field.to_string());
+                            let _ = iter.next(); // consume the field ident
+                        }
+                    }
+                }
+                TokenTree::Group(g) => scan_tokens(&g.stream(), reads),
+                _ => {}
+            }
+        }
+    }
+
+    impl<'ast> Visit<'ast> for CfgReads {
+        fn visit_expr_field(&mut self, i: &'ast ExprField) {
+            if let Expr::Path(ep) = &*i.base
+                && ep.path.leading_colon.is_none()
+                && ep.path.segments.len() == 1
+                && ep.path.segments[0].ident == "cfg"
+                && let Member::Named(m) = &i.member
+            {
+                self.reads.insert(m.to_string());
+            }
+            visit::visit_expr_field(self, i);
+        }
+
+        fn visit_macro(&mut self, i: &'ast Macro) {
+            scan_tokens(&i.tokens, &mut self.reads);
+            visit::visit_macro(self, i);
+        }
+    }
+
+    /// Walk every `.rs` file under `src/` and collect the union of `cfg.<field>`
+    /// reads. Files that fail to parse (e.g. generated/proc-macro output) are
+    /// skipped rather than fatal — a parse failure here must not mask a real
+    /// orphan.
+    fn all_cfg_reads() -> HashSet<String> {
+        let mut reads = HashSet::new();
+        walk_rs(&src_dir(), &mut reads);
+        reads
+    }
+
+    fn walk_rs(dir: &Path, reads: &mut HashSet<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk_rs(&path, reads);
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && let Ok(text) = std::fs::read_to_string(&path)
+                && let Ok(file) = syn::parse_file(&text)
+            {
+                let mut v = CfgReads {
+                    reads: HashSet::new(),
+                };
+                v.visit_file(&file);
+                reads.extend(v.reads);
+            }
+        }
+    }
+
+    /// Visitor collecting every `EmbedModel::load(...)` call's argument
+    /// expressions, scoped to the function body it is run over.
+    struct LoadCalls<'a> {
+        calls: Vec<Vec<&'a Expr>>,
+    }
+
+    impl<'ast> Visit<'ast> for LoadCalls<'ast> {
+        fn visit_expr_call(&mut self, i: &'ast ExprCall) {
+            if let Expr::Path(ep) = &*i.func {
+                let segs: Vec<String> = ep
+                    .path
+                    .segments
+                    .iter()
+                    .map(|s| s.ident.to_string())
+                    .collect();
+                if segs.as_slice() == ["EmbedModel", "load"] {
+                    self.calls.push(i.args.iter().collect());
+                }
+            }
+            visit::visit_expr_call(self, i);
+        }
+    }
+
+    /// True iff `arg` is the member access `cfg.<field>`.
+    fn is_cfg_field_access(arg: &Expr, field: &str) -> bool {
+        if let Expr::Field(ef) = arg
+            && let Expr::Path(ep) = &*ef.base
+            && ep.path.leading_colon.is_none()
+            && ep.path.segments.len() == 1
+            && ep.path.segments[0].ident == "cfg"
+            && let Member::Named(m) = &ef.member
+        {
+            return m == field;
+        }
+        false
+    }
+
+    /// Render an argument expression for the failure message: name it for what
+    /// it is (literal / cfg-field / other) so the regression is obvious.
+    fn describe_arg(arg: &Expr) -> String {
+        match arg {
+            Expr::Lit(ExprLit { lit, .. }) => format!("literal `{:?}`", lit),
+            Expr::Field(ef) => {
+                if let Expr::Path(ep) = &*ef.base
+                    && ep.path.segments.len() == 1
+                    && let Member::Named(m) = &ef.member
+                {
+                    return format!("{}.{m}", ep.path.segments[0].ident);
+                }
+                "field access".to_string()
+            }
+            other => format!("{:?}", other),
+        }
+    }
+
+    /// The set of `EmbedModel::load` parameters that MUST be forwarded from
+    /// `cfg` by `StandaloneEmbedder::load`: a parameter is in this set when its
+    /// name matches a `Config` field AND it is not already a parameter of
+    /// `StandaloneEmbedder::load` (the latter are sourced separately on the
+    /// worker, e.g. `intra_threads` comes from `EMBED_WORKER_INTRA_THREADS`).
+    fn must_flow_from_cfg(
+        embed_params: &[String],
+        standalone_params: &[String],
+        config_fields: &HashSet<String>,
+    ) -> Vec<String> {
+        let standalone: HashSet<&str> = standalone_params.iter().map(|s| s.as_str()).collect();
+        embed_params
+            .iter()
+            .filter(|p| config_fields.contains(p.as_str()) && !standalone.contains(p.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn every_config_field_is_read_somewhere() {
+        // INV-1: no orphan knobs. A field present in `struct Config` but never
+        // read as `cfg.<field>` anywhere under `src/` was parsed and then
+        // discarded — the bug class. This is what catches a brand-new field
+        // that nobody told the detector about.
+        let fields = config_field_names();
+        let reads = all_cfg_reads();
+        let orphan: Vec<&String> = fields
+            .iter()
+            .filter(|f| !reads.contains(f.as_str()))
+            .collect();
+        assert!(
+            orphan.is_empty(),
+            "Config fields with no `cfg.<field>` read anywhere under src/: {orphan:?}.\n\
+             A field parsed in `Config::from_env` but never consumed is a dead knob —\n\
+             the exact bug class of issue #167. Either wire the field into a consumer\n\
+             or remove it from `Config`."
+        );
+    }
+
+    #[test]
+    fn standalone_embedder_load_forwards_cfg_fields_to_embed_model_load() {
+        // INV-2: the worker-path discard regression. `StandaloneEmbedder::load`
+        // takes `&cfg` and calls `EmbedModel::load`; any `EmbedModel::load`
+        // parameter named like a `Config` field (and not already a parameter of
+        // `StandaloneEmbedder::load`) must be forwarded as `cfg.<field>`, not a
+        // literal. Passing `false`/`0` here is what shipped for `auto_truncate`
+        // and `idle_evict_secs`.
+        let model = parse_rel("model.rs");
+        let embed_load = find_impl_fn(&model, "EmbedModel", "load");
+        let standalone_load = find_impl_fn(&model, "StandaloneEmbedder", "load");
+
+        let embed_params = sig_param_names(&embed_load.sig);
+        let standalone_params = sig_param_names(&standalone_load.sig);
+        let config_fields: HashSet<String> = config_field_names().into_iter().collect();
+        let must_flow = must_flow_from_cfg(&embed_params, &standalone_params, &config_fields);
+
+        // Collect the `EmbedModel::load(...)` call(s) inside the worker loader.
+        let mut visitor = LoadCalls { calls: Vec::new() };
+        visitor.visit_block(&standalone_load.block);
+        assert_eq!(
+            visitor.calls.len(),
+            1,
+            "expected exactly one `EmbedModel::load` call inside \
+             `StandaloneEmbedder::load`, found {}",
+            visitor.calls.len()
+        );
+        let call_args = &visitor.calls[0];
+
+        for (i, param) in embed_params.iter().enumerate() {
+            if !must_flow.contains(param) {
+                continue;
+            }
+            let arg = call_args.get(i).unwrap_or_else(|| {
+                panic!(
+                    "`EmbedModel::load` call has {} args but parameter `{param}` is at \
+                     position {i}",
+                    call_args.len()
+                );
+            });
+            assert!(
+                is_cfg_field_access(arg, param),
+                "`StandaloneEmbedder::load` passes {} for `EmbedModel::load` parameter \
+                 `{param}` (arg position {i}); expected `cfg.{param}`.\n\
+                 The `Config` field `{param}` is parsed but discarded on the worker path —\n\
+                 the dead-knob bug class (issue #167). Production runs \
+                 `EMBED_MULTI_PROCESS=1`, so the worker loader is the only call site that\n\
+                 matters. Forward `cfg.{param}` instead of a literal.",
+                describe_arg(arg)
+            );
+        }
+    }
+}
