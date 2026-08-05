@@ -58,6 +58,11 @@ pub fn apply_histogram_buckets(builder: PrometheusBuilder) -> PrometheusBuilder 
     // (median > 0.4 → length-bucketing payoff per Phase 3C plan).
     let waste_matcher =
         metrics_exporter_prometheus::Matcher::Suffix("padding_waste_ratio".to_string());
+    // Sub-batches per embed request (#136). Without an explicit matcher this
+    // renders as a summary, whose per-instance quantiles cannot be aggregated
+    // across workers — and every worker is its own process here.
+    let subbatch_groups_matcher =
+        metrics_exporter_prometheus::Matcher::Full("embed_subbatch_groups".to_string());
     // Token count per batcher batch: [batch_size × max_seq_len] (padded-model formula).
     // Max for e5-large: 8 × 256 = 2048; for jina: 8 × 512 = 4096; BATCH_MAX_TOKENS cap = 8192.
     let batch_tokens_matcher =
@@ -122,6 +127,14 @@ pub fn apply_histogram_buckets(builder: PrometheusBuilder) -> PrometheusBuilder 
             &[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
         )
         .expect("set padding waste buckets")
+        .set_buckets_for_metric(
+            subbatch_groups_matcher,
+            // Small integers: 1 means no split happened, and that bucket is
+            // the one an operator reads first. Ceiling matches BATCH_MAX=32,
+            // the most groups a request can produce (every text alone).
+            &[1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 32.0],
+        )
+        .expect("set subbatch group buckets")
         .set_buckets_for_metric(
             batch_tokens_matcher,
             &[128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0, 16384.0],
@@ -1646,6 +1659,79 @@ mod bucket_ladder_tests {
             DURATION_BUCKETS.windows(2).all(|w| w[0] < w[1]),
             "bucket edges must be strictly increasing"
         );
+    }
+}
+
+#[cfg(test)]
+mod subbatch_metric_tests {
+    use super::{record_subbatch_groups, set_subbatch_ratio, test_prometheus_handle};
+
+    fn series(rendered: &str, needle: &str) -> Option<f64> {
+        rendered
+            .lines()
+            .find_map(|l| l.strip_prefix(needle))
+            .and_then(|rest| rest.trim().parse::<f64>().ok())
+    }
+
+    /// Both sub-batch metrics must actually reach the registry.
+    ///
+    /// cargo-mutants found the gap this closes: replacing either function
+    /// body with `()` left the whole suite green, so the emission was
+    /// unguarded — the same class as `record_carry_lost` and the #158 gauges.
+    ///
+    /// These guard the emission HELPERS, not their call sites. Both call
+    /// sites live in `EmbedModel` and need a loaded ONNX session, so no unit
+    /// test can reach them; the integration suite covers that path. Said
+    /// plainly so nobody reads this as end-to-end coverage.
+    ///
+    /// Model names are unique per assertion because the Prometheus recorder
+    /// is process-wide and shared with every other test in this binary.
+    #[test]
+    fn subbatch_group_count_reaches_the_registry() {
+        let handle = test_prometheus_handle();
+        record_subbatch_groups("t_subbatch_groups", 3);
+        record_subbatch_groups("t_subbatch_groups", 5);
+
+        let rendered = handle.render();
+        let count = series(
+            &rendered,
+            "embed_subbatch_groups_count{model=\"t_subbatch_groups\"}",
+        )
+        .expect("embed_subbatch_groups must be emitted");
+        assert_eq!(count, 2.0, "both observations must be recorded");
+
+        let sum = series(
+            &rendered,
+            "embed_subbatch_groups_sum{model=\"t_subbatch_groups\"}",
+        )
+        .expect("sum series must exist");
+        // Kills a mutant that records a constant instead of the argument.
+        assert_eq!(sum, 8.0, "sum must carry the observed group counts");
+    }
+
+    /// The configured ratio must be readable off `/metrics`, including its
+    /// value — a gauge stuck at 0 would misreport an enabled split as
+    /// disabled, which is exactly the ambiguity this gauge exists to remove.
+    #[test]
+    fn subbatch_ratio_gauge_carries_the_configured_value() {
+        let handle = test_prometheus_handle();
+        set_subbatch_ratio("t_subbatch_ratio", 2.0);
+        let v = series(
+            &handle.render(),
+            "embed_subbatch_ratio{model=\"t_subbatch_ratio\"}",
+        )
+        .expect("embed_subbatch_ratio must be emitted");
+        assert_eq!(v, 2.0);
+
+        // A gauge, not a counter: the disabled state must be representable
+        // and must overwrite, not accumulate.
+        set_subbatch_ratio("t_subbatch_ratio", 0.0);
+        let v = series(
+            &handle.render(),
+            "embed_subbatch_ratio{model=\"t_subbatch_ratio\"}",
+        )
+        .expect("gauge must still be present after being set to 0");
+        assert_eq!(v, 0.0, "disabled must render 0, not the previous value");
     }
 }
 
