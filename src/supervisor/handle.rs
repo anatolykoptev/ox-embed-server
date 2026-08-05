@@ -817,6 +817,25 @@ impl WorkerSupervisor {
             heartbeat_probe_timeout: Duration::from_millis(100),
         })
     }
+
+    /// Test-only: create a supervisor with NO live client — `client()`
+    /// always returns `None`, simulating a worker mid-respawn. Used by
+    /// the #150 tests to drive `WorkerPool::dispatch_*` into
+    /// `DispatchError::Timeout` without spawning a real child process.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn for_test_no_client(spec: SpawnSpec) -> Arc<Self> {
+        Arc::new(Self {
+            spec,
+            client_slot: Arc::new(RwLock::new(None)),
+            restart_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            socket_wait: Duration::from_secs(60),
+            current_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            heartbeat_interval: Duration::ZERO,
+            heartbeat_max_fails: 3,
+            heartbeat_probe_timeout: Duration::from_millis(100),
+        })
+    }
 }
 
 #[cfg(test)]

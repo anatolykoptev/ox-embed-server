@@ -398,7 +398,7 @@ pub async fn rerank(
     // hygienic and only exists in this fn's scope.
     #[allow(unused_macros)]
     macro_rules! finish {
-        ($status:literal, $resp:expr) => {{
+        ($status:expr, $resp:expr) => {{
             metrics::record_rerank_request(
                 &model_name,
                 $status,
@@ -464,22 +464,28 @@ pub async fn rerank(
             Err(e) => {
                 use crate::supervisor::pool::DispatchError;
                 tracing::error!(model = %model_name, error = ?e, "worker_pool rerank dispatch failed");
-                // #97: dispatch timeout → 503 + Retry-After (transient).
-                let resp = match &e {
+                // #97 / #150: dispatch timeout → 503 + Retry-After (transient).
+                // Distinct status label + error_type from the 500 path so
+                // operators and clients can tell respawn from hard failure
+                // and from 429 backpressure.
+                let (label, resp) = match &e {
                     DispatchError::Timeout { .. } => (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        [("retry-after", "1")],
-                        Json(ErrorResponse {
-                            error: ErrorDetail {
-                                message: "rerank failed: worker respawning".to_string(),
-                                error_type: "rate_limited",
-                            },
-                        }),
-                    )
-                        .into_response(),
-                    _ => server_error("rerank failed".to_string()),
+                        "worker_unavailable",
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            [("retry-after", "5")],
+                            Json(ErrorResponse {
+                                error: ErrorDetail {
+                                    message: "rerank failed: worker respawning".to_string(),
+                                    error_type: "worker_unavailable",
+                                },
+                            }),
+                        )
+                            .into_response(),
+                    ),
+                    _ => ("server_error", server_error("rerank failed".to_string())),
                 };
-                finish!("server_error", resp);
+                finish!(label, resp);
             }
         }
     }
@@ -1193,6 +1199,105 @@ mod tests {
             metrics_text.contains("embed_rerank_input_docs_size"),
             "embed_rerank_input_docs_size histogram must appear in /metrics output \
              for both accepted and rejected requests"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // #150 — F2: the rerank 503 worker-respawn path must emit a `status`
+    // label on `embed_rerank_requests_total` DISTINCT from the 500 path's
+    // `"server_error"`. The rerank handler hardcoded `finish!("server_error",
+    // resp)` for BOTH the 500 and 503 branches — this test catches that.
+    // -----------------------------------------------------------------
+
+    use crate::supervisor::{SpawnSpec, WorkerKind, WorkerPool, WorkerSupervisor};
+    use std::path::PathBuf;
+
+    /// Build an AppState wired for the rerank 503 worker-respawn path: a
+    /// `WorkerPool` with a no-client supervisor + 1 ms timeout, and a
+    /// metadata-only `RerankerEntry` (multi-process shape).
+    async fn make_state_rerank_worker_respawning() -> Arc<AppState> {
+        let spec = SpawnSpec {
+            model: "test-reranker".to_string(),
+            kind: WorkerKind::Rerank,
+            worker_bin: PathBuf::from("/bin/true"),
+            socket_dir: PathBuf::from("/tmp"),
+            pool_size: 1,
+            intra_threads: 1,
+            env_extra: vec![],
+        };
+        let sup = WorkerSupervisor::for_test_no_client(spec);
+        let pool = WorkerPool::with_dispatch_timeout(std::time::Duration::from_millis(1));
+        pool.add(sup).await;
+        Arc::new(AppState {
+            models: HashMap::new(),
+            rerankers: HashMap::from([(
+                "test-reranker".to_string(),
+                crate::types::RerankerEntry {
+                    model: None,
+                    batcher: None,
+                },
+            )]),
+            splades: HashMap::new(),
+            default_model: "test-model".to_string(),
+            shutdown: CancellationToken::new(),
+            drain_timeout: Duration::from_secs(5),
+            cache: Arc::new(EmbeddingCache::new(0)),
+            token_cache: Arc::new(TokenCache::new(0)),
+            rerank_semaphore: None,
+            embed_max_input_array: 32,
+            rerank_max_input_docs: 32,
+            worker_pool: Some(Arc::new(pool)),
+            ready_probe_timeout_ms: 2000,
+        })
+    }
+
+    /// Build a POST /v1/rerank request targeting `test-reranker`.
+    fn make_rerank_request_named() -> Request<Body> {
+        let body = serde_json::json!({
+            "model": "test-reranker",
+            "query": "test query",
+            "documents": ["doc 0"]
+        });
+        Request::builder()
+            .method("POST")
+            .uri("/v1/rerank")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// F2 — the rerank 503 worker-respawn path must emit a `status` label
+    /// on `embed_rerank_requests_total` DISTINCT from the 500 path's
+    /// `"server_error"`. Reverting the 503 branch's `finish!` back to
+    /// `"server_error"` makes this test RED.
+    #[tokio::test]
+    async fn f2_rerank_503_status_label_distinct_from_500() {
+        let handle = test_prom();
+        let state = make_state_rerank_worker_respawning().await;
+        let app = make_app(state);
+
+        let resp = app.oneshot(make_rerank_request_named()).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "rerank worker-respawn path must return HTTP 503"
+        );
+
+        let metrics_text = handle.render();
+        // Anchored line check on embed_rerank_requests_total.
+        let has_503_label = metrics_text.lines().any(|line| {
+            line.starts_with("embed_rerank_requests_total{")
+                && line.contains("status=\"worker_unavailable\"")
+                && line
+                    .rsplit('}')
+                    .next()
+                    .map(|s| s.trim().parse::<u64>().is_ok())
+                    == Some(true)
+        });
+        assert!(
+            has_503_label,
+            "rerank metrics must contain a distinct `worker_unavailable` status line for the 503 path; \
+             got:\n{metrics_text}"
         );
     }
 }

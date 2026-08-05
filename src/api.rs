@@ -254,32 +254,51 @@ pub async fn embeddings(
             Err(e) => {
                 use crate::supervisor::pool::DispatchError;
                 tracing::error!(model = %model_name, error = ?e, "worker_pool dispatch failed");
-                crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
-                // #97: dispatch timeout (worker respawning) is transient →
+                // #97 / #150: dispatch timeout (worker respawning) is transient →
                 // 503 + Retry-After so clients retry instead of treating it
-                // as a hard 500 failure.
+                // as a hard 500 failure. The status label and error_type are
+                // DISTINCT from the 500 path so operators and clients can
+                // tell "worker respawning, retry in 5s" apart from "request
+                // broken" and from 429 backpressure ("slow down, retry in 1s").
                 return match &e {
-                    DispatchError::Timeout { .. } => (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        [("retry-after", "1")],
-                        Json(ErrorResponse {
-                            error: ErrorDetail {
-                                message: "inference failed: worker respawning".to_string(),
-                                error_type: "rate_limited",
-                            },
-                        }),
-                    )
-                        .into_response(),
-                    _ => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ErrorResponse {
-                            error: ErrorDetail {
-                                message: "inference failed".to_string(),
-                                error_type: "server_error",
-                            },
-                        }),
-                    )
-                        .into_response(),
+                    DispatchError::Timeout { .. } => {
+                        status = "worker_unavailable";
+                        crate::metrics::record_request(
+                            &model_name,
+                            status,
+                            t0.elapsed(),
+                            texts_count,
+                        );
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            [("retry-after", "5")],
+                            Json(ErrorResponse {
+                                error: ErrorDetail {
+                                    message: "inference failed: worker respawning".to_string(),
+                                    error_type: "worker_unavailable",
+                                },
+                            }),
+                        )
+                            .into_response()
+                    }
+                    _ => {
+                        crate::metrics::record_request(
+                            &model_name,
+                            status,
+                            t0.elapsed(),
+                            texts_count,
+                        );
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ErrorResponse {
+                                error: ErrorDetail {
+                                    message: "inference failed".to_string(),
+                                    error_type: "server_error",
+                                },
+                            }),
+                        )
+                            .into_response()
+                    }
                 };
             }
         };
@@ -918,6 +937,158 @@ mod tests {
             metrics_text.contains("embed_input_array_size"),
             "embed_input_array_size histogram must appear in /metrics output \
              for both accepted and rejected requests"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // #150 — 503 worker-respawn must be distinguishable from 500 in BOTH
+    // the `embed_requests_total{status}` metric label AND the client-facing
+    // `error_type` field. The 429 queue-full path keeps `error_type=
+    // "rate_limited"`; the 503 worker-respawn path gets a distinct value.
+    //
+    // These tests drive the REAL handler through axum with a WorkerPool
+    // whose supervisor has no live client (`for_test_no_client`) and a
+    // 1 ms dispatch timeout, so `dispatch_embed` returns
+    // `DispatchError::Timeout` → the 503 branch fires end-to-end.
+    // ------------------------------------------------------------------
+
+    use crate::supervisor::{SpawnSpec, WorkerKind, WorkerPool, WorkerSupervisor};
+    use std::path::PathBuf;
+
+    /// Build an AppState wired for the 503 worker-respawn path: a
+    /// `WorkerPool` with a no-client supervisor + 1 ms timeout, and a
+    /// metadata-only `ModelEntry` (multi-process shape: `model: None`).
+    async fn make_state_worker_respawning() -> Arc<AppState> {
+        let spec = SpawnSpec {
+            model: "test-model".to_string(),
+            kind: WorkerKind::Embed,
+            worker_bin: PathBuf::from("/bin/true"),
+            socket_dir: PathBuf::from("/tmp"),
+            pool_size: 1,
+            intra_threads: 1,
+            env_extra: vec![],
+        };
+        let sup = WorkerSupervisor::for_test_no_client(spec);
+        let pool = WorkerPool::with_dispatch_timeout(std::time::Duration::from_millis(1));
+        pool.add(sup).await;
+        Arc::new(AppState {
+            models: HashMap::from([(
+                "test-model".to_string(),
+                crate::types::ModelEntry {
+                    model: None,
+                    batcher: None,
+                },
+            )]),
+            rerankers: HashMap::new(),
+            splades: HashMap::new(),
+            default_model: "test-model".to_string(),
+            shutdown: CancellationToken::new(),
+            drain_timeout: Duration::from_secs(5),
+            cache: Arc::new(EmbeddingCache::new(0)),
+            token_cache: Arc::new(crate::token_cache::TokenCache::new(0)),
+            rerank_semaphore: None,
+            embed_max_input_array: 32,
+            rerank_max_input_docs: 32,
+            worker_pool: Some(Arc::new(pool)),
+            ready_probe_timeout_ms: 2000,
+        })
+    }
+
+    /// F1 — the 503 worker-respawn path must emit a `status` label on
+    /// `embed_requests_total` that is DISTINCT from the 500 path's
+    /// `"server_error"`. Reverting the 503 branch's status back to
+    /// `"server_error"` makes this test RED (the regex matches the 500
+    /// line, not a distinct 503 line).
+    ///
+    /// Anchored regex on the rendered /metrics text — a substring check
+    /// would go green on broken structured output (the defect that
+    /// shipped a blocker on this fleet before).
+    #[tokio::test]
+    async fn f1_embed_503_status_label_distinct_from_500() {
+        let handle = test_prom();
+        let state = make_state_worker_respawning().await;
+        let app = make_app(state);
+
+        // Send a request that reaches the worker-pool path. The 1 ms
+        // dispatch timeout against a no-client supervisor fires
+        // DispatchError::Timeout → the 503 branch.
+        let resp = app.oneshot(make_request(1)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "worker-respawn path must return HTTP 503"
+        );
+
+        let metrics_text = handle.render();
+        // Anchored line check: a line starting with `embed_requests_total{`
+        // that carries `status="worker_unavailable"` and ends with a number.
+        // A substring check would go green on broken structured output (the
+        // defect that shipped a blocker on this fleet before).
+        let has_503_label = metrics_text.lines().any(|line| {
+            line.starts_with("embed_requests_total{")
+                && line.contains("status=\"worker_unavailable\"")
+                && line
+                    .rsplit('}')
+                    .next()
+                    .map(|s| s.trim().parse::<u64>().is_ok())
+                    == Some(true)
+        });
+        assert!(
+            has_503_label,
+            "metrics must contain a distinct `worker_unavailable` status line for the 503 path; \
+             got:\n{metrics_text}"
+        );
+        // The 500 path must NOT carry this label — proves the two paths
+        // emit distinct status values.
+        let has_500_with_same_label = metrics_text.lines().any(|line| {
+            line.starts_with("embed_requests_total{")
+                && line.contains("status=\"server_error\"")
+                && line.contains("worker_unavailable")
+        });
+        assert!(
+            !has_500_with_same_label,
+            "500 and 503 paths must not share the same status label"
+        );
+    }
+
+    /// F3 — the 503 worker-respawn path must carry an `error_type` value
+    /// DISTINCT from the 429 queue-full path's `"rate_limited"`. Reverting
+    /// the 503 branch's `error_type` back to `"rate_limited"` makes this
+    /// test RED (the assertion expects a different value).
+    #[tokio::test]
+    async fn f3_embed_503_error_type_distinct_from_429() {
+        let state = make_state_worker_respawning().await;
+        let app = make_app(state);
+
+        let resp = app.oneshot(make_request(1)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // Capture Retry-Before before consuming the body.
+        let retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body_bytes).unwrap();
+        // ErrorDetail serializes `error_type` as `"type"` (OpenAI shape).
+        let et = json["error"]["type"].as_str().unwrap_or("");
+        assert_ne!(
+            et, "rate_limited",
+            "503 worker-respawn must NOT reuse the 429 queue-full error_type"
+        );
+        assert!(
+            !et.is_empty(),
+            "503 worker-respawn must carry a non-empty error_type"
+        );
+        // Retry-After should differ from the 429's "1" — a respawn wants a
+        // longer backoff than backpressure.
+        assert_ne!(
+            retry_after, "1",
+            "503 worker-respawn Retry-After should differ from the 429 backpressure hint"
         );
     }
 }
