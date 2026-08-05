@@ -365,28 +365,45 @@ impl<T> std::ops::DerefMut for EvictableGuard<T> {
 
 impl<T> Drop for EvictableGuard<T> {
     fn drop(&mut self) {
-        if let Some(item) = self.item.take() {
-            let now = unix_now_secs();
-            if let Ok(mut guard) = self.slot.item.lock() {
-                self.slot.last_used.store(now, Ordering::Relaxed);
-                *guard = Some(item);
-                // ── B1: busy.store INSIDE the MutexGuard scope ───────────────
-                // Publishing busy=false while still holding the lock eliminates the
-                // race window that existed when busy.store fired after unlock.
-                self.slot.busy.store(false, Ordering::Release);
-            } else if let Err(poisoned) = self.slot.item.lock() {
-                // Mutex poisoned — recover the inner guard (matching the
-                // `acquire()` recovery pattern at lines 139-146) so we can
-                // still return the item to the slot instead of losing it.
-                // `into_inner()` gives us the inner `Option<T>` regardless of
-                // the poison state; the item we hold is still valid.
-                let mut guard = poisoned.into_inner();
-                self.slot.last_used.store(now, Ordering::Relaxed);
-                *guard = Some(item);
-                self.slot.busy.store(false, Ordering::Release);
+        let Some(item) = self.item.take() else {
+            return;
+        };
+        let now = unix_now_secs();
+
+        // ── ONE lock() call, one arm per outcome ─────────────────────────────
+        // The previous shape was `if let Ok(..) = lock() { } else if let
+        // Err(..) = lock() { }` — two `lock()` calls on the same mutex inside
+        // `Drop`. It was deadlock-free only because edition 2024 drops the
+        // `if let` scrutinee temporary before the `else` arm runs, and that
+        // temporary is a `PoisonError<MutexGuard>` which still OWNS the guard.
+        // On edition 2021 the guard is still alive when the second `lock()`
+        // fires, so the same source self-deadlocks inside a destructor — with
+        // no compile error. `Cargo.toml` says `edition = "2024"` today; a
+        // future edition change must not be able to reintroduce that.
+        //
+        // A `match` also removes the second defect of the old shape: `if/else
+        // if` had no final `else`, so a state matching neither arm dropped the
+        // item silently — the exact loss that #137 added this recovery path to
+        // prevent. `LockResult` has exactly two variants, so every outcome is
+        // now handled by construction rather than by inspection.
+        let mut guard = match self.slot.item.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                // Recover the inner value (matching the `acquire()` recovery
+                // pattern above) so the item returns to its slot instead of
+                // being lost. `into_inner()` yields the `Option<T>` regardless
+                // of poison state; the item we hold is still valid.
                 tracing::warn!("pool mutex poisoned on guard drop — item recovered");
+                poisoned.into_inner()
             }
-        }
+        };
+
+        self.slot.last_used.store(now, Ordering::Relaxed);
+        *guard = Some(item);
+        // ── B1: busy.store INSIDE the MutexGuard scope ───────────────────────
+        // Publishing busy=false while still holding the lock eliminates the
+        // race window that existed when busy.store fired after unlock.
+        self.slot.busy.store(false, Ordering::Release);
     }
 }
 
@@ -657,6 +674,63 @@ mod tests {
             .acquire()
             .expect("slot must be reusable after recovery");
         assert_eq!(*guard2, 100u32);
+    }
+
+    // ── #152: a poisoned drop must COMPLETE, not merely recover ─────────────
+    /// `poisoned_mutex_drop_recovers_item` above asserts the item comes back,
+    /// but asserts nothing about the destructor terminating — and termination
+    /// is the property #152 is about. The shape this replaced was
+    /// `if let Ok(..) = lock() { } else if let Err(..) = lock() { }`: two
+    /// `lock()` calls on one mutex, safe only because edition 2024 drops the
+    /// `if let` scrutinee temporary — a `PoisonError<MutexGuard>` that still
+    /// owns the guard — before the `else` arm runs. On an edition that does
+    /// not, the second `lock()` blocks forever inside `Drop`.
+    ///
+    /// A deadlocked test HANGS rather than fails, and a hanging job reads as a
+    /// slow one in CI, so the completion is asserted explicitly and with a
+    /// bound. Kills: reverting the `match` to the double-`lock()` chain under
+    /// an edition where the temporary outlives the arm.
+    #[test]
+    fn poisoned_drop_completes_and_does_not_deadlock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let pool = Arc::new(EvictablePool::from_items(
+            vec![7u32],
+            0,
+            "deadlock-test",
+            Arc::new(|| Ok(7u32)),
+        ));
+
+        let guard = pool.acquire().expect("slot must be acquirable");
+
+        // Poison the mutex: hold the lock in another thread, then panic.
+        let slot = pool.slots[0].clone();
+        let h = std::thread::spawn(move || {
+            let _lock = slot.item.lock().unwrap();
+            panic!("intentional poison");
+        });
+        assert!(h.join().is_err(), "poison thread must panic");
+
+        // Run the drop on its own thread so a deadlock cannot hang the suite.
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(guard);
+            let _ = tx.send(());
+        });
+
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("Drop must complete on a poisoned mutex — it deadlocked");
+
+        // And the recovery itself still holds.
+        let slot0 = &pool.slots[0];
+        let inner = slot0.item.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(inner.is_some(), "item must be back in the slot");
+        drop(inner);
+        assert!(
+            !slot0.busy.load(AOrdering::Acquire),
+            "busy must be cleared after a poisoned drop"
+        );
     }
 
     // ── factory called outside lock (MAJOR 3 rewrite) ───────────────────────
