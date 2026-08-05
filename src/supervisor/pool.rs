@@ -74,6 +74,19 @@ impl WorkerPool {
         }
     }
 
+    /// Test-only: build a pool with an explicit `dispatch_timeout`,
+    /// bypassing the env-var resolution in [`new`]. Used by the #150
+    /// tests to force `DispatchError::Timeout` quickly (e.g. 1 ms)
+    /// against a `for_test_no_client` supervisor without waiting 30 s.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn with_dispatch_timeout(dispatch_timeout: Duration) -> Self {
+        Self {
+            workers: Arc::new(RwLock::new(HashMap::new())),
+            dispatch_timeout,
+        }
+    }
+
     pub async fn add(&self, supervisor: Arc<WorkerSupervisor>) {
         let mut w = self.workers.write().await;
         w.insert(supervisor.model().to_string(), supervisor);

@@ -202,15 +202,18 @@ pub async fn sparse_embeddings(
             Err(e) => {
                 use crate::supervisor::pool::DispatchError;
                 tracing::error!(model = %model_name, error = ?e, "worker_pool splade dispatch failed");
-                // #97: dispatch timeout → 503 + Retry-After (transient).
+                // #97 / #150: dispatch timeout → 503 + Retry-After (transient).
+                // Distinct error_type from the 429 backpressure path so clients
+                // can tell respawn from rate-limit. retry-after=5 (respawn
+                // takes 5-15s) vs the 429's 1s backpressure hint.
                 let resp = match &e {
                     DispatchError::Timeout { .. } => (
                         StatusCode::SERVICE_UNAVAILABLE,
-                        [("retry-after", "1")],
+                        [("retry-after", "5")],
                         Json(ErrorResponse {
                             error: ErrorDetail {
                                 message: "splade failed: worker respawning".to_string(),
-                                error_type: "rate_limited",
+                                error_type: "worker_unavailable",
                             },
                         }),
                     )
