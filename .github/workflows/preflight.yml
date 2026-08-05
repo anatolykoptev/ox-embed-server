@@ -181,20 +181,42 @@ jobs:
           # workflow and the nightly full run cannot disagree about what is in
           # scope. A MISSED mutant here means: you changed this line, and no
           # test in the suite notices when it is broken.
-          cargo mutants --in-diff /tmp/pr.diff --no-shuffle -j 2
+          # Not piped to tee: `$?` after a pipe is the pipe's, and this exit
+          # code is the gate. `|| rc=$?` keeps `bash -e` from aborting before
+          # the self-check below can read the log.
+          rc=0
+          cargo mutants --in-diff /tmp/pr.diff --no-shuffle -j 2 > /tmp/mutants.log 2>&1 || rc=$?
+          cat /tmp/mutants.log
 
-          # Self-check against the failure above recurring in a new form. If the
-          # PR touched a file that .cargo/mutants.toml puts IN scope, the run
-          # must have produced a report; an empty mutants.out here means the
-          # diff never reached cargo-mutants, which is indistinguishable from
-          # "all mutants caught" in the exit code alone.
+          # Self-check against the failure above recurring in a new form: if the
+          # PR touched a file that .cargo/mutants.toml puts IN scope, then
+          # cargo-mutants must have RUN. What proves it ran is the enumeration
+          # line, which it prints whenever it reached the diff — including for
+          # zero:
+          #
+          #     Found 0 mutants to test
+          #
+          # It is NOT `mutants.out/outcomes.json`. That file is only written
+          # when there is at least one mutant, so requiring it failed PR #164,
+          # where the in-scope files (`supervisor/handle.rs`, `supervisor/pool.rs`)
+          # changed only by gaining a #[cfg(test)] seam and the production edits
+          # landed in `api*.rs`, which is out of scope. Nothing to mutate is a
+          # legitimate outcome; never having run is not, and only the second is
+          # the false-green this check exists to catch.
           if git diff --name-only "${BASE}...HEAD" -- src \
                | grep -qE '^src/(api_health|batcher|cache|cache_flow|config|evictable_pool|metrics|pool|token_cache|types|worker_waiters)\.rs$|^src/(ipc|supervisor)/.*\.rs$'; then
-            test -s mutants.out/outcomes.json || {
-              echo "::error::This PR changes a file that is in the mutation scope, but cargo-mutants produced no outcomes.json. The gate did not run — do not read this job's green as test-quality evidence."
+            if ! grep -qE '^Found [0-9]+ mutants to test' /tmp/mutants.log; then
+              echo "::error::This PR changes a file in the mutation scope, but cargo-mutants never reported a mutant count. The gate did not run — do not read this job's green as test-quality evidence."
               exit 1
-            }
+            fi
+            # Ran, but had nothing in scope to break. Say so out loud: a silent
+            # pass here reads as "test quality verified", and it is not.
+            if grep -qE '^Found 0 mutants to test' /tmp/mutants.log; then
+              echo "::notice::cargo-mutants ran and found 0 mutants in the changed lines. The in-scope files changed only outside mutable production code (test seams, comments, signatures). This job is NOT test-quality evidence for this PR."
+            fi
           fi
+
+          exit "$rc"
 
       - name: Upload mutants report
         if: always() && github.event_name == 'pull_request'
