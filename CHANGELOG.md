@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/anatolykoptev/ox-embed-server/compare/embed-server-v0.8.0...embed-server-v0.8.1) (2026-08-05)
+
+
+### Bug Fixes
+
+* **mutants:** correct the scope config and the Makefile pathspec ([#154](https://github.com/anatolykoptev/ox-embed-server/issues/154)) ([6e1ee7a](https://github.com/anatolykoptev/ox-embed-server/commit/6e1ee7a989e65cc5cfaab0999b9499c1a82c551c))
+
 ## [0.8.0](https://github.com/anatolykoptev/ox-embed-server/compare/embed-server-v0.7.0...embed-server-v0.8.0) (2026-08-04)
 
 
