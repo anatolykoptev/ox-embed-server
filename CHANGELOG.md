@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.4](https://github.com/anatolykoptev/ox-embed-server/compare/embed-server-v0.8.3...embed-server-v0.8.4) (2026-08-05)
+
+
+### Bug Fixes
+
+* **supervisor:** suppress a heartbeat probe failure when the worker completed real work ([#162](https://github.com/anatolykoptev/ox-embed-server/issues/162)) ([c856166](https://github.com/anatolykoptev/ox-embed-server/commit/c8561665cdd544dba55c1817c9c74f832ee3739c))
+
 ## [0.8.3](https://github.com/anatolykoptev/ox-embed-server/compare/embed-server-v0.8.2...embed-server-v0.8.3) (2026-08-05)
 
 
