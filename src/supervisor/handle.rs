@@ -90,6 +90,15 @@ const SOCKET_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// time out — a positive feedback loop. 40 extra seconds on a genuinely wedged
 /// worker that is already erroring is strictly the better failure.
 ///
+/// NOTE: this constant is the PROBE interval only. The freshness window — how
+/// recently a real inference must have completed for a probe failure to be
+/// suppressed as queue-depth noise — is a separate concept with its own knob
+/// (`EMBED_WORKER_HEARTBEAT_FRESHNESS_WINDOW_SECS`, default 3× this interval).
+/// They were once hardcoded to the same value, which gave the suppression the
+/// tightest possible window and let starved-but-healthy workers be killed; do
+/// not re-couple them without reading the `heartbeat_freshness_window` field
+/// doc and the 2026-08-05 pillow incident it references.
+///
 /// Overridable via `EMBED_WORKER_HEARTBEAT_INTERVAL_SECS`. Captured at
 /// startup; restart the container to change.
 const HEARTBEAT_INTERVAL_SECS: u64 = 30;
@@ -125,14 +134,21 @@ const HEARTBEAT_MAX_FAILS: u32 = 3;
 /// 15s is ~6x the documented p50-at-conc-4 and still an order of magnitude
 /// below the time a genuinely wedged worker stays stuck (forever). The
 /// remaining false-positive window — sustained saturation deep enough to delay
-/// a probe past 15s — is closed properly by suppressing a failure when the
-/// worker has completed a real inference within the interval; that is tracked
-/// as a follow-up rather than bundled here.
+/// a probe past 15s — is closed by suppressing a failure when the worker has
+/// completed a real inference within the freshness window
+/// (`EMBED_WORKER_HEARTBEAT_FRESHNESS_WINDOW_SECS`, default 3× the interval —
+/// decoupled from it so the bound is not the tightest possible one).
 ///
 /// Overridable via `EMBED_WORKER_HEARTBEAT_PROBE_TIMEOUT_MS`. Must be > 0.
 /// NOTE: pillow's compose.yml sets this explicitly, so raising the default
 /// alone does not change production — the deployed value must be raised too.
 const HEARTBEAT_PROBE_TIMEOUT_MS: u64 = 15_000;
+
+/// Default multiplier applied to the heartbeat interval to derive the
+/// freshness window when `EMBED_WORKER_HEARTBEAT_FRESHNESS_WINDOW_SECS` is
+/// unset. See [`WorkerSupervisor::heartbeat_freshness_window`] for why the
+/// two are decoupled.
+const HEARTBEAT_FRESHNESS_WINDOW_INTERVAL_MULTIPLIER: u32 = 3;
 
 /// jina-code-v2 p50 at concurrency 4 on the deployment hardware, from
 /// `docs/BUGS.md` BUG-001. Not a tuning knob — a recorded measurement.
@@ -166,6 +182,18 @@ fn now_unix_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Whether the freshness window is too short for the suppression to do
+/// useful work. A window shorter than the probe timeout means a probe that
+/// times out has already aged any pre-dispatch success past the window, so
+/// only successes landing in the tail of the probe's own wait can suppress —
+/// nearly inert. `launch` warns (not fails) when this is true.
+///
+/// Extracted from `launch` so the threshold is unit-testable and
+/// mutation-covered independently of spawning a real worker.
+fn freshness_window_is_inert(window: Duration, probe_timeout: Duration) -> bool {
+    window < probe_timeout
 }
 
 /// Inference kind the worker should load.
@@ -210,11 +238,13 @@ enum HeartbeatOutcome {
     Killed,
     /// The probe failed (timeout / error / worker-error reply) but was
     /// **suppressed** because the worker completed a real inference within
-    /// the heartbeat interval — proof it is not wedged. The probe queues
+    /// the freshness window — proof it is not wedged. The probe queues
     /// behind the worker's session pool, so under load it measures queue
     /// depth, not liveness; suppressing a failure when the worker recently
     /// did real work stops the wedge detector from firing at peak load.
-    /// The fail counter is NOT incremented.
+    /// The window is `heartbeat_freshness_window` (default 3× the interval),
+    /// decoupled from the probe interval. The fail counter is NOT
+    /// incremented.
     Suppressed,
 }
 
@@ -259,13 +289,34 @@ pub struct WorkerSupervisor {
     heartbeat_max_fails: u32,
     /// Timeout for each heartbeat inference probe.
     heartbeat_probe_timeout: Duration,
+    /// Freshness window for the heartbeat suppression check — how recently
+    /// a real inference must have completed for a probe failure to be
+    /// presumed benign (queue depth, not a wedge). DISTINCT from
+    /// [`WorkerSupervisor::heartbeat_interval`]: the interval is how often
+    /// we PROBE; the window is how recent a success must be to SUPPRESS a
+    /// probe failure. They are different questions that previously shared
+    /// one value (the interval), which gave the suppression the tightest
+    /// possible bound — on pillow 2026-08-05, under CPU pressure
+    /// (`/proc/pressure/cpu some avg10=68`), 8 of 90 probe timeouts fell
+    /// outside the one-interval window, accumulated to `max_fails`, and
+    /// SIGKILLed two healthy, merely starved workers (each aborting an
+    /// in-flight repo index on another machine). 3× the interval (the
+    /// default) lets a success in either of the two preceding intervals
+    /// suppress.
+    ///
+    /// Overridable via `EMBED_WORKER_HEARTBEAT_FRESHNESS_WINDOW_SECS`; when
+    /// unset, defaults to `heartbeat_interval *
+    /// HEARTBEAT_FRESHNESS_WINDOW_INTERVAL_MULTIPLIER` (3×). A window
+    /// shorter than the probe timeout makes suppression nearly inert —
+    /// `launch` warns in that case.
+    heartbeat_freshness_window: Duration,
     /// Unix-millis timestamp of the worker's last **successful** real
     /// inference (stamped by [`WorkerPool::dispatch_*`] on a non-`Err`
     /// `WorkerResponse`). The heartbeat freshness check suppresses a probe
-    /// failure when this is fresher than `heartbeat_interval` — a worker
-    /// that completed a real inference within the interval is by definition
-    /// not wedged, and the probe queues behind the session pool so under
-    /// load it measures queue depth, not liveness.
+    /// failure when this is fresher than `heartbeat_freshness_window` — a
+    /// worker that completed a real inference within the window is by
+    /// definition not wedged, and the probe queues behind the session pool
+    /// so under load it measures queue depth, not liveness.
     ///
     /// Stamped on **success** (response received), NOT on dispatch start:
     /// a worker stuck on one long request never stamps, so the timestamp
@@ -331,6 +382,43 @@ impl WorkerSupervisor {
             },
         );
 
+        // Freshness window — distinct from the probe interval. Default is
+        // 3× the resolved interval so retuning the interval scales the window
+        // with it; an explicit override wins. See the field doc for why the
+        // two are decoupled.
+        let heartbeat_freshness_window = {
+            let default = heartbeat_interval
+                .checked_mul(HEARTBEAT_FRESHNESS_WINDOW_INTERVAL_MULTIPLIER)
+                .unwrap_or(heartbeat_interval);
+            resolve_duration_secs_env(
+                "EMBED_WORKER_HEARTBEAT_FRESHNESS_WINDOW_SECS",
+                default,
+                &format!("3x HEARTBEAT_INTERVAL_SECS ({}s)", default.as_secs()),
+            )
+        };
+
+        // A freshness window shorter than the probe timeout makes the
+        // suppression nearly inert: a probe that times out has aged any
+        // pre-dispatch success past the window, so only successes landing
+        // in the tail of the probe's own wait can suppress. Warn (not fail)
+        // — the operator may have a reason, but they should know the knob
+        // is doing almost nothing. Skipped when heartbeat is disabled
+        // (interval 0 → window 0 → spurious).
+        if !heartbeat_interval.is_zero()
+            && freshness_window_is_inert(heartbeat_freshness_window, heartbeat_probe_timeout)
+        {
+            tracing::warn!(
+                model = %spec.model,
+                freshness_window_ms = heartbeat_freshness_window.as_millis() as u64,
+                probe_timeout_ms = heartbeat_probe_timeout.as_millis() as u64,
+                "EMBED_WORKER_HEARTBEAT_FRESHNESS_WINDOW_SECS is shorter than the probe \
+                 timeout — the freshness suppression is nearly inert (a timed-out probe \
+                 ages any pre-dispatch success past the window). Raise the window above \
+                 the probe timeout or leave it at the 3x-interval default."
+            );
+            crate::metrics::record_config_fallback("EMBED_WORKER_HEARTBEAT_FRESHNESS_WINDOW_SECS");
+        }
+
         let supervisor = Arc::new(Self {
             spec: spec.clone(),
             client_slot: Arc::new(RwLock::new(None)),
@@ -340,6 +428,7 @@ impl WorkerSupervisor {
             heartbeat_interval,
             heartbeat_max_fails,
             heartbeat_probe_timeout,
+            heartbeat_freshness_window,
             last_success_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         });
 
@@ -768,28 +857,35 @@ impl WorkerSupervisor {
         }
 
         // Freshness check (#149): suppress a probe failure when the worker
-        // completed a real inference within the heartbeat interval. The probe
+        // completed a real inference within the freshness window. The probe
         // is dispatched through the same UDS and queues behind the worker's
         // session pool, so under load it measures QUEUE DEPTH, not liveness.
-        // A worker that completed a real inference within the interval is by
+        // A worker that completed a real inference within the window is by
         // definition not wedged; suppressing here stops the wedge detector
         // from firing hardest at peak load (32 false SIGKILLs on pillow in
-        // three days before this check). The probe then only decides liveness
-        // for workers that are otherwise idle — the only case where it
-        // carries information.
+        // three days before this check, and 2 more on 2026-08-05 when the
+        // one-interval window proved too tight under CPU pressure). The probe
+        // then only decides liveness for workers that are otherwise idle —
+        // the only case where it carries information.
+        //
+        // The window is `heartbeat_freshness_window`, NOT `heartbeat_interval`
+        // — they are decoupled (default 3× the interval). Re-coupling them
+        // re-introduces the tightest-possible bound that let starved workers
+        // be killed; see the field doc and the 2026-08-05 pillow incident.
         //
         // `last > 0` guards the "never stamped" case (fresh worker, no real
         // dispatch yet): 0 must NOT suppress, or the detector is dead on
         // arrival for a worker that wedges before its first request.
         let now = now_unix_millis();
         let last = self.last_success_ms();
-        if last > 0 && now.saturating_sub(last) < self.heartbeat_interval.as_millis() as u64 {
+        if last > 0 && now.saturating_sub(last) < self.heartbeat_freshness_window.as_millis() as u64
+        {
             tracing::debug!(
                 model = %self.spec.model,
                 last_success_ms = last,
-                interval_ms = self.heartbeat_interval.as_millis(),
+                freshness_window_ms = self.heartbeat_freshness_window.as_millis(),
                 "heartbeat probe failed but suppressed — worker completed a real \
-                 inference within the interval (not wedged, just busy)"
+                 inference within the freshness window (not wedged, just busy)"
             );
             self.record_heartbeat("suppressed");
             return HeartbeatOutcome::Suppressed;
@@ -902,6 +998,7 @@ impl WorkerSupervisor {
             heartbeat_interval: Duration::ZERO,
             heartbeat_max_fails: 3,
             heartbeat_probe_timeout: Duration::from_millis(100),
+            heartbeat_freshness_window: Duration::ZERO,
             last_success_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
@@ -922,6 +1019,7 @@ impl WorkerSupervisor {
             heartbeat_interval: Duration::ZERO,
             heartbeat_max_fails: 3,
             heartbeat_probe_timeout: Duration::from_millis(100),
+            heartbeat_freshness_window: Duration::ZERO,
             last_success_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
@@ -1032,6 +1130,7 @@ mod tests {
             heartbeat_interval: Duration::ZERO,
             heartbeat_max_fails: 3,
             heartbeat_probe_timeout: Duration::from_millis(150),
+            heartbeat_freshness_window: Duration::ZERO,
             last_success_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         });
 
@@ -1259,19 +1358,31 @@ mod tests {
         kind: WorkerKind,
         pid: u32,
     ) -> Arc<WorkerSupervisor> {
-        supervisor_with(mock, kind, pid, Duration::from_millis(50), 0).await
+        // Default freshness window = 3× the interval, matching production.
+        supervisor_with(
+            mock,
+            kind,
+            pid,
+            Duration::from_millis(50),
+            Duration::from_millis(150),
+            0,
+        )
+        .await
     }
 
     /// Build a supervisor with a pre-connected mock client and explicit
     /// heartbeat/freshness state. Used by the #149 boundary tests because the
     /// default `supervisor_for` interval is too small to deterministically
-    /// exercise the `last > 0` and `now.saturating_sub(last) < interval`
-    /// guards.
+    /// exercise the `last > 0` and `now.saturating_sub(last) < window`
+    /// guards. `heartbeat_freshness_window` is the suppression bound (decoupled
+    /// from the probe interval); pass it explicitly so a boundary test can
+    /// isolate the `<` operator against the WINDOW, not the interval.
     async fn supervisor_with(
         mock: &MockWorker,
         kind: WorkerKind,
         pid: u32,
         heartbeat_interval: Duration,
+        heartbeat_freshness_window: Duration,
         last_success_ms: u64,
     ) -> Arc<WorkerSupervisor> {
         use crate::ipc::client::WorkerClient;
@@ -1297,6 +1408,7 @@ mod tests {
             heartbeat_interval,
             heartbeat_max_fails: 1,
             heartbeat_probe_timeout: Duration::from_millis(10),
+            heartbeat_freshness_window,
             last_success_ms: Arc::new(AtomicU64::new(last_success_ms)),
         })
     }
@@ -1489,6 +1601,7 @@ mod tests {
             heartbeat_interval: Duration::from_millis(50),
             heartbeat_max_fails: 1,
             heartbeat_probe_timeout: Duration::from_millis(150),
+            heartbeat_freshness_window: Duration::from_millis(150),
             last_success_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         });
 
@@ -1506,22 +1619,36 @@ mod tests {
     //
     // The heartbeat probe is dispatched through the same UDS and queues behind
     // the worker's session pool, so under load it measures QUEUE DEPTH, not
-    // liveness. A worker that completed a real inference within the heartbeat
-    // interval is by definition not wedged; the freshness check suppresses
-    // the probe failure so the wedge detector stops firing at peak load.
+    // liveness. A worker that completed a real inference within the freshness
+    // WINDOW is by definition not wedged; the freshness check suppresses the
+    // probe failure so the wedge detector stops firing at peak load.
     //
-    // Three mutations guard this — F1, F2, F3 — and all three matter:
-    //   F1: freshness check always false (never suppress) → false positives return.
-    //   F2: suppression unconditional (always suppress)   → detector is dead.
-    //   F3: stamp on dispatch start, not on success       → wedge masked by
-    //       the in-flight request keeping the timestamp fresh.
+    // The window is decoupled from the probe interval (default 3×). The
+    // mutations that guard this — F1, F2, F3 — and why each matters:
+    //   F1: a success at interval×2 is outside the OLD one-interval window but
+    //       inside the NEW 3× window → must suppress. Restoring
+    //       `heartbeat_interval` as the comparison bound re-tightens the
+    //       window and this goes RED (Killed). This is the test that proves
+    //       the decoupling, not just that suppression exists.
+    //   F2: a success OLDER than the new window, probes failing, max_fails
+    //       reached → STILL killed. Making the freshness check always
+    //       suppress (e.g. `if true`) returns Suppressed here → RED. This
+    //       matters more than F1: a change that only ever suppresses is a
+    //       regression wearing a fix's clothing.
+    //   F3: stamp on dispatch start, not on success → wedge masked by the
+    //       in-flight request keeping the timestamp fresh.
 
-    /// F1: a worker that completed a real inference within the heartbeat
-    /// interval is NOT counted as a heartbeat failure.
+    /// F1: a worker whose last success is at interval×2 — OUTSIDE the old
+    /// one-interval window but INSIDE the new 3× window — is suppressed, not
+    /// killed. This is the test that proves the decoupling: under the old
+    /// coupling (`window == interval`) this was a kill; with the 3× window it
+    /// is a suppress.
     ///
-    /// RED-proven: making the freshness check always evaluate to `false`
-    /// (e.g. `if false && last > 0 && ...`) returns `Failed`/`Killed` here
-    /// instead of `Suppressed`.
+    /// RED-proven two ways:
+    ///   * restore `self.heartbeat_interval` as the comparison bound in
+    ///     `heartbeat_tick` (the re-coupling mutation) → `now - last ≈ 2s` is
+    ///     not `< 1s` → `Killed` here instead of `Suppressed`.
+    ///   * make the freshness check always `false` (`if false && ...`) → same.
     #[tokio::test]
     async fn heartbeat_tick_suppresses_failure_when_success_is_fresh() {
         let mock = MockWorker::start("fresh-success", MockReply::Hang).await;
@@ -1530,10 +1657,12 @@ mod tests {
             .spawn()
             .expect("spawn sleep");
 
-        // Use a 1s interval — longer than the 150ms probe timeout, mirroring
-        // production (30s interval vs 15s timeout). With a 50ms interval
-        // (the supervisor_for default), the probe timeout alone (150ms)
-        // would make the timestamp stale before the freshness check runs.
+        // 1s interval, 3s freshness window (the new default), 150ms probe
+        // timeout — mirrors production ratios (30s/90s/15s). max_fails=1 so a
+        // single un-suppressed failure kills, making the re-coupling mutation
+        // observable as `Killed` rather than just `Failed`.
+        let interval = Duration::from_secs(1);
+        let window = interval * HEARTBEAT_FRESHNESS_WINDOW_INTERVAL_MULTIPLIER;
         let client = Arc::new(
             crate::ipc::client::WorkerClient::connect(mock.socket_path.clone(), 1)
                 .await
@@ -1553,18 +1682,23 @@ mod tests {
             restart_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             socket_wait: Duration::from_secs(60),
             current_pid: Arc::new(std::sync::atomic::AtomicU32::new(child.id())),
-            heartbeat_interval: Duration::from_secs(1),
+            heartbeat_interval: interval,
             heartbeat_max_fails: 1,
             heartbeat_probe_timeout: Duration::from_millis(150),
+            heartbeat_freshness_window: window,
             last_success_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         });
 
-        // Stamp a recent successful inference — simulates the pool having
-        // dispatched a real request that completed within the interval.
-        sup.record_success();
+        // Stamp the last success at interval×2 in the past — 2s ago. This is
+        // OUTSIDE the old one-interval (1s) window but INSIDE the new 3× (3s)
+        // window. We set the AtomicU64 directly rather than calling
+        // `record_success()` (which stamps `now`) so the age is deterministic.
+        let two_intervals_ago = now_unix_millis().saturating_sub(2 * interval.as_millis() as u64);
+        sup.last_success_ms
+            .store(two_intervals_ago, std::sync::atomic::Ordering::Relaxed);
         assert!(
             sup.last_success_ms() > 0,
-            "record_success must stamp a non-zero timestamp"
+            "the pre-set last_success_ms must be non-zero"
         );
 
         let mut fails = 0;
@@ -1573,8 +1707,9 @@ mod tests {
         assert_eq!(
             outcome,
             HeartbeatOutcome::Suppressed,
-            "a worker that completed a real inference within the interval \
-             must NOT be counted as a heartbeat failure"
+            "a worker whose last success is at interval×2 (inside the 3× \
+             freshness window but outside the old 1× interval) must be \
+             SUPPRESSED, not killed — this is the decoupling the fix delivers"
         );
         assert_eq!(
             fails, 0,
@@ -1590,7 +1725,61 @@ mod tests {
         let _ = child.wait();
     }
 
-    /// F2: an idle worker that has NEVER completed a real inference (no
+    /// F2: a worker whose last success is OLDER than the freshness window,
+    /// with probes failing and `max_fails` reached, is STILL killed. This
+    /// matters more than F1: the wedge detector exists because a genuinely
+    /// hung worker once went unnoticed for three days, and a change that
+    /// only ever suppresses is a regression wearing a fix's clothing.
+    ///
+    /// RED-proven: making the freshness check always suppress (e.g. `if true`
+    /// instead of `if last > 0 && ...`) returns `Suppressed` here instead of
+    /// `Killed`, and the child is not signalled.
+    #[tokio::test]
+    async fn heartbeat_tick_kills_worker_when_success_is_stale() {
+        let mock = MockWorker::start("stale-success", MockReply::Hang).await;
+        let mut child = std::process::Command::new("sleep")
+            .arg("999")
+            .spawn()
+            .expect("spawn sleep");
+
+        // 1s interval, 3s window. Last success is 10s ago — well outside the
+        // 3s window, so the freshness check must NOT suppress. max_fails=1 so
+        // the single failing probe kills.
+        let interval = Duration::from_secs(1);
+        let window = interval * HEARTBEAT_FRESHNESS_WINDOW_INTERVAL_MULTIPLIER;
+        let sup = supervisor_with(
+            &mock,
+            WorkerKind::Embed,
+            child.id(),
+            interval,
+            window,
+            now_unix_millis().saturating_sub(10_000),
+        )
+        .await;
+        assert!(
+            sup.last_success_ms() > 0,
+            "the pre-set last_success_ms must be non-zero"
+        );
+
+        let mut fails = 0;
+        let outcome = sup.heartbeat_tick(&mut fails).await;
+
+        assert_eq!(
+            outcome,
+            HeartbeatOutcome::Killed,
+            "a worker whose last success is older than the freshness window \
+             MUST be killed when the fail budget is spent — a wider window is \
+             not a license to never kill"
+        );
+        let status = child.wait().expect("wait child");
+        assert!(
+            !status.success(),
+            "the stale-but-wedged worker must have been SIGKILLed"
+        );
+        assert_eq!(fails, 0, "the fail counter resets after a kill");
+    }
+
+    /// F3: an idle worker that has NEVER completed a real inference (no
     /// last-success timestamp) and fails `max_fails` consecutive probes IS
     /// still killed. Without this, the fix silently turns the wedge detector
     /// off — `last_success_ms == 0` must NOT suppress.
@@ -1687,6 +1876,7 @@ mod tests {
             heartbeat_interval: Duration::from_secs(1),
             heartbeat_max_fails: 1,
             heartbeat_probe_timeout: Duration::from_millis(150),
+            heartbeat_freshness_window: Duration::from_secs(3),
             last_success_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         });
 
@@ -1755,6 +1945,7 @@ mod tests {
             heartbeat_interval: Duration::ZERO,
             heartbeat_max_fails: 3,
             heartbeat_probe_timeout: Duration::from_millis(100),
+            heartbeat_freshness_window: Duration::ZERO,
             last_success_ms: Arc::new(AtomicU64::new(0)),
         });
 
@@ -1911,26 +2102,27 @@ mod tests {
 
     // ── #149 heartbeat freshness guard boundaries ────────────────────────────
     //
-    // Line 786 is `if last > 0 && now.saturating_sub(last) < interval`.
-    // The three operator mutants are each killed at a boundary where only that
-    // operator differs between the correct and mutant behavior.
+    // The freshness check is `if last > 0 && now.saturating_sub(last) < window`
+    // (window = `heartbeat_freshness_window`, decoupled from the probe
+    // interval). The operator mutants are each killed at a boundary where only
+    // that operator differs between the correct and mutant behavior.
     //
     // Boundary values are chosen deliberately so the test fails for the mutant
     // and passes for the original, and the comment explains which side of each
     // comparison is correct.
 
     /// A worker that has NEVER stamped (`last_success_ms == 0`) must NOT have
-    /// its probe failure suppressed — even if the heartbeat interval is large
-    /// enough that `now - 0 < interval` is true.
+    /// its probe failure suppressed — even if the freshness window is large
+    /// enough that `now - 0 < window` is true.
     ///
-    /// This kills two mutants on line 786:
+    /// This kills two mutants on the freshness check:
     ///   * `>` → `>=`: `0 >= 0` is true, so the right-hand side would suppress.
-    ///   * `&&` → `||`: the right-hand side `now - 0 < interval` is true, so
+    ///   * `&&` → `||`: the right-hand side `now - 0 < window` is true, so
     ///     the `||` would suppress.
     ///
     /// The correct side: `last > 0` is the strict guard for "has stamped"; an
     /// un-stamped worker is treated as never fresh, and `&&` requires BOTH the
-    /// stamp-exists and the within-interval conditions to suppress.
+    /// stamp-exists and the within-window conditions to suppress.
     #[tokio::test]
     async fn heartbeat_tick_never_suppresses_when_last_success_is_zero() {
         let mock = MockWorker::start("zero-guard", MockReply::Hang).await;
@@ -1939,11 +2131,13 @@ mod tests {
             .spawn()
             .expect("spawn sleep");
 
-        // An interval far larger than any possible wall clock in ms guarantees
-        // `now.saturating_sub(0) < interval` is true, isolating the `>` and `&&`
-        // mutants without depending on the exact value of `now`.
+        // A window far larger than any possible wall clock in ms guarantees
+        // `now.saturating_sub(0) < window` is true, isolating the `>` and `&&`
+        // mutants without depending on the exact value of `now`. The interval
+        // is irrelevant to the freshness check now (the window is the bound),
+        // so it is left at the same huge value for simplicity.
         let huge = Duration::from_millis(u64::MAX / 2);
-        let sup = supervisor_with(&mock, WorkerKind::Embed, child.id(), huge, 0).await;
+        let sup = supervisor_with(&mock, WorkerKind::Embed, child.id(), huge, huge, 0).await;
 
         let mut fails = 0;
         let outcome = sup.heartbeat_tick(&mut fails).await;
@@ -1963,16 +2157,16 @@ mod tests {
 
     /// The freshness comparison is STRICTLY LESS THAN.
     ///
-    /// We cannot force `now - last == positive_interval` against a real wall
+    /// We cannot force `now - last == positive_window` against a real wall
     /// clock without asserting on the clock itself, but we CAN force
     /// `now.saturating_sub(last) == 0` by setting `last` to a value greater than
-    /// any possible `now`, and set `interval` to 0. At the `0 == 0` boundary:
+    /// any possible `now`, and set `window` to 0. At the `0 == 0` boundary:
     ///   * original `<` is false → NOT fresh → Killed.
     ///   * `<` → `<=` makes it true → Suppressed.
     ///   * `&&` → `||` with `last > 0` also makes it true → Suppressed.
     ///
-    /// The correct side: `now.saturating_sub(last) < interval` must be strictly
-    /// less. A success exactly as old as the interval is NOT fresh enough to
+    /// The correct side: `now.saturating_sub(last) < window` must be strictly
+    /// less. A success exactly as old as the window is NOT fresh enough to
     /// suppress a probe failure.
     #[tokio::test]
     async fn heartbeat_tick_freshness_boundary_is_strictly_less_than() {
@@ -1983,12 +2177,14 @@ mod tests {
             .expect("spawn sleep");
 
         // `last` in the future forces `now.saturating_sub(last)` to 0 via
-        // saturating subtraction. `interval` is 0, so the boundary is `0 == 0`.
-        // The test isolates the `<` vs `<=` and `&&` vs `||` operators.
+        // saturating subtraction. `window` is 0, so the boundary is `0 == 0`.
+        // The test isolates the `<` vs `<=` and `&&` vs `||` operators on the
+        // WINDOW (the freshness bound), not the interval.
         let sup = supervisor_with(
             &mock,
             WorkerKind::Embed,
             child.id(),
+            Duration::ZERO,
             Duration::ZERO,
             u64::MAX,
         )
@@ -2000,7 +2196,7 @@ mod tests {
         assert_eq!(
             outcome,
             HeartbeatOutcome::Killed,
-            "freshness at the exact interval boundary must NOT suppress; the comparison must be strict"
+            "freshness at the exact window boundary must NOT suppress; the comparison must be strict"
         );
         let status = child.wait().expect("wait child");
         assert!(
@@ -2008,5 +2204,66 @@ mod tests {
             "worker must have been SIGKILLed at the boundary"
         );
         assert_eq!(fails, 0, "fail counter resets after kill");
+    }
+
+    // ── freshness window config (decoupling + inert-knob guard) ──────────────
+    //
+    // The window is decoupled from the probe interval (default 3×). Two
+    // things to guard at the config layer:
+    //   * the multiplier is 3, not 1 — a regression to 1 re-couples the
+    //     window to the interval and re-introduces the tightest-possible
+    //     bound that let starved workers be killed on pillow 2026-08-05.
+    //   * a window shorter than the probe timeout makes the suppression
+    //     nearly inert — `launch` warns in that case, and the threshold
+    //     helper is what decides.
+
+    /// The default freshness window is 3× the heartbeat interval, not 1×.
+    /// A regression to 1× re-couples the two concepts and re-introduces the
+    /// defect this change fixes.
+    #[test]
+    fn freshness_window_default_is_three_times_interval() {
+        assert_eq!(
+            HEARTBEAT_FRESHNESS_WINDOW_INTERVAL_MULTIPLIER, 3,
+            "the default freshness window must be 3× the interval; 1× re-couples \
+             the window to the interval and re-introduces the 2026-08-05 pillow \
+             kill of starved-but-healthy workers"
+        );
+        // The computation `launch` uses to derive the default:
+        let interval = Duration::from_secs(HEARTBEAT_INTERVAL_SECS);
+        let default = interval
+            .checked_mul(HEARTBEAT_FRESHNESS_WINDOW_INTERVAL_MULTIPLIER)
+            .unwrap_or(interval);
+        assert_eq!(
+            default,
+            Duration::from_secs(90),
+            "at the default 30s interval the window must be 90s (3×)"
+        );
+    }
+
+    /// `freshness_window_is_inert` flags a window shorter than the probe
+    /// timeout — the regime where a timed-out probe has aged any pre-dispatch
+    /// success past the window and suppression can barely fire.
+    ///
+    /// RED-proven: flipping `<` to `<=` in the helper makes the equal case
+    /// (window == probe_timeout) report inert, failing the middle assertion.
+    #[test]
+    fn freshness_window_is_inert_threshold() {
+        // window < probe timeout → inert
+        assert!(
+            freshness_window_is_inert(Duration::from_secs(5), Duration::from_secs(15)),
+            "a 5s window with a 15s probe timeout is inert"
+        );
+        // window == probe timeout → NOT inert (the boundary is strict: at
+        // exactly the probe timeout, a success landing at the very end of the
+        // probe wait is still within the window)
+        assert!(
+            !freshness_window_is_inert(Duration::from_secs(15), Duration::from_secs(15)),
+            "a window equal to the probe timeout is the boundary, not inert"
+        );
+        // window > probe timeout → NOT inert (the production default: 90s vs 15s)
+        assert!(
+            !freshness_window_is_inert(Duration::from_secs(90), Duration::from_secs(15)),
+            "the 90s default window with a 15s probe timeout is healthy"
+        );
     }
 }
