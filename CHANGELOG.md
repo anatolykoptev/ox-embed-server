@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.5](https://github.com/anatolykoptev/ox-embed-server/compare/embed-server-v0.8.4...embed-server-v0.8.5) (2026-08-07)
+
+
+### Bug Fixes
+
+* **supervisor:** decouple the heartbeat freshness window from the probe interval ([#174](https://github.com/anatolykoptev/ox-embed-server/issues/174)) ([c336f71](https://github.com/anatolykoptev/ox-embed-server/commit/c336f719f106a7a8d7fbccccee6417efddcfcf7d))
+
 ## [0.8.4](https://github.com/anatolykoptev/ox-embed-server/compare/embed-server-v0.8.3...embed-server-v0.8.4) (2026-08-05)
 
 
