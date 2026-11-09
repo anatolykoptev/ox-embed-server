@@ -50,7 +50,7 @@ Batcher:
 
 ## CI
 
-Two lanes, both on GitHub-hosted `ubuntu-24.04-arm` (public repo → free + unlimited, and arm64 is what pillow runs).
+Two lanes, both on GitHub-hosted `ubuntu-24.04-arm` (public repo → free + unlimited, and arm64 is what production runs).
 
 **`preflight`** — every PR: gitleaks → osv-scanner → fmt → clippy → deny → nextest → release build → **mutants `--in-diff`**.
 
