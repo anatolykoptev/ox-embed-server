@@ -61,7 +61,7 @@ static WAITERS: AtomicUsize = AtomicUsize::new(0);
 
 /// Install a Prometheus metrics recorder in the worker process and, if
 /// `EMBED_WORKER_METRICS_PORT` is set, spawn a lightweight HTTP server
-/// that exposes `/metrics` for Prometheus scraping.
+/// that exposes `/metrics` for Prometheus polling.
 ///
 /// Port assignment: the supervisor sets `EMBED_WORKER_METRICS_PORT` to
 /// `EMBED_WORKER_METRICS_PORT_BASE + <worker-index>` (default base 8200).
@@ -276,7 +276,7 @@ async fn main() -> anyhow::Result<()> {
     })?;
 
     // Install Prometheus recorder. If EMBED_WORKER_METRICS_PORT is set, also
-    // spawns a lightweight HTTP /metrics server for per-worker scraping.
+    // spawns a lightweight HTTP /metrics server for per-worker polling.
     // Must happen before arena registration (which emits gauges).
     // Held for process lifetime: dropping this handle shuts down the metrics
     // HTTP server, making /metrics unreachable for the rest of the worker life.

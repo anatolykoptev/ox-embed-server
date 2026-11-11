@@ -97,7 +97,7 @@ const SOCKET_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// They were once hardcoded to the same value, which gave the suppression the
 /// tightest possible window and let starved-but-healthy workers be killed; do
 /// not re-couple them without reading the `heartbeat_freshness_window` field
-/// doc and the 2026-08-05 pillow incident it references.
+/// doc and the 2026-08-05 production incident it references.
 ///
 /// Overridable via `EMBED_WORKER_HEARTBEAT_INTERVAL_SECS`. Captured at
 /// startup; restart the container to change.
@@ -123,7 +123,7 @@ const HEARTBEAT_MAX_FAILS: u32 = 3;
 /// for jina-code-v2 on this exact hardware — i.e. the old default sat BELOW the
 /// measured median under load.
 ///
-/// Live consequence on pillow between 2026-08-01 and 2026-08-04: 156 probe
+/// Live consequence in production between 2026-08-01 and 2026-08-04: 156 probe
 /// timeouts and 32 SIGKILLs, all of healthy workers (`code-rank-embed` 23,
 /// with `gte-multi-rerank` repeatedly logging "heartbeat recovered after
 /// failures" — a genuinely wedged worker never recovers). Each kill costs a
@@ -140,7 +140,7 @@ const HEARTBEAT_MAX_FAILS: u32 = 3;
 /// decoupled from it so the bound is not the tightest possible one).
 ///
 /// Overridable via `EMBED_WORKER_HEARTBEAT_PROBE_TIMEOUT_MS`. Must be > 0.
-/// NOTE: pillow's compose.yml sets this explicitly, so raising the default
+/// NOTE: the production compose.yml sets this explicitly, so raising the default
 /// alone does not change production — the deployed value must be raised too.
 const HEARTBEAT_PROBE_TIMEOUT_MS: u64 = 15_000;
 
@@ -163,7 +163,7 @@ const _: () = assert!(
     HEARTBEAT_PROBE_TIMEOUT_MS >= 4 * MEASURED_JINA_P50_CONC4_MS,
     "HEARTBEAT_PROBE_TIMEOUT_MS must leave at least 4x headroom over the measured \
      jina-code-v2 p50-at-conc-4 (docs/BUGS.md BUG-001), or the wedge detector kills \
-     healthy workers under load — as it did 32 times on pillow in three days"
+     healthy workers under load — as it did 32 times in production in three days"
 );
 
 /// Advance exponential backoff by doubling, capped at MAX_BACKOFF.
@@ -296,7 +296,7 @@ pub struct WorkerSupervisor {
     /// we PROBE; the window is how recent a success must be to SUPPRESS a
     /// probe failure. They are different questions that previously shared
     /// one value (the interval), which gave the suppression the tightest
-    /// possible bound — on pillow 2026-08-05, under CPU pressure
+    /// possible bound — in production on 2026-08-05, under CPU pressure
     /// (`/proc/pressure/cpu some avg10=68`), 8 of 90 probe timeouts fell
     /// outside the one-interval window, accumulated to `max_fails`, and
     /// SIGKILLed two healthy, merely starved workers (each aborting an
@@ -801,7 +801,7 @@ impl WorkerSupervisor {
             // corrupted session) replied promptly with an error, was counted
             // as a good beat, and was never killed — while
             // `embed_worker_heartbeat_total{result="error"}` sat at exactly 0
-            // (verified on pillow: 0 across 51,447 beats). The wedge detector
+            // (verified in production: 0 across 51,447 beats). The wedge detector
             // was blind to the failure mode it exists to catch. `/ready`
             // already branched on this variant correctly; the heartbeat did
             // not. This arm must stay ABOVE the success arm.
@@ -862,7 +862,7 @@ impl WorkerSupervisor {
         // session pool, so under load it measures QUEUE DEPTH, not liveness.
         // A worker that completed a real inference within the window is by
         // definition not wedged; suppressing here stops the wedge detector
-        // from firing hardest at peak load (32 false SIGKILLs on pillow in
+        // from firing hardest at peak load (32 false SIGKILLs in production in
         // three days before this check, and 2 more on 2026-08-05 when the
         // one-interval window proved too tight under CPU pressure). The probe
         // then only decides liveness for workers that are otherwise idle —
@@ -871,7 +871,7 @@ impl WorkerSupervisor {
         // The window is `heartbeat_freshness_window`, NOT `heartbeat_interval`
         // — they are decoupled (default 3× the interval). Re-coupling them
         // re-introduces the tightest-possible bound that let starved workers
-        // be killed; see the field doc and the 2026-08-05 pillow incident.
+        // be killed; see the field doc and the 2026-08-05 production incident.
         //
         // `last > 0` guards the "never stamped" case (fresh worker, no real
         // dispatch yet): 0 must NOT suppress, or the detector is dead on
@@ -1449,7 +1449,7 @@ mod tests {
     /// This is the regression guard for the bug where the catch-all
     /// `Ok(Ok(_))` arm swallowed `WorkerResponse::Err`: a worker whose every
     /// inference failed replied promptly, was counted as a good beat, and was
-    /// never killed. On pillow this showed as
+    /// never killed. In production this showed as
     /// `embed_worker_heartbeat_total{result="error"}` sitting at exactly 0
     /// across 51,447 beats.
     ///
@@ -2212,7 +2212,7 @@ mod tests {
     // things to guard at the config layer:
     //   * the multiplier is 3, not 1 — a regression to 1 re-couples the
     //     window to the interval and re-introduces the tightest-possible
-    //     bound that let starved workers be killed on pillow 2026-08-05.
+    //     bound that let starved workers be killed in production on 2026-08-05.
     //   * a window shorter than the probe timeout makes the suppression
     //     nearly inert — `launch` warns in that case, and the threshold
     //     helper is what decides.
@@ -2225,7 +2225,7 @@ mod tests {
         assert_eq!(
             HEARTBEAT_FRESHNESS_WINDOW_INTERVAL_MULTIPLIER, 3,
             "the default freshness window must be 3× the interval; 1× re-couples \
-             the window to the interval and re-introduces the 2026-08-05 pillow \
+             the window to the interval and re-introduces the 2026-08-05 production \
              kill of starved-but-healthy workers"
         );
         // The computation `launch` uses to derive the default:

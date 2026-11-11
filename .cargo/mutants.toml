@@ -128,7 +128,7 @@ additional_cargo_args = ["--locked"]
 # healthy-but-slow mutants as caught-by-timeout noise.
 #
 # The floor is 30s against an ~8s baseline (613 tests). It was 60s, which cost a
-# full minute per infinite-loop mutant for no extra signal — measured on krolik,
+# full minute per infinite-loop mutant for no extra signal — measured on the build server,
 # where `evict_idle -> 1` and a bucket-boundary mutant each burned the whole 60s.
 timeout_multiplier = 5.0
 minimum_test_timeout = 30
