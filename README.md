@@ -170,3 +170,7 @@ the `vX.Y.Z` tag and GitHub release with the generated changelog, and bumps
 the version in `Cargo.toml` and the manifest. No manual tagging.
 
 First release PR (#1) targets `v0.2.0`.
+
+## License
+
+Dual-licensed under [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE), at your option.
