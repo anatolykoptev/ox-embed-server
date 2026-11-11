@@ -250,3 +250,5 @@ Findings from competitive research (TEI, Infinity, vLLM) + ML expert review duri
 - New follow-ups discovered during execution go to `TaskList` (ephemeral) or to `docs/plans/*` (persistent).
 
 Last refreshed: 2026-04-17 (after Phase E ship).
+
+live probe, do not merge
