@@ -2,7 +2,7 @@
 name = "embed-server"
 version = "0.8.4"
 edition = "2024"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 anyhow = "1"
