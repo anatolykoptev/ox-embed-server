@@ -599,8 +599,10 @@ mod tests {
         assert_eq!(decoded_bytes.len(), original.len() * 4, "4 bytes per f32");
 
         let decoded_floats: Vec<f32> = decoded_bytes
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect();
         assert_eq!(decoded_floats, original, "round-trip must be lossless");
     }
@@ -628,8 +630,10 @@ mod tests {
                     .decode(s)
                     .expect("valid base64");
                 let floats: Vec<f32> = bytes
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b))
                     .collect();
                 assert_eq!(floats, v);
             }
