@@ -865,7 +865,7 @@ pub(crate) fn parse_subbatch_ratio(raw: Option<&str>) -> f32 {
     }
 }
 
-/// Measured on pillow (ARM Neoverse-N1) against 32 real code chunks from this
+/// Measured on an ARM Neoverse-N1 host against 32 real code chunks from this
 /// repo, median 130 tokens against a 512 cap — the shape `code-rank-embed`
 /// actually serves (issue #136: 62% of its requests are batch 32+, 80% are
 /// seq 512+).
@@ -1992,7 +1992,7 @@ impl StandaloneEmbedder {
             // not: the module doc on `src/bin/worker.rs` describes exactly
             // what this process does — load the model once, then loop
             // accepting UDS connections for the container's lifetime. Measured
-            // on pillow 2026-08-05: four models serving nothing but heartbeats
+            // in production on 2026-08-05: four models serving nothing but heartbeats
             // held ~5 GB resident while `PSIMemoryPressureHigh` was firing.
             //
             // `cfg` was already in scope, so the configured value was being

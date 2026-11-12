@@ -206,7 +206,7 @@ pub fn apply_histogram_buckets(builder: PrometheusBuilder) -> PrometheusBuilder 
 /// deploy cannot fake.
 ///
 /// `version` (below) carries `EMBED_VERSION`, a hand-written string set in the
-/// deploy compose file (`phase-2-multi-process-pillow` on pillow today). It is
+/// deploy compose file (a phase label such as `phase-2-multi-process`). It is
 /// constant across releases, so it can never answer "did the new build actually
 /// reach production?" — the question that matters after a release. `pkg_version`
 /// is `CARGO_PKG_VERSION`, baked at compile time from `Cargo.toml`, which
@@ -1840,8 +1840,8 @@ mod build_info_tests {
 
     /// `embed_build_info` must carry the COMPILED-IN crate version.
     ///
-    /// This is the assertion the post-release deploy check reads: pillow's
-    /// autodeploy scrapes `/metrics` and refuses to report success unless the
+    /// This is the assertion the post-release deploy check reads: the production
+    /// autodeploy polls `/metrics` and refuses to report success unless the
     /// running container advertises the version it just built. Before
     /// `pkg_version` existed the only label was `version`, sourced from the
     /// `EMBED_VERSION` env var — a constant string in the deploy compose file,
