@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.9.0](https://github.com/anatolykoptev/ox-embed-server/compare/embed-server-v0.8.5...embed-server-v0.9.0) (2026-11-15)
+
+
+### Features
+
+* **supervisor:** meter worker-slot wait and add bulk priority ([#187](https://github.com/anatolykoptev/ox-embed-server/issues/187)) ([6f1dbf8](https://github.com/anatolykoptev/ox-embed-server/commit/6f1dbf837aea51b93b21a58bf7d1bf5dfb0c43a5))
+
+
+### Bug Fixes
+
+* **metrics,api:** count every worker-path 5xx; dead worker returns retryable 503 ([#190](https://github.com/anatolykoptev/ox-embed-server/issues/190)) ([b36b918](https://github.com/anatolykoptev/ox-embed-server/commit/b36b918b9fd6ca6ee02d720fe18ffd25a0cd1298))
+* **worker:** stamp the model label on every series a worker exposes ([#191](https://github.com/anatolykoptev/ox-embed-server/issues/191)) ([d1ed0e0](https://github.com/anatolykoptev/ox-embed-server/commit/d1ed0e07db3406b4917fb163fc92bd5f1b4e6e3e))
+
 ## [0.8.5](https://github.com/anatolykoptev/ox-embed-server/compare/embed-server-v0.8.4...embed-server-v0.8.5) (2026-11-15)
 
 
