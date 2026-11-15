@@ -676,7 +676,7 @@ mod tests {
         // Step 1 — cold, no cache.
         let plan_cold = LoadPlan::NoCache;
         let t0 = Instant::now();
-        let builder = Session::builder().unwrap();
+        let builder = Session::builder(crate::arena::ort_env().unwrap()).unwrap();
         let builder = apply_plan(builder, &plan_cold, GraphOptimizationLevel::Level3).unwrap();
         let _s = builder
             .with_intra_threads(1)
@@ -690,7 +690,7 @@ mod tests {
         let plan_miss = LoadPlan::decide(Some(&cache), &onnx_path);
         assert!(matches!(plan_miss, LoadPlan::Miss { .. }));
         let t1 = Instant::now();
-        let builder = Session::builder().unwrap();
+        let builder = Session::builder(crate::arena::ort_env().unwrap()).unwrap();
         let builder = apply_plan(builder, &plan_miss, GraphOptimizationLevel::Level3).unwrap();
         let _s = builder
             .with_intra_threads(1)
@@ -708,7 +708,7 @@ mod tests {
         let plan_hit = LoadPlan::decide(Some(&cache), &onnx_path);
         assert!(matches!(plan_hit, LoadPlan::Hit { .. }));
         let t2 = Instant::now();
-        let builder = Session::builder().unwrap();
+        let builder = Session::builder(crate::arena::ort_env().unwrap()).unwrap();
         let builder = apply_plan(builder, &plan_hit, GraphOptimizationLevel::Level3).unwrap();
         let _s = builder
             .with_intra_threads(1)

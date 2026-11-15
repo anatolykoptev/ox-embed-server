@@ -66,12 +66,22 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates curl && \
     rm -rf /var/lib/apt/lists/*
 
-# Download ONNX Runtime 1.24.3
+# ONNX Runtime 1.32.0 (released 2026-11-13), pinned by version and sha256.
+# Digests are the ones GitHub publishes for the release assets; a bump must
+# update both. `ort` 2.0.0-rc.15 targets ORT 1.31 and negotiates the C API
+# version at load time, so a newer dylib is accepted.
 ARG TARGETARCH
-RUN ORT_VER="1.24.3" && \
-    if [ "$TARGETARCH" = "arm64" ]; then ORT_ARCH="aarch64"; else ORT_ARCH="x64"; fi && \
-    curl -L -o /tmp/ort.tgz \
+RUN ORT_VER="1.32.0" && \
+    if [ "$TARGETARCH" = "arm64" ]; then \
+      ORT_ARCH="aarch64"; \
+      ORT_SHA256="81a46251dd90da4122f4b9ceb4433f836fbc79ee1eddffca7c09033af81a1939"; \
+    else \
+      ORT_ARCH="x64"; \
+      ORT_SHA256="bb169b7e374731730d2ae406fb39de7be4b315f413a9132efe896261c31bb503"; \
+    fi && \
+    curl -fL -o /tmp/ort.tgz \
       "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VER}/onnxruntime-linux-${ORT_ARCH}-${ORT_VER}.tgz" && \
+    echo "${ORT_SHA256}  /tmp/ort.tgz" | sha256sum -c - && \
     tar -xzf /tmp/ort.tgz -C /tmp/ && \
     cp /tmp/onnxruntime-linux-${ORT_ARCH}-${ORT_VER}/lib/libonnxruntime.so /usr/lib/ && \
     ldconfig && \

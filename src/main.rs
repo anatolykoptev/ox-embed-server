@@ -159,8 +159,8 @@ async fn main() {
     let otel_provider = otel::init();
 
     // Initialize ort runtime explicitly (required for load-dynamic).
-    if !ort::init().commit() {
-        eprintln!("ort init failed (environment already configured?)");
+    if let Err(e) = arena::ort_env() {
+        eprintln!("{e}");
     }
     tracing::info!("ort runtime initialized");
 

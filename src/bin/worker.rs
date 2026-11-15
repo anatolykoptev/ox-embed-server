@@ -250,8 +250,8 @@ async fn main() -> anyhow::Result<()> {
     // after `ort::init().commit()` — the worker previously relied on
     // lazy init, which meant the global thread pool options were never
     // set in the process that actually runs inference.
-    if !ort::init().commit() {
-        tracing::warn!("ort init failed (environment already configured?)");
+    if let Err(e) = embed_server::arena::ort_env() {
+        tracing::warn!("{e}");
     }
     tracing::info!(model = %model_name, "ort runtime initialized in worker");
 

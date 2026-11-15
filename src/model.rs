@@ -318,7 +318,7 @@ impl EmbedModel {
                     def.name
                 )
             })?;
-            opts.add_config_entry("memory.enable_memory_arena_shrinkage", "cpu:0")
+            opts.set("memory.enable_memory_arena_shrinkage", "cpu:0")
                 .map_err(|e| {
                     format!(
                         "model {}: failed to add arena shrinkage config entry: {e}",
@@ -1074,7 +1074,8 @@ fn build_one_session(
     // `DisableCpuMemArena` (PR #34), the session has only the shared
     // arena to draw from — pattern planning amortizes per-shape
     // scratch allocations across requests.
-    let builder = Session::builder().map_err(|e| format!("session builder: {e}"))?;
+    let builder =
+        Session::builder(crate::arena::ort_env()?).map_err(|e| format!("session builder: {e}"))?;
     let builder = onnx_cache::apply_plan(builder, &plan, opt_level)
         .map_err(|e| format!("apply cache plan: {e}"))?;
     let allow_spinning = crate::arena::parse_intra_op_spinning();

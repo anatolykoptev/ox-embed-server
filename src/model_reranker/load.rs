@@ -404,7 +404,8 @@ fn build_session_pool(
         // now produces scratch reuse rather than per-session duplication.
         // Reranker pool members benefit most because they see the highest
         // shape variability (B × pairs × seq_len).
-        let builder = Session::builder().map_err(|e| format!("session builder #{i}: {e}"))?;
+        let builder = Session::builder(crate::arena::ort_env()?)
+            .map_err(|e| format!("session builder #{i}: {e}"))?;
         let builder = onnx_cache::apply_plan(builder, &plan, opt_level)
             .map_err(|e| format!("apply cache plan #{i}: {e}"))?;
         let mut builder = builder
