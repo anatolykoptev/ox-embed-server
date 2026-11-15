@@ -89,9 +89,10 @@ pub fn configure_truncation(
     Ok(())
 }
 
-/// Parse the `ORT_OPT_LEVEL` env var (0..=3) into an ort
-/// `GraphOptimizationLevel`. Defaults to `Level3` (all optimizations) when
-/// the variable is unset or unparseable.
+/// Parse the `ORT_OPT_LEVEL` env var (0..=4) into an ort
+/// `GraphOptimizationLevel`. Defaults to `Level3` (layout optimizations) when the variable is
+/// unset or unparseable. `4` is ORT's `ENABLE_ALL`, what the Python runtime uses by default;
+/// it differs numerically from `3` on dynamically-quantised exports.
 fn parse_opt_level() -> GraphOptimizationLevel {
     let raw = std::env::var("ORT_OPT_LEVEL")
         .ok()
@@ -101,6 +102,7 @@ fn parse_opt_level() -> GraphOptimizationLevel {
         0 => GraphOptimizationLevel::Disable,
         1 => GraphOptimizationLevel::Level1,
         2 => GraphOptimizationLevel::Level2,
+        4 => GraphOptimizationLevel::All,
         _ => GraphOptimizationLevel::Level3,
     }
 }
@@ -156,6 +158,9 @@ pub struct EmbedModel {
     ///
     /// Default `2.0` is measured, not guessed — see `plan_subbatches`.
     subbatch_ratio: f32,
+    /// `EMBED_PAD_EXACT`: pad each pass to its longest sequence instead of the next power of two.
+    /// Needed for dynamically-quantised int8 exports (bge-m3), whose output shifts with the padded width.
+    pad_exact: bool,
     /// Whether per-run BFCArena shrinkage is enabled for this model.
     ///
     /// When `true`, `embed_tokens` and `warmup_at_shape` call
@@ -343,6 +348,7 @@ impl EmbedModel {
         crate::metrics::set_arena_shrink_enabled(&def.name, arena_shrink_enabled);
 
         let subbatch_ratio = resolve_subbatch_ratio(&def.name);
+        let pad_exact = resolve_pad_exact(&def.name);
         crate::metrics::set_subbatch_ratio(&def.name, subbatch_ratio);
         crate::metrics::touch_tokenize_hard_clip(&def.name);
 
@@ -357,6 +363,7 @@ impl EmbedModel {
             has_token_type_ids: def.has_token_type_ids,
             num_heads,
             subbatch_ratio,
+            pad_exact,
             arena_shrink_enabled,
             run_options,
             eviction_handle,
@@ -447,7 +454,7 @@ impl EmbedModel {
             .iter()
             .map(|g| {
                 let widest = g.iter().map(|&i| lens[i]).max().unwrap_or(0);
-                g.len() * round_up_seq_len(widest, self.max_len)
+                g.len() * padded_seq_len(widest, self.max_len, self.pad_exact)
             })
             .sum();
         crate::metrics::record_padding_waste(&self.name, padded, real);
@@ -500,7 +507,7 @@ impl EmbedModel {
             .max()
             .unwrap_or(0)
             .min(self.max_len);
-        let max_seq = round_up_seq_len(real_max_seq, self.max_len);
+        let max_seq = padded_seq_len(real_max_seq, self.max_len, self.pad_exact);
 
         let batch = token_ids.len();
 
@@ -612,7 +619,13 @@ impl EmbedModel {
         let mask_arr_f = Array2::from_shape_vec([batch, max_seq], pool::mask_i64_to_f32(&mask_i64))
             .map_err(|e| format!("mask_f shape: {e}"))?;
 
-        pool::mean_pool_normalize(&raw, &mask_arr_f, batch, max_seq, self.dim)
+        // A rank-2 output is already pooled inside the graph (bge-m3 `dense_vecs`, CLS
+        // pooling): normalise only. Rank 3 is `[B, S, D]` token states: masked mean + L2.
+        if raw.ndim() == 2 {
+            pool::pooled_normalize(&raw, batch, self.dim)
+        } else {
+            pool::mean_pool_normalize(&raw, &mask_arr_f, batch, max_seq, self.dim)
+        }
     }
 
     /// Return the model name (for test assertions and metric label reuse).
@@ -944,6 +957,35 @@ pub(crate) fn plan_subbatches(lens: &[usize], ratio: f32) -> Vec<Vec<usize>> {
     groups
 }
 
+/// Padded width of one forward pass: `n` itself when `exact`, else the power-of-two round-up.
+fn padded_seq_len(n: usize, cap: usize, exact: bool) -> usize {
+    if exact {
+        n.clamp(1, cap.max(1))
+    } else {
+        round_up_seq_len(n, cap)
+    }
+}
+
+/// `EMBED_PAD_EXACT_<MODEL>` (else `EMBED_PAD_EXACT`): `1`/`true`/`yes` turns exact padding on.
+/// Default off, so existing deployments keep power-of-two padding.
+fn resolve_pad_exact(model_key: &str) -> bool {
+    let per_model = format!(
+        "EMBED_PAD_EXACT_{}",
+        crate::config::model_env_key(model_key)
+    );
+    let raw = std::env::var(&per_model)
+        .ok()
+        .or_else(|| std::env::var("EMBED_PAD_EXACT").ok());
+    parse_pad_exact(raw.as_deref())
+}
+
+pub(crate) fn parse_pad_exact(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes")
+    )
+}
+
 fn round_up_seq_len(n: usize, cap: usize) -> usize {
     if n <= 1 {
         // Empty/singleton input → 1-token tensor. `max_len` is always
@@ -1148,7 +1190,30 @@ fn build_one_session(
 #[cfg(test)]
 mod seq_pad_tests {
     use super::round_up_seq_len;
-    use super::{DEFAULT_SUBBATCH_RATIO, parse_subbatch_ratio, plan_subbatches};
+    use super::{
+        DEFAULT_SUBBATCH_RATIO, padded_seq_len, parse_pad_exact, parse_subbatch_ratio,
+        plan_subbatches,
+    };
+
+    #[test]
+    fn exact_padding_keeps_the_longest_sequence_width() {
+        // 7 tokens: power-of-two padding widens to 8, exact padding stays at 7.
+        assert_eq!(padded_seq_len(7, 512, false), 8);
+        assert_eq!(padded_seq_len(7, 512, true), 7);
+        // the model cap and the 1-token floor apply in both modes
+        assert_eq!(padded_seq_len(900, 512, true), 512);
+        assert_eq!(padded_seq_len(0, 512, true), 1);
+    }
+
+    #[test]
+    fn pad_exact_flag_is_opt_in() {
+        assert!(!parse_pad_exact(None), "default keeps power-of-two padding");
+        assert!(!parse_pad_exact(Some("")));
+        assert!(!parse_pad_exact(Some("0")));
+        assert!(!parse_pad_exact(Some("maybe")));
+        assert!(parse_pad_exact(Some("1")));
+        assert!(parse_pad_exact(Some(" True ")));
+    }
 
     /// Flatten a plan back to a sorted index list.
     fn flat(groups: &[Vec<usize>]) -> Vec<usize> {

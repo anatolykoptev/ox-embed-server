@@ -887,7 +887,7 @@ async fn main() {
         .layer(axum::middleware::from_fn(otel::trace_request))
         .with_state(router_state);
 
-    let addr = format!("0.0.0.0:{}", cfg.port);
+    let addr = std::net::SocketAddr::new(cfg.bind_ip, cfg.port);
     tracing::info!(addr = %addr, "embed-server listening");
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();

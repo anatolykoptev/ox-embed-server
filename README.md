@@ -110,10 +110,17 @@ Environment variables (parsed in `src/config.rs`):
 | `BATCH_WAIT_MS` | `10` | Coalesce window. |
 | `MAX_QUEUE_SIZE` | `256` | Queue cap → 503. |
 | `EMBED_MAX_WAITERS` | `8×pool_size` (floor 16) | Worker waiter-queue cap per worker. Set higher (e.g. `64`) to absorb bulk-indexing bursts without touching `EMBED_SESSION_POOL_SIZE`. |
+| `EMBED_BIND_ADDR` | `0.0.0.0` | Listen IP literal. `127.0.0.1` for a loopback-only local sidecar; a non-IP value is a startup error. |
+| `EMBED_IDLE_EVICT_SECS` | `0` (off) | Free a model's ONNX sessions after this many idle seconds; the next request reloads them lazily (cold start, seconds). |
+| `EMBED_PAD_EXACT` (`_<MODEL>`) | off | Pad each pass to its longest sequence instead of the next power of two. Needed to reproduce dynamically-quantised int8 exports (bge-m3) whose output depends on padded width. |
+| `ORT_OPT_LEVEL` | `3` | `0..=3`; `4` = ORT `ENABLE_ALL`. |
 | `DRAIN_TIMEOUT_S` | `10` | SIGTERM drain window. |
 | `ORT_DYLIB_PATH` | `/usr/lib/libonnxruntime.so` | Required with `load-dynamic`. |
 | `EMBED_VERSION` | `dev` | Stamped into `embed_build_info`. |
 | `AUTO_TRUNCATE` | `true` | TEI-compat. Only literal `false` (case-insensitive) disables; `0`/`no`/`off`/empty leave it enabled. |
+
+Models whose ONNX graph already pools (rank-2 `[batch, dim]` output, e.g. the bge-m3 `dense_vecs` head) are
+L2-normalised as is; rank-3 token states are mask-averaged then normalised.
 
 Current production `EMBED_MODELS`:
 
