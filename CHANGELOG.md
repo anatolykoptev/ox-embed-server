@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.8.5](https://github.com/anatolykoptev/ox-embed-server/compare/embed-server-v0.8.4...embed-server-v0.8.5) (2026-11-15)
+
+
+### Bug Fixes
+
+* **deps:** update crates flagged by osv-scanner (h2, rustls, tokio, webpki, rustix) ([#179](https://github.com/anatolykoptev/ox-embed-server/issues/179)) ([0dd70b5](https://github.com/anatolykoptev/ox-embed-server/commit/0dd70b5bf3e2fdca893a0c897018716eeecf04f6))
+* **supervisor:** decouple the heartbeat freshness window from the probe interval ([#174](https://github.com/anatolykoptev/ox-embed-server/issues/174)) ([c336f71](https://github.com/anatolykoptev/ox-embed-server/commit/c336f719f106a7a8d7fbccccee6417efddcfcf7d))
+
+
+### Performance Improvements
+
+* **embed,rerank:** cut padded tokens — multiple-of-4 pad width, length sub-batching for rerank ([#183](https://github.com/anatolykoptev/ox-embed-server/issues/183)) ([657a6c9](https://github.com/anatolykoptev/ox-embed-server/commit/657a6c9c889fa783e8caf16910acf9fc46899fb5))
+
 ## [0.8.4](https://github.com/anatolykoptev/ox-embed-server/compare/embed-server-v0.8.3...embed-server-v0.8.4) (2026-08-05)
 
 
