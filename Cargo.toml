@@ -36,11 +36,10 @@ opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 tracing-opentelemetry = "0.33"
 thiserror = "1"
 
-# Linux-only: glibc `malloc_trim(0)` background task in `main.rs` returns
-# unused trailing arena pages to the OS on a 100 ms cadence (TEI pattern,
-# `router/src/main.rs:222-229`). Compiled out on macOS/Windows via cfg
-# guards in main.rs — the dependency itself only links on Linux.
-[target.'cfg(target_os = "linux")'.dependencies]
+# Unix: `libc::kill` in the supervisor heartbeat (cfg(unix)) and, Linux-only via cfg guards,
+# glibc `malloc_trim(0)` in `main.rs`, which returns unused trailing arena pages to the OS on a
+# 100 ms cadence (TEI pattern, `router/src/main.rs:222-229`) and `mlock`. Windows has none of it.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [profile.release]

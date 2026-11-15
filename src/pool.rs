@@ -151,6 +151,43 @@ pub fn mean_pool_normalize(
     Ok(result)
 }
 
+/// L2-normalise a model output that is ALREADY pooled: shape `[batch, dim]`.
+///
+/// Some exports (e.g. the `dense_vecs` head of the bge-m3 ONNX) pool inside the graph
+/// (CLS pooling), so there is no token axis left to average. The vector is only
+/// L2-normalised here, which is what the in-graph `[B, S, D]` path ends with as well.
+/// Accumulation is f64, like [`mean_pool_normalize`].
+pub fn pooled_normalize(
+    raw: &ArrayViewD<'_, f32>,
+    batch: usize,
+    dim: usize,
+) -> Result<Vec<Vec<f32>>, String> {
+    let shape = raw.shape();
+    if shape.len() != 2 || shape[0] != batch || shape[1] != dim {
+        return Err(format!(
+            "unexpected pooled output shape: {shape:?}, expected [{batch}, {dim}]"
+        ));
+    }
+    Ok(raw
+        .axis_iter(Axis(0))
+        .map(|row| {
+            let mut v: Vec<f32> = row.iter().copied().collect();
+            let norm = v
+                .iter()
+                .map(|&x| (x as f64) * (x as f64))
+                .sum::<f64>()
+                .sqrt();
+            if norm > 0.0 {
+                let inv = (1.0 / norm) as f32;
+                for x in &mut v {
+                    *x *= inv;
+                }
+            }
+            v
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,5 +390,37 @@ mod tests {
         let raw = raw_view(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 1, 3, 2);
         let mask = Array2::from_shape_vec((1, 3), vec![1.0, 0.0, 1.0]).unwrap();
         let _ = mean_pool_normalize(&raw, &mask, 1, 3, 2);
+    }
+
+    #[test]
+    fn pooled_normalize_unit_length_and_direction() {
+        let arr =
+            ndarray::Array2::from_shape_vec((2, 3), vec![3.0f32, 0.0, 4.0, 0.0, 0.0, 0.0]).unwrap();
+        let out = pooled_normalize(&arr.view().into_dyn(), 2, 3).unwrap();
+        assert!(
+            (out[0][0] - 0.6).abs() < 1e-6 && (out[0][2] - 0.8).abs() < 1e-6,
+            "{:?}",
+            out[0]
+        );
+        assert_eq!(
+            out[1],
+            vec![0.0, 0.0, 0.0],
+            "zero vector stays zero, no NaN"
+        );
+    }
+
+    #[test]
+    fn pooled_normalize_rejects_wrong_shape() {
+        let arr3 = Array3::<f32>::zeros((1, 2, 3));
+        assert!(pooled_normalize(&arr3.view().into_dyn(), 1, 3).is_err());
+        let arr2 = ndarray::Array2::<f32>::zeros((2, 3));
+        assert!(
+            pooled_normalize(&arr2.view().into_dyn(), 2, 4).is_err(),
+            "dim mismatch"
+        );
+        assert!(
+            pooled_normalize(&arr2.view().into_dyn(), 1, 3).is_err(),
+            "batch mismatch"
+        );
     }
 }

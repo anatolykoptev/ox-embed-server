@@ -107,6 +107,9 @@ pub struct SpladeModelDef {
 /// Server configuration parsed from environment variables.
 pub struct Config {
     pub port: u16,
+    /// Listen address, from `EMBED_BIND_ADDR` (default `0.0.0.0`, the container behaviour).
+    /// Set `127.0.0.1` for a loopback-only local sidecar.
+    pub bind_ip: std::net::IpAddr,
     pub models: Vec<ModelDef>,
     /// Zero-or-more cross-encoder rerankers. Unlike `models`, an empty
     /// list is valid (and the default when `RERANKER_MODELS` is unset):
@@ -363,6 +366,17 @@ pub struct Config {
     pub ready_probe_timeout_ms: u64,
 }
 
+/// Parse `EMBED_BIND_ADDR`. Unset or blank keeps the historical `0.0.0.0`; a value that is
+/// not an IP literal is an error (never silently widened to all interfaces).
+pub(crate) fn parse_bind_ip(raw: Option<&str>) -> Result<std::net::IpAddr, String> {
+    match raw.map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+        Some(v) => v
+            .parse::<std::net::IpAddr>()
+            .map_err(|e| format!("invalid EMBED_BIND_ADDR {v:?}: {e}")),
+    }
+}
+
 impl Config {
     /// Parse configuration from environment variables.
     ///
@@ -376,6 +390,8 @@ impl Config {
             .unwrap_or_else(|_| "8082".into())
             .parse::<u16>()
             .map_err(|e| format!("invalid EMBED_PORT: {e}"))?;
+
+        let bind_ip = parse_bind_ip(env::var("EMBED_BIND_ADDR").ok().as_deref())?;
 
         let models_str =
             env::var("EMBED_MODELS").map_err(|_| "EMBED_MODELS env var is required")?;
@@ -660,6 +676,7 @@ impl Config {
 
         Ok(Config {
             port,
+            bind_ip,
             models,
             rerankers,
             default_model,
@@ -2123,6 +2140,27 @@ mod tests {
             true, // per_model_memory_pattern: true (default)
         );
         assert!(def2.memory_pattern);
+    }
+
+    #[test]
+    fn parse_bind_ip_cases() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let all = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        assert_eq!(parse_bind_ip(None).unwrap(), all, "unset keeps 0.0.0.0");
+        assert_eq!(
+            parse_bind_ip(Some("  ")).unwrap(),
+            all,
+            "blank keeps 0.0.0.0"
+        );
+        assert_eq!(
+            parse_bind_ip(Some("127.0.0.1")).unwrap(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+        assert!(parse_bind_ip(Some("::1")).unwrap().is_loopback());
+        assert!(
+            parse_bind_ip(Some("localhost")).is_err(),
+            "not an IP literal: error, not widened"
+        );
     }
 
     // -----------------------------------------------------------------
