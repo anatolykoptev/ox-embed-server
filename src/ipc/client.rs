@@ -170,6 +170,37 @@ impl WorkerClient {
     }
 }
 
+/// Test-only fake worker: answers every request with whatever `reply` builds
+/// from the request id. Lets handler tests drive the real `WorkerClient`.
+#[cfg(test)]
+#[allow(dead_code)] // used by the bin target's handler tests only
+pub(crate) mod test_support {
+    use super::*;
+    use crate::ipc::frame::{read_frame, write_frame};
+
+    /// Bind `sock`, serve requests forever on a background task and return a
+    /// connected client. The connect probe (connect + drop) is ignored.
+    pub(crate) async fn fake_worker_client(
+        sock: PathBuf,
+        reply: fn(u64) -> WorkerResponse,
+    ) -> WorkerClient {
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    if let Ok(req) = read_frame::<_, WorkerRequest>(&mut stream).await {
+                        let _ = write_frame(&mut stream, &reply(req.request_id())).await;
+                    }
+                });
+            }
+        });
+        WorkerClient::connect(sock, 1).await.unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

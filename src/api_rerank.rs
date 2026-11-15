@@ -556,7 +556,6 @@ pub async fn rerank(
             got = scores.len(),
             "rerank score count mismatch"
         );
-        metrics::record_inference_failure(&model_name, "count_mismatch", 0);
         finish!(
             "server_error",
             server_error("internal error: score count mismatch".to_string())
@@ -1335,5 +1334,79 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(read() - before, 1.0);
+    }
+
+    async fn rerank_against_fake(
+        model: &str,
+        reply: fn(u64) -> crate::ipc::protocol::WorkerResponse,
+    ) -> axum::response::Response {
+        let dir = tempfile::tempdir().unwrap();
+        let client =
+            crate::ipc::client::test_support::fake_worker_client(dir.path().join("w.sock"), reply)
+                .await;
+        let spec = SpawnSpec {
+            model: model.to_string(),
+            kind: WorkerKind::Rerank,
+            worker_bin: PathBuf::from("/bin/true"),
+            socket_dir: PathBuf::from("/tmp"),
+            pool_size: 1,
+            intra_threads: 1,
+            env_extra: vec![],
+        };
+        let pool = WorkerPool::with_dispatch_timeout(std::time::Duration::from_millis(50));
+        pool.add(WorkerSupervisor::for_test(spec, Arc::new(client)))
+            .await;
+        let mut state = make_state_rerank_worker_respawning_for(model).await;
+        Arc::get_mut(&mut state).unwrap().worker_pool = Some(Arc::new(pool));
+        make_app(state)
+            .oneshot(make_rerank_request_for(model))
+            .await
+            .unwrap()
+    }
+
+    fn rerank_failures(model: &str, reason: &str) -> f64 {
+        let needle = format!(
+            "embed_inference_failures_total{{model=\"{model}\",reason=\"{reason}\",bin_num=\"0\"}} "
+        );
+        test_prom()
+            .render()
+            .lines()
+            .find_map(|l| l.strip_prefix(needle.as_str()))
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(0.0)
+    }
+
+    /// Wrong response variant for a rerank request: 500, counted.
+    #[tokio::test]
+    async fn rerank_unexpected_variant_is_500_and_counted() {
+        let model = "rerank-wrong-variant";
+        let before = rerank_failures(model, "unexpected_response");
+        let resp = rerank_against_fake(model, |id| {
+            crate::ipc::protocol::WorkerResponse::Embed(crate::ipc::protocol::EmbedResponseOk {
+                request_id: id,
+                vectors: vec![],
+                dims: 4,
+            })
+        })
+        .await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(rerank_failures(model, "unexpected_response") - before, 1.0);
+    }
+
+    /// Wrong score count from a live worker: 500 `ipc_protocol`, no retry hint.
+    #[tokio::test]
+    async fn rerank_wrong_score_count_is_500_ipc_protocol() {
+        let model = "rerank-wrong-count";
+        let before = rerank_failures(model, "ipc_protocol");
+        let resp = rerank_against_fake(model, |id| {
+            crate::ipc::protocol::WorkerResponse::Rerank(crate::ipc::protocol::RerankResponseOk {
+                request_id: id,
+                scores: vec![],
+            })
+        })
+        .await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(resp.headers().get("retry-after").is_none());
+        assert_eq!(rerank_failures(model, "ipc_protocol") - before, 1.0);
     }
 }

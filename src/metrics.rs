@@ -1087,6 +1087,8 @@ pub fn classify_worker_error(message: &str) -> &'static str {
 ///   bytes of <M>" (`ORT_MAKE_STATUS(... FAIL, ...)`, line 105)
 /// - `BFCArena::Extend`: "Failed to allocate memory for requested buffer of
 ///   size <M>" (line 201)
+/// - `AllocateRawInternal`, line 343: "Failed to find a free memory block despite
+///   calling Extend. rounded_bytes=<M>"
 /// - `AllocateRawInternal` rethrows either one with `ORT_THROW`, which prefixes
 ///   the source location, so the file name `bfc_arena.cc` may precede the text.
 ///
@@ -1098,10 +1100,17 @@ pub fn classify_worker_error(message: &str) -> &'static str {
 fn is_arena_oom(m: &str) -> bool {
     (m.contains("available memory of") && m.contains("smaller than requested bytes"))
         || m.contains("failed to allocate memory for requested buffer")
+        || m.contains("failed to find a free memory block")
         || m.contains("arena")
         || m.contains("out of memory")
         || m.split(|c: char| !c.is_ascii_alphanumeric())
             .any(|w| w == "oom")
+}
+
+/// Case-insensitive [`is_arena_oom`] on a raw error string, for callers that
+/// do not go through [`classify_worker_error`] (the in-process ORT path).
+pub fn is_arena_oom_message(msg: &str) -> bool {
+    is_arena_oom(&msg.to_ascii_lowercase())
 }
 
 /// Every `reason` label `embed_inference_failures_total` can carry: the
@@ -1121,7 +1130,9 @@ pub const INFERENCE_FAILURE_REASONS: &[&str] = &[
     "worker_unavailable",
     "no_worker",
     "unexpected_response",
-    "count_mismatch",
+    // A live worker broke the IPC contract (response id or cardinality
+    // mismatch): deterministic, not retryable.
+    "ipc_protocol",
 ];
 
 /// Pre-touch `embed_inference_failures_total` at 0 for every reason.
@@ -1564,12 +1575,34 @@ mod classify_worker_error_tests {
         for msg in [
             "Available memory of 1073741824 is smaller than requested bytes of 1258291200",
             "Failed to allocate memory for requested buffer of size 1258291200",
+            "Failed to find a free memory block despite calling Extend. rounded_bytes=1258291200",
             "/onnxruntime/onnxruntime/core/framework/bfc_arena.cc:359 void* \
              onnxruntime::BFCArena::AllocateRawInternal(size_t, bool, \
              onnxruntime::Stream*, bool, onnxruntime::WaitNotificationFn) \
              Available memory of 1073741824 is smaller than requested bytes of 1258291200",
         ] {
             assert_eq!(classify_worker_error(msg), "arena_oom", "message: {msg}");
+        }
+    }
+
+    /// Every output of `classify_worker_error` must be a pre-touched reason,
+    /// or `rate()` over that reason has no series at 0.
+    #[test]
+    fn every_classifier_output_is_pre_touched() {
+        for msg in [
+            "worker queue overflow",
+            "worker semaphore closed",
+            "worker saturated",
+            "Available memory of 1 is smaller than requested bytes of 2",
+            "kind mismatch: model is embed",
+            "tokenizer failed",
+            "something else",
+        ] {
+            let reason = classify_worker_error(msg);
+            assert!(
+                crate::metrics::INFERENCE_FAILURE_REASONS.contains(&reason),
+                "{reason} (from {msg:?}) missing from INFERENCE_FAILURE_REASONS"
+            );
         }
     }
 

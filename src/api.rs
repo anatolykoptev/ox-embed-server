@@ -474,7 +474,6 @@ pub async fn embeddings(
             got = miss_vectors.len(),
             "miss vector count mismatch"
         );
-        crate::metrics::record_inference_failure(&model_name, "count_mismatch", 0);
         crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1239,5 +1238,69 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(failures(model, "no_worker") - before, 1.0);
+    }
+
+    // ---- fake-worker tests: the worker answers, but wrongly ----
+
+    use crate::ipc::protocol::{EmbedResponseOk, RerankResponseOk, WorkerResponse};
+
+    /// Drive /v1/embeddings against a fake worker that replies with `reply`.
+    async fn embed_against_fake(
+        model: &str,
+        reply: fn(u64) -> WorkerResponse,
+    ) -> axum::response::Response {
+        let dir = tempfile::tempdir().unwrap();
+        let client =
+            crate::ipc::client::test_support::fake_worker_client(dir.path().join("w.sock"), reply)
+                .await;
+        let pool = WorkerPool::with_dispatch_timeout(Duration::from_millis(50));
+        pool.add(WorkerSupervisor::for_test(
+            spec_for(model),
+            Arc::new(client),
+        ))
+        .await;
+        make_app(state_with_pool(model, pool))
+            .oneshot(request_for(model))
+            .await
+            .unwrap()
+    }
+
+    /// A worker answering an embed request with a rerank response is a
+    /// 500 (`unexpected_response`), and must be counted.
+    #[tokio::test]
+    async fn embed_unexpected_variant_is_500_and_counted() {
+        let model = "wrong-variant-model";
+        let before = failures(model, "unexpected_response");
+        let resp = embed_against_fake(model, |id| {
+            WorkerResponse::Rerank(RerankResponseOk {
+                request_id: id,
+                scores: vec![],
+            })
+        })
+        .await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(failures(model, "unexpected_response") - before, 1.0);
+    }
+
+    /// A live worker returning the wrong number of vectors broke the IPC
+    /// contract: deterministic, so 500 `ipc_protocol` (not a retryable 503
+    /// `worker_died`).
+    #[tokio::test]
+    async fn embed_wrong_vector_count_is_500_ipc_protocol() {
+        let model = "wrong-count-model";
+        let before = failures(model, "ipc_protocol");
+        let died = failures(model, "worker_died");
+        let resp = embed_against_fake(model, |id| {
+            WorkerResponse::Embed(EmbedResponseOk {
+                request_id: id,
+                vectors: vec![],
+                dims: 4,
+            })
+        })
+        .await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(resp.headers().get("retry-after").is_none());
+        assert_eq!(failures(model, "ipc_protocol") - before, 1.0);
+        assert_eq!(failures(model, "worker_died"), died);
     }
 }

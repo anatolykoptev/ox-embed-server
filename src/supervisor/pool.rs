@@ -35,12 +35,30 @@ pub enum DispatchError {
     Ipc(#[from] std::io::Error),
 }
 
+trait IpcErrorExt {
+    /// `InvalidData`/`InvalidInput` come from a live worker answering with the
+    /// wrong response id or cardinality (`ipc::client`) or an undecodable
+    /// frame: deterministic, so a retry only repeats it. Connect, EOF and
+    /// broken-pipe errors mean the worker is gone.
+    fn is_protocol_violation(&self) -> bool;
+}
+
+impl IpcErrorExt for std::io::Error {
+    fn is_protocol_violation(&self) -> bool {
+        matches!(
+            self.kind(),
+            std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput
+        )
+    }
+}
+
 impl DispatchError {
     /// Bounded `reason` label for `embed_inference_failures_total`.
     pub fn failure_reason(&self) -> &'static str {
         match self {
             DispatchError::NoWorker { .. } => "no_worker",
             DispatchError::Timeout { .. } => "worker_unavailable",
+            DispatchError::Ipc(e) if e.is_protocol_violation() => "ipc_protocol",
             DispatchError::Ipc(_) => "worker_died",
         }
     }
@@ -49,7 +67,11 @@ impl DispatchError {
     /// handlers answer 503 + `Retry-After` instead of a permanent-looking 500.
     /// `NoWorker` is a config error and stays 500.
     pub fn is_transient(&self) -> bool {
-        matches!(self, DispatchError::Timeout { .. } | DispatchError::Ipc(_))
+        match self {
+            DispatchError::Timeout { .. } => true,
+            DispatchError::Ipc(e) => !e.is_protocol_violation(),
+            DispatchError::NoWorker { .. } => false,
+        }
     }
 }
 
@@ -261,11 +283,27 @@ mod tests {
         };
         let none = DispatchError::NoWorker { model: "m".into() };
         assert_eq!(ipc.failure_reason(), "worker_died");
+        let proto = DispatchError::Ipc(std::io::Error::from(std::io::ErrorKind::InvalidData));
+        assert_eq!(proto.failure_reason(), "ipc_protocol");
+        assert!(
+            !proto.is_transient(),
+            "a protocol violation is not retryable"
+        );
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::BrokenPipe,
+        ] {
+            let e = DispatchError::Ipc(std::io::Error::from(kind));
+            assert_eq!(e.failure_reason(), "worker_died", "{kind:?}");
+            assert!(e.is_transient(), "{kind:?}");
+        }
         assert_eq!(timeout.failure_reason(), "worker_unavailable");
         assert_eq!(none.failure_reason(), "no_worker");
         assert!(ipc.is_transient() && timeout.is_transient());
         assert!(!none.is_transient(), "a missing worker is a config error");
-        for e in [&ipc, &timeout, &none] {
+        for e in [&ipc, &proto, &timeout, &none] {
             assert!(
                 crate::metrics::INFERENCE_FAILURE_REASONS.contains(&e.failure_reason()),
                 "reason must be pre-touched: {}",
