@@ -17,7 +17,7 @@ use embed_server::ipc::protocol::{
     EmbedResponseOk, RerankResponseOk, SpladeResponseOk, WorkerRequest, WorkerResponse,
 };
 use embed_server::model::{StandaloneEmbedder, StandaloneReranker, StandaloneSplade};
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::PrometheusHandle;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -77,7 +77,7 @@ fn install_worker_metrics(model_name: &str) -> PrometheusHandle {
     // `embed_worker_queue_wait_duration_seconds` — land in the same buckets as the
     // supervisor's. A bare `PrometheusBuilder::new()` here would silently fall
     // back to library-default buckets, making cross-process comparison wrong.
-    let handle = embed_server::metrics::apply_histogram_buckets(PrometheusBuilder::new())
+    let handle = embed_server::metrics::worker_recorder_builder(model_name)
         .install_recorder()
         .expect("install Prometheus recorder in worker");
 
