@@ -886,6 +886,9 @@ async fn main() {
         // free; can exclude via env-driven sampler if it ever matters.
         .layer(axum::middleware::from_fn(otel::trace_request))
         .with_state(router_state);
+    // `X-Embed-Priority: bulk` demotes a request on the supervisor wait
+    // (interactive first, bulk aged in). Absent header = interactive.
+    let app = ipc::gate::with_priority_layer(app);
 
     let addr = format!("0.0.0.0:{}", cfg.port);
     tracing::info!(addr = %addr, "embed-server listening");
