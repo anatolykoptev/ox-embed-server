@@ -32,12 +32,33 @@ Tensor width was the longest sequence rounded up to the next power of two
 | multiple of 32 | 36.1 (one run) |
 | multiple of 16 | 29.4 (one run) |
 | multiple of 8 | 26.9 / 26.5 / 26.4 |
-| **multiple of 4 (chosen)** | **24.0 / 24.1 / 25.0** |
+| **multiple of 4 (chosen for `memory_pattern=false`)** | **24.0 / 24.1 / 25.0** |
+| multiple of 1 (no rounding), Apple silicon only | 5.9 (vs 5.7 for 4, 6.6 for 8, 6.2 for 16, 12.1 for power of two; two rounds) |
 
 The 32 and 16 rows come from an earlier single-round sweep on a quiet host
 (power of two 48.8, 4: 25.3, 8: 27.9 in that round) and show the same ordering:
 the less padding, the faster, so the "power-of-two tiles are cheaper" assumption did
 not hold on this CPU.
+
+### Which rule, when
+
+The pad rule follows the model's `memory_pattern` (`pool::seq_pad_multiple`,
+published as `embed_seq_pad_multiple{model}`): multiple of 4 with the pattern off
+(production), multiple of 16 with it on (the code default). With the pattern on
+ORT keeps one memory plan per distinct shape and the shared arena has a hard cap,
+so the shape count is bounded at the source: a 256-token model sees at most 16
+distinct widths instead of 64. Measured with the pattern on, 200 single-text
+requests of random length on a 4-core Neoverse-N1 host (RSS MiB; the host was
+heavily loaded by other tenants, so latency from that session is not reported):
+
+| rule | after load | after 32 / 64 / 96 / 128 / 160 / 192 / 200 requests | errors |
+|---|---|---|---|
+| power of two (old) | 1384 | 1410 / 1410 / 1410 / 1410 / 1410 / 1410 / 1410 | 0 |
+| multiple of 16 (chosen for the pattern on) | 1384 | 1406 / 1411 / 1411 / 1411 / 1410 / 1410 / 1410 | 0 |
+
+RSS is flat once the widths have been seen and the arena counters record no OOM.
+Multiples of 8 and 4 were not measured with the pattern on because they are not
+used there.
 
 Embedding quality, measured on the same host (128 sentences, seed 3, old build vs
 new build, cosine per vector):
@@ -57,6 +78,8 @@ shifts by about 0.1% cosine on average, 0.8% at worst. That is smaller than the
 batch-composition drift the old code already has (0.993 mean between a text embedded
 in a batch and alone). If vectors computed before this change are stored next to
 vectors computed after it, expect that order of difference for single-text requests.
+That is fine for ranking; a near-duplicate threshold set close to 1.0 should be
+checked against it.
 
 ## Before / after (2 intra threads, pool 1)
 
@@ -105,6 +128,9 @@ and top-5 overlap >= 4/5 against the single pass on every seed.
 
 ## Threads (new build, solo requests)
 
+Measured on the bare bench host, for completeness. **Not a recommendation:** an
+earlier trial of higher intra-op thread counts in production showed no gain.
+
 Min seconds, quieter round (load ~2.9):
 
 | setting | 16 rerank docs x 1000 ch | 128 e5 sentences |
@@ -114,12 +140,9 @@ Min seconds, quieter round (load ~2.9):
 | 4 intra threads | 3.34 | 16.2 |
 | e5 pool 2, one request split over both sessions (2 threads each; bench `--par 2`, not shipped code) | - | 16.1 |
 
-Raising intra threads helps a solo request by ~30% on a quiet host and nothing on a
-busy one (round 1, load 5: 7.5 / 4.5 / 6.4 s for 2 / 3 / 4 threads). Splitting one
-request across the two e5 sessions gives the same 16 s as 4 threads on one session,
-so there is no case for changing the pool code over raising `EMBED_INTRA_THREADS` /
-`RERANKER_INTRA_THREADS`; the cost is oversubscription when several workers are busy
-at once, which is the operator's call.
+On a busy host (round 1, load 5) the same rerank rows were 7.5 / 4.5 / 6.4 s for
+2 / 3 / 4 threads, i.e. no reliable gain. Splitting one request across the two e5
+sessions matched 4 threads on one session, so the pool code was not changed.
 
 ## Not changed
 

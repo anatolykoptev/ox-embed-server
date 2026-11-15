@@ -15,7 +15,7 @@ use crate::config::ModelDef;
 use crate::evictable_pool::{AcquireError, EvictablePool};
 use crate::mlock::{MlockedSession, read_and_mlock};
 use crate::onnx_cache::{self, CacheDir, LoadPlan};
-use crate::pool::{self, round_up_seq_len};
+use crate::pool;
 
 /// Configure tokenizer truncation.
 ///
@@ -156,6 +156,10 @@ pub struct EmbedModel {
     ///
     /// Default `2.0` is measured, not guessed — see `plan_subbatches`.
     subbatch_ratio: f32,
+    /// Pad-width multiple, chosen from this model's `memory_pattern`
+    /// (`pool::seq_pad_multiple`): fine when ORT keeps no per-shape plan,
+    /// coarse (bounded shape count) when it does.
+    pad_multiple: usize,
     /// Whether per-run BFCArena shrinkage is enabled for this model.
     ///
     /// When `true`, `embed_tokens` and `warmup_at_shape` call
@@ -344,6 +348,8 @@ impl EmbedModel {
 
         let subbatch_ratio = resolve_subbatch_ratio(&def.name);
         crate::metrics::set_subbatch_ratio(&def.name, subbatch_ratio);
+        let pad_multiple = pool::seq_pad_multiple(def.memory_pattern);
+        crate::metrics::set_seq_pad_multiple(&def.name, pad_multiple);
         crate::metrics::touch_tokenize_hard_clip(&def.name);
 
         Ok(Self {
@@ -357,6 +363,7 @@ impl EmbedModel {
             has_token_type_ids: def.has_token_type_ids,
             num_heads,
             subbatch_ratio,
+            pad_multiple,
             arena_shrink_enabled,
             run_options,
             eviction_handle,
@@ -443,7 +450,9 @@ impl EmbedModel {
         // per-group ratio improves by construction as groups narrow, so it
         // would report success even when the split saved nothing.
         let real: usize = lens.iter().sum();
-        let padded = pool::padded_tokens(&groups, &lens, |w| round_up_seq_len(w, self.max_len));
+        let padded = pool::padded_tokens(&groups, &lens, |w| {
+            pool::round_up_to_multiple(w, self.pad_multiple, self.max_len)
+        });
         crate::metrics::record_padding_waste(&self.name, padded, real);
         crate::metrics::record_subbatch_groups(&self.name, groups.len());
 
@@ -467,9 +476,9 @@ impl EmbedModel {
         }
 
         // Pad to the longest sequence in the batch, capped at model max,
-        // then round UP to a multiple of `SEQ_PAD_MULTIPLE` (also capped at
-        // `self.max_len`) so the GEMM row count stays tile-aligned without
-        // the up-to-2x waste of rounding to a power of two.
+        // then round UP to `self.pad_multiple` (4 with memory_pattern off, 16
+        // with it on; also capped at `self.max_len`) instead of the old
+        // power of two, which wasted up to 2x compute.
         // Correctness is preserved: `pool::build_tensors_from_ids` zero-
         // fills the mask over padded positions, and
         // `pool::mean_pool_normalize` averages only positions where
@@ -481,7 +490,7 @@ impl EmbedModel {
             .max()
             .unwrap_or(0)
             .min(self.max_len);
-        let max_seq = round_up_seq_len(real_max_seq, self.max_len);
+        let max_seq = pool::round_up_to_multiple(real_max_seq, self.pad_multiple, self.max_len);
 
         let batch = token_ids.len();
 
@@ -2116,66 +2125,80 @@ impl StandaloneSplade {
 #[cfg(test)]
 mod pad_call_site_tests {
     use super::EmbedModel;
-    use crate::pool::round_up_seq_len;
+    use crate::pool::{round_up_to_multiple, seq_pad_multiple};
 
-    /// The tensor `embed_tokens` builds must be as wide as
-    /// `round_up_seq_len(longest)`, not the next power of two. Read off
-    /// `embed_batch_token_budget` (= batch x width, recorded from the width
-    /// actually used), so a call site that bypasses `round_up_seq_len` — or
-    /// one that regresses to `next_power_of_two` — changes the sum.
+    /// The tensor `embed_tokens` builds must be as wide as the model's own pad
+    /// rule says — multiple of 4 with `memory_pattern` off, multiple of 16 with
+    /// it on — not the next power of two. Read off `embed_batch_token_budget`
+    /// (= batch x width, recorded from the width actually used), so a call site
+    /// that bypasses the rule, regresses to `next_power_of_two`, or reads the
+    /// wrong model flag changes the sum. Both branches run in one test because
+    /// each loads the model with the flag flipped on the parsed definition.
     #[test]
-    fn embed_tokens_pads_to_the_shared_multiple_not_a_power_of_two() {
-        let Ok(cfg) = crate::config::Config::from_env() else {
+    fn embed_tokens_pads_by_the_models_memory_pattern_rule() {
+        let Ok(mut cfg) = crate::config::Config::from_env() else {
             eprintln!("SKIP pad call-site test: config not loadable (EMBED_MODELS unset?)");
             return;
         };
-        let Some(def) = cfg.models.first() else {
+        if cfg.models.is_empty() {
             eprintln!("SKIP pad call-site test: no EMBED_MODELS entry");
             return;
-        };
+        }
         // Tests call `load` directly, bypassing main.rs, so do the worker's
         // init: ORT runtime first, then the shared arena (idempotent).
         let _ = ort::init().commit();
-        if crate::arena::register_shared_cpu_arena_for_model(&def.name).is_err() {
+        if crate::arena::register_shared_cpu_arena_for_model(&cfg.models[0].name).is_err() {
             eprintln!("SKIP pad call-site test: arena registration failed");
             return;
         }
-        let Ok(model) = EmbedModel::load(def, 1, true, 1, 0) else {
-            eprintln!("SKIP pad call-site test: model not loadable");
-            return;
-        };
         let handle = crate::metrics::test_prometheus_handle();
-        let needle = format!("embed_batch_token_budget_sum{{model=\"{}\"}}", def.name);
-        let budget = || {
+        let series = |name: &str, model: &str| {
+            let needle = format!("{name}{{model=\"{model}\"}}");
             handle
                 .render()
                 .lines()
                 .find_map(|l| l.strip_prefix(needle.as_str()))
                 .and_then(|v| v.trim().parse::<f64>().ok())
-                .unwrap_or(0.0)
         };
 
-        // Grow the text until it is longer than 32 tokens, so the next power
-        // of two (64) differs from the next multiple of the pad (<= 40).
-        let mut text = String::from("embedding latency on a small arm server");
-        let mut ids = model.tokenize(&[text.clone()]).expect("tokenize");
-        while ids[0].len() <= 32 {
-            text.push_str(" and another short clause about padding");
-            ids = model.tokenize(&[text.clone()]).expect("tokenize");
-        }
-        let longest = ids[0].len();
-        let width = round_up_seq_len(longest, def.max_len);
-        assert!(
-            width < longest.next_power_of_two().min(def.max_len),
-            "fixture must separate the two paddings: longest={longest} width={width}"
-        );
+        for memory_pattern in [false, true] {
+            cfg.models[0].memory_pattern = memory_pattern;
+            let def = &cfg.models[0];
+            let Ok(model) = EmbedModel::load(def, 1, true, 1, 0) else {
+                eprintln!("SKIP pad call-site test: model not loadable");
+                return;
+            };
+            let multiple = seq_pad_multiple(memory_pattern);
+            assert_eq!(
+                series("embed_seq_pad_multiple", &def.name),
+                Some(multiple as f64),
+                "memory_pattern={memory_pattern}: the live rule must be published"
+            );
 
-        let before = budget();
-        model.embed_tokens(&ids).expect("embed");
-        assert_eq!(
-            budget() - before,
-            width as f64,
-            "batch of 1 must be padded to {width}, not the next power of two"
-        );
+            // Grow the text past 32 tokens so the next power of two (64)
+            // differs from both rules' width (<= 48).
+            let mut text = String::from("embedding latency on a small arm server");
+            let mut ids = model.tokenize(&[text.clone()]).expect("tokenize");
+            while ids[0].len() <= 32 {
+                text.push_str(" and another short clause about padding");
+                ids = model.tokenize(&[text.clone()]).expect("tokenize");
+            }
+            let longest = ids[0].len();
+            let width = round_up_to_multiple(longest, multiple, def.max_len);
+            assert!(
+                width < longest.next_power_of_two().min(def.max_len),
+                "fixture must separate the paddings: longest={longest} width={width}"
+            );
+
+            let before = series("embed_batch_token_budget_sum", &def.name).unwrap_or(0.0);
+            model.embed_tokens(&ids).expect("embed");
+            let after = series("embed_batch_token_budget_sum", &def.name).unwrap_or(0.0);
+            assert_eq!(
+                after - before,
+                width as f64,
+                "memory_pattern={memory_pattern}: a batch of 1 must be padded to {width} \
+                 (multiple of {multiple}), not the next power of two"
+            );
+        }
     }
 }

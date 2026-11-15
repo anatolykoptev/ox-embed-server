@@ -168,15 +168,35 @@ pub fn round_up_to_multiple(n: usize, multiple: usize, cap: usize) -> usize {
         .min(cap)
 }
 
-/// Pad width is rounded up to a multiple of this many tokens (was: the next
-/// power of two, which padded a 33-token batch to 64 on the short-sentence
-/// batches callers send). 4 was the best of {4, 8, 16, 32} measured on the
-/// target CPU; see the PR description.
+/// Pad width multiple for a model whose ORT `memory_pattern` is OFF (the
+/// production setting). Was: the next power of two, which padded a 33-token
+/// batch to 64 on the short-sentence batches callers send. 4 beat 8, 16 and 32
+/// on the target CPU; see the PR description. With the pattern off ORT keeps no
+/// per-shape plan, so the up-to-64 distinct widths this allows cost nothing.
 pub const SEQ_PAD_MULTIPLE: usize = 4;
 
+/// Pad width multiple for a model whose `memory_pattern` is ON (the code
+/// default). ORT keeps one memory plan per distinct input shape and the shared
+/// arena has a hard cap (docs/arena.md; the jina and reranker OOMs), so the
+/// number of distinct widths must stay small: multiple-of-16 allows at most 16
+/// for a 256-token model. Measured: RSS flat over 200 random-length requests
+/// with pattern on, for both multiple-of-16 and the old power of two.
+pub const SEQ_PAD_MULTIPLE_PATTERN_ON: usize = 16;
+
+/// The pad multiple for a model, by its `memory_pattern` setting.
+pub fn seq_pad_multiple(memory_pattern: bool) -> usize {
+    if memory_pattern {
+        SEQ_PAD_MULTIPLE_PATTERN_ON
+    } else {
+        SEQ_PAD_MULTIPLE
+    }
+}
+
 /// The tensor width for a batch whose longest real sequence is `n` tokens,
-/// never above the model's `cap`. Single definition shared by the embedder
-/// and the batcher's `embed_batch_max_effective_seq` metric.
+/// never above the model's `cap`, under the `memory_pattern=false` rule. The
+/// batcher's `embed_batch_max_effective_seq` metric uses this; it does not know
+/// the model's pattern setting, so for a pattern-on model that metric is an
+/// approximation.
 pub fn round_up_seq_len(n: usize, cap: usize) -> usize {
     round_up_to_multiple(n, SEQ_PAD_MULTIPLE, cap)
 }
@@ -455,6 +475,35 @@ mod tests {
             "multiple 0 = no rounding"
         );
         assert_eq!(round_up_to_multiple(5, 1, 256), 5);
+    }
+
+    #[test]
+    fn pad_multiple_follows_memory_pattern() {
+        // Pattern off (production): fine rule. Pattern on (code default):
+        // coarse rule that bounds ORT's per-shape plans.
+        assert_eq!(seq_pad_multiple(false), 4);
+        assert_eq!(seq_pad_multiple(true), 16);
+        // The two branches really give different widths for the same batch.
+        assert_eq!(round_up_to_multiple(33, seq_pad_multiple(false), 256), 36);
+        assert_eq!(round_up_to_multiple(33, seq_pad_multiple(true), 256), 48);
+    }
+
+    #[test]
+    fn pattern_on_rule_bounds_the_number_of_distinct_widths() {
+        // The reason the coarse rule exists: with memory_pattern on every
+        // distinct width is a plan ORT keeps. For a 256-token model every
+        // possible longest length must land on <= 17 widths (16 multiples
+        // plus the 1-token floor); the fine rule is allowed 65.
+        let widths = |memory_pattern: bool| {
+            let mut w: Vec<usize> = (1..=256)
+                .map(|n| round_up_to_multiple(n, seq_pad_multiple(memory_pattern), 256))
+                .collect();
+            w.sort_unstable();
+            w.dedup();
+            w.len()
+        };
+        assert_eq!(widths(true), 17);
+        assert_eq!(widths(false), 65);
     }
 
     #[test]

@@ -489,6 +489,17 @@ pub fn record_subbatch_groups(model: &str, groups: usize) {
     .record(groups as f64);
 }
 
+/// Publish the pad-width multiple an embedder chose from its `memory_pattern`
+/// setting, so operators can read which rule is live instead of inferring it
+/// from env.
+pub fn set_seq_pad_multiple(model: &str, multiple: usize) {
+    metrics::gauge!(
+        "embed_seq_pad_multiple",
+        "model" => model.to_string()
+    )
+    .set(multiple as f64);
+}
+
 /// Publish the configured sub-batch length ratio so operators can read the
 /// effective value off `/metrics` instead of reconstructing it from the two
 /// env vars and a default.

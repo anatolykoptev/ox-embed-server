@@ -495,6 +495,10 @@ fn subbatch_ratio_env_reaches_the_gauge() {
 #[serial_test::serial]
 fn loaded_reranker_takes_its_ratio_from_the_env() {
     let name = "rr-load-env";
+    // The recorder must be installed BEFORE load, or the gauge set at load is
+    // dropped (and the test then only passes when another test happened to
+    // install it first in the same process).
+    crate::metrics::test_prometheus_handle();
     let Some(m) = with_ratio_env(Some("1.0"), || load_named_or_skip(name)) else {
         return;
     };
