@@ -227,6 +227,15 @@ impl RerankerModel {
             .collect();
         let groups = crate::model::plan_subbatches(&lens, self.subbatch_ratio);
         crate::metrics::record_subbatch_groups(&self.name, groups.len());
+        // Padding waste is reported across the WHOLE request (as the embedder
+        // does), not per pass: a per-pass ratio improves by construction as
+        // passes narrow, so it would report success even when a split saved
+        // nothing.
+        crate::metrics::record_rerank_padding_waste(
+            &self.name,
+            pool::padded_tokens(&groups, &lens, |w| w),
+            lens.iter().sum(),
+        );
         if groups.len() <= 1 {
             return self.score_dynamic_pass(token_ids);
         }
@@ -248,10 +257,6 @@ impl RerankerModel {
             .unwrap_or(0)
             .min(self.max_len);
         let batch = token_ids.len();
-        // Sum of clipped real lengths — used for padding-waste ratio. Each
-        // sequence contributes `min(len, max_len)` tokens of actual compute;
-        // the rest of the `[batch, max_seq]` tensor is padding.
-        let real_tokens: usize = token_ids.iter().map(|v| v.len().min(self.max_len)).sum();
         // Reuse `pool::build_tensors_from_ids` with `with_tti = false` — the
         // reranker ONNX graph has no `token_type_ids` input (confirmed via
         // `Session::inputs()` at load), so we skip the allocation entirely.
@@ -286,11 +291,6 @@ impl RerankerModel {
             })
             .map_err(|e| format!("reranker inference: {e}"))?;
         crate::metrics::record_rerank_inference(&self.name, inference_start.elapsed(), batch);
-        crate::metrics::record_rerank_padding_waste(
-            &self.name,
-            batch.saturating_mul(max_seq),
-            real_tokens,
-        );
 
         // The reranker emits a single output tensor named "logits" of
         // shape [batch, 1]. Extract, reshape, then flatten the trailing

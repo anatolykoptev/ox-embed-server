@@ -151,6 +151,19 @@ fn main() -> anyhow::Result<()> {
         .cloned();
     let mut dump_lines = String::new();
 
+    // `--churn N` (embed only): N single-text requests of random length, to see
+    // whether memory plateaus once every pad width has been seen.
+    let churn = arg_val(&args, "--churn", 0);
+    let churn_metrics = if churn > 0 {
+        Some(
+            metrics_exporter_prometheus::PrometheusBuilder::new()
+                .install_recorder()
+                .map_err(|e| anyhow::anyhow!("metrics recorder: {e}"))?,
+        )
+    } else {
+        None
+    };
+
     // Same init order as src/bin/worker.rs.
     if !ort::init().commit() {
         eprintln!("ort init: environment already configured");
@@ -188,6 +201,10 @@ fn main() -> anyhow::Result<()> {
         .then(|| StandaloneEmbedder::load(model, &cfg, threads, pool_size))
         .transpose()
         .map_err(|e| anyhow::anyhow!("load embedder: {e}"))?;
+
+    if let (Some(handle), Some(e)) = (&churn_metrics, &embedder) {
+        return run_churn(e, handle, &pool, churn);
+    }
 
     println!("kind,model,threads,pool,scenario,iters,min_s,p50_s,p95_s");
     for (name, n, chars) in scenarios {
@@ -279,6 +296,60 @@ fn main() -> anyhow::Result<()> {
     }
     if let Some(path) = dump {
         std::fs::write(&path, dump_lines)?;
+    }
+    Ok(())
+}
+
+/// Resident set size and its high-water mark in MiB (Linux; 0 elsewhere).
+fn rss_mib() -> (u64, u64) {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let kb = |key: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(key))
+            .and_then(|v| v.split_whitespace().next())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+            / 1024
+    };
+    (kb("VmRSS:"), kb("VmHWM:"))
+}
+
+/// `n` single-text requests whose length is uniform over 16..1100 characters
+/// (about 4..256 tokens), printing RSS every 32 requests and the failure /
+/// arena counters at the end. Same seed every run, so every pad rule sees the
+/// same request sequence.
+fn run_churn(
+    e: &StandaloneEmbedder,
+    handle: &metrics_exporter_prometheus::PrometheusHandle,
+    pool: &[String],
+    n: usize,
+) -> anyhow::Result<()> {
+    let mut rng = Lcg(0xC0FFEE);
+    let mut errors = 0usize;
+    let (rss0, _) = rss_mib();
+    println!("churn,request,rss_mib,peak_rss_mib,errors  (start rss {rss0})");
+    let start = Instant::now();
+    for i in 1..=n {
+        let chars = 16 + (rng.next() as usize % 1084);
+        let text = corpus(pool, 1, chars, rng.next()).remove(0);
+        if let Err(err) = e.infer(vec![text], 0) {
+            errors += 1;
+            eprintln!("request {i}: {err}");
+        }
+        if i % 32 == 0 || i == n {
+            let (rss, peak) = rss_mib();
+            println!("churn,{i},{rss},{peak},{errors}");
+        }
+    }
+    println!("churn_total_s,{:.1}", start.elapsed().as_secs_f64());
+    for l in handle.render().lines() {
+        let interesting = l.contains("arena_oom")
+            || l.contains("inference_failures")
+            || l.contains("arena_extend");
+        if interesting && !l.starts_with('#') {
+            println!("metric,{l}");
+        }
     }
     Ok(())
 }

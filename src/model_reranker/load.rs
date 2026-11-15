@@ -165,13 +165,7 @@ impl RerankerModel {
             "loaded reranker model"
         );
 
-        // `RERANKER_SUBBATCH_RATIO` (default 2.0, `<= 1.0` disables): the
-        // widest pair in one forward pass may be at most this many times the
-        // shortest.
-        let subbatch_ratio = crate::model::parse_subbatch_ratio(
-            std::env::var("RERANKER_SUBBATCH_RATIO").ok().as_deref(),
-        );
-        tracing::info!(model = %name, subbatch_ratio, "reranker sub-batch ratio");
+        let subbatch_ratio = resolve_subbatch_ratio(name);
 
         Ok(Self {
             name: name.to_string(),
@@ -186,6 +180,20 @@ impl RerankerModel {
             subbatch_ratio,
         })
     }
+}
+
+/// `RERANKER_SUBBATCH_RATIO` (default 2.0, `<= 1.0` disables): the widest pair
+/// in one forward pass may be at most this many times the shortest. Published
+/// as `embed_subbatch_ratio{model}` so an operator can read the kill switch's
+/// state off `/metrics` instead of inferring it from the env.
+pub(super) fn resolve_subbatch_ratio(name: &str) -> f32 {
+    let ratio = crate::model::parse_subbatch_ratio(
+        std::env::var("RERANKER_SUBBATCH_RATIO").ok().as_deref(),
+        "RERANKER_SUBBATCH_RATIO",
+    );
+    crate::metrics::set_subbatch_ratio(name, ratio);
+    tracing::info!(model = %name, subbatch_ratio = ratio, "reranker sub-batch ratio");
+    ratio
 }
 
 /// Per-shape session pool size. PR #27 hard-coded the legacy single-shape

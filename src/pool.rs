@@ -181,6 +181,27 @@ pub fn round_up_seq_len(n: usize, cap: usize) -> usize {
     round_up_to_multiple(n, SEQ_PAD_MULTIPLE, cap)
 }
 
+/// Tokens the tensors of a plan will hold: for each group, its size times the
+/// width `width_of` gives for the group's longest sequence. `lens` are the
+/// per-input lengths already capped at the model's `max_len`.
+///
+/// Used for the request-wide padding-waste metric. It sums over ALL groups: a
+/// per-group ratio improves by construction as groups narrow, so it would
+/// report success even when a split saved nothing.
+pub fn padded_tokens(
+    groups: &[Vec<usize>],
+    lens: &[usize],
+    width_of: impl Fn(usize) -> usize,
+) -> usize {
+    groups
+        .iter()
+        .map(|g| {
+            let widest = g.iter().map(|&i| lens[i]).max().unwrap_or(0);
+            g.len() * width_of(widest)
+        })
+        .sum()
+}
+
 /// Run `run` once per planned group and scatter the rows back to input order.
 ///
 /// `groups` is a partition of `0..total` (see `plan_subbatches`); `run`
@@ -434,6 +455,22 @@ mod tests {
             "multiple 0 = no rounding"
         );
         assert_eq!(round_up_to_multiple(5, 1, 256), 5);
+    }
+
+    #[test]
+    fn padded_tokens_sums_every_group_at_its_own_width() {
+        // Two groups: {0, 3} widest 10, {1, 2} widest 4. Identity width.
+        let lens = [10, 4, 3, 7];
+        let groups = vec![vec![0, 3], vec![1, 2]];
+        assert_eq!(padded_tokens(&groups, &lens, |w| w), 2 * 10 + 2 * 4);
+        // The width rule is applied to each group's widest, not to the batch's.
+        assert_eq!(
+            padded_tokens(&groups, &lens, |w| round_up_to_multiple(w, 4, 256)),
+            2 * 12 + 2 * 4
+        );
+        // One group is the old single-pass figure: batch x widest.
+        assert_eq!(padded_tokens(&[vec![0, 1, 2, 3]], &lens, |w| w), 4 * 10);
+        assert_eq!(padded_tokens(&[], &lens, |w| w), 0);
     }
 
     #[test]

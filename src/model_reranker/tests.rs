@@ -326,6 +326,17 @@ fn passes_recorded(model: &str) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Observations of `embed_rerank_padding_waste_ratio` recorded for `model`.
+fn waste_observations(model: &str) -> f64 {
+    let needle = format!("embed_rerank_padding_waste_ratio_count{{model=\"{model}\"}}");
+    crate::metrics::test_prometheus_handle()
+        .render()
+        .lines()
+        .find_map(|l| l.strip_prefix(needle.as_str()))
+        .and_then(|rest| rest.trim().parse::<f64>().ok())
+        .unwrap_or(0.0)
+}
+
 /// Pairs whose lengths differ by far more than the default 2.0 ratio: three
 /// short snippets interleaved with three long page chunks.
 fn mixed_length_docs() -> Vec<String> {
@@ -373,7 +384,13 @@ fn subbatched_scores_match_single_pass_and_keep_input_order() {
 
     m.subbatch_ratio = 2.0;
     let before = passes_recorded(name);
+    let waste_before = waste_observations(name);
     let split = m.score_pairs(&ids).expect("sub-batched");
+    assert_eq!(
+        waste_observations(name) - waste_before,
+        1.0,
+        "padding waste is one request-wide observation, not one per pass"
+    );
     assert!(
         passes_recorded(name) - before >= 2.0,
         "short and long pairs must run in separate forward passes at ratio 2.0"
@@ -411,4 +428,90 @@ fn subbatched_scores_match_single_pass_and_keep_input_order() {
             "pair {i}: reversed-input score {r} vs {s} — scatter order"
         );
     }
+}
+
+/// Run `f` with `RERANKER_SUBBATCH_RATIO` set to `value` (or unset), restoring
+/// the previous state after. Callers are `#[serial]`: env is process-wide.
+fn with_ratio_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+    const VAR: &str = "RERANKER_SUBBATCH_RATIO";
+    let prev = std::env::var(VAR).ok();
+    // SAFETY: serialised by `#[serial]`; no other test thread reads this
+    // variable while a `#[serial]` test is running.
+    unsafe {
+        match value {
+            Some(v) => std::env::set_var(VAR, v),
+            None => std::env::remove_var(VAR),
+        }
+    }
+    let out = f();
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var(VAR, v),
+            None => std::env::remove_var(VAR),
+        }
+    }
+    out
+}
+
+fn ratio_gauge(model: &str) -> Option<f64> {
+    let needle = format!("embed_subbatch_ratio{{model=\"{model}\"}}");
+    crate::metrics::test_prometheus_handle()
+        .render()
+        .lines()
+        .find_map(|l| l.strip_prefix(needle.as_str()))
+        .and_then(|v| v.trim().parse::<f64>().ok())
+}
+
+/// The kill switch must reach the loaded model AND be visible on `/metrics`.
+/// Model-free half: env -> parse -> gauge, plus the unset default.
+#[test]
+#[serial_test::serial]
+fn subbatch_ratio_env_reaches_the_gauge() {
+    crate::metrics::test_prometheus_handle();
+    let got = with_ratio_env(Some("1.0"), || {
+        super::load::resolve_subbatch_ratio("rr-env-off")
+    });
+    assert_eq!(
+        got, 1.0,
+        "RERANKER_SUBBATCH_RATIO=1.0 must disable the split"
+    );
+    assert_eq!(
+        ratio_gauge("rr-env-off"),
+        Some(1.0),
+        "gauge must carry the configured value"
+    );
+
+    let got = with_ratio_env(None, || {
+        super::load::resolve_subbatch_ratio("rr-env-default")
+    });
+    assert_eq!(got, crate::model::DEFAULT_SUBBATCH_RATIO);
+    assert_eq!(ratio_gauge("rr-env-default"), Some(2.0));
+}
+
+/// Model-backed half: `RerankerModel::load` must take the ratio from the env
+/// (not hardcode it) and publish it. The mixed-length request then runs as one
+/// pass because the env turned the split off.
+#[test]
+#[serial_test::serial]
+fn loaded_reranker_takes_its_ratio_from_the_env() {
+    let name = "rr-load-env";
+    let Some(m) = with_ratio_env(Some("1.0"), || load_named_or_skip(name)) else {
+        return;
+    };
+    assert_eq!(
+        m.subbatch_ratio, 1.0,
+        "load must read RERANKER_SUBBATCH_RATIO"
+    );
+    assert_eq!(ratio_gauge(name), Some(1.0), "load must publish the ratio");
+
+    let ids = m
+        .tokenize_pairs("what do cats do", &mixed_length_docs())
+        .expect("tokenize");
+    let before = passes_recorded(name);
+    m.score_pairs(&ids).expect("score");
+    assert_eq!(
+        passes_recorded(name) - before,
+        1.0,
+        "ratio 1.0 from the env must give one forward pass for a mixed-length request"
+    );
 }

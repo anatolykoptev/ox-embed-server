@@ -443,13 +443,7 @@ impl EmbedModel {
         // per-group ratio improves by construction as groups narrow, so it
         // would report success even when the split saved nothing.
         let real: usize = lens.iter().sum();
-        let padded: usize = groups
-            .iter()
-            .map(|g| {
-                let widest = g.iter().map(|&i| lens[i]).max().unwrap_or(0);
-                g.len() * round_up_seq_len(widest, self.max_len)
-            })
-            .sum();
+        let padded = pool::padded_tokens(&groups, &lens, |w| round_up_seq_len(w, self.max_len));
         crate::metrics::record_padding_waste(&self.name, padded, real);
         crate::metrics::record_subbatch_groups(&self.name, groups.len());
 
@@ -824,12 +818,12 @@ fn resolve_subbatch_ratio(model_key: &str) -> f32 {
     let raw = std::env::var(&per_model)
         .ok()
         .or_else(|| std::env::var("EMBED_SUBBATCH_RATIO").ok());
-    parse_subbatch_ratio(raw.as_deref())
+    parse_subbatch_ratio(raw.as_deref(), "EMBED_SUBBATCH_RATIO*")
 }
 
 /// Pure half of [`resolve_subbatch_ratio`], split out so the fallback
 /// behaviour is testable without mutating process env.
-pub(crate) fn parse_subbatch_ratio(raw: Option<&str>) -> f32 {
+pub(crate) fn parse_subbatch_ratio(raw: Option<&str>, var: &str) -> f32 {
     match raw {
         None | Some("") => DEFAULT_SUBBATCH_RATIO,
         Some(s) => match s.trim().parse::<f32>() {
@@ -837,8 +831,9 @@ pub(crate) fn parse_subbatch_ratio(raw: Option<&str>) -> f32 {
             _ => {
                 tracing::warn!(
                     raw = %s,
+                    var,
                     default = DEFAULT_SUBBATCH_RATIO,
-                    "EMBED_SUBBATCH_RATIO* is not a finite non-negative float; using default"
+                    "sub-batch ratio is not a finite non-negative float; using default"
                 );
                 DEFAULT_SUBBATCH_RATIO
             }
@@ -1216,20 +1211,32 @@ mod seq_pad_tests {
 
     #[test]
     fn subbatch_ratio_parses_with_a_typo_guard() {
-        assert_eq!(parse_subbatch_ratio(None), DEFAULT_SUBBATCH_RATIO);
-        assert_eq!(parse_subbatch_ratio(Some("")), DEFAULT_SUBBATCH_RATIO);
-        assert_eq!(parse_subbatch_ratio(Some(" 3.5 ")), 3.5);
+        assert_eq!(parse_subbatch_ratio(None, "T"), DEFAULT_SUBBATCH_RATIO);
+        assert_eq!(parse_subbatch_ratio(Some(""), "T"), DEFAULT_SUBBATCH_RATIO);
+        assert_eq!(parse_subbatch_ratio(Some(" 3.5 "), "T"), 3.5);
         assert_eq!(
-            parse_subbatch_ratio(Some("0")),
+            parse_subbatch_ratio(Some("0"), "T"),
             0.0,
             "explicit off honoured"
         );
         // Garbage must NOT silently disable the split — that would read as
         // "operator turned it off" on the dashboard.
-        assert_eq!(parse_subbatch_ratio(Some("two")), DEFAULT_SUBBATCH_RATIO);
-        assert_eq!(parse_subbatch_ratio(Some("-1")), DEFAULT_SUBBATCH_RATIO);
-        assert_eq!(parse_subbatch_ratio(Some("inf")), DEFAULT_SUBBATCH_RATIO);
-        assert_eq!(parse_subbatch_ratio(Some("NaN")), DEFAULT_SUBBATCH_RATIO);
+        assert_eq!(
+            parse_subbatch_ratio(Some("two"), "T"),
+            DEFAULT_SUBBATCH_RATIO
+        );
+        assert_eq!(
+            parse_subbatch_ratio(Some("-1"), "T"),
+            DEFAULT_SUBBATCH_RATIO
+        );
+        assert_eq!(
+            parse_subbatch_ratio(Some("inf"), "T"),
+            DEFAULT_SUBBATCH_RATIO
+        );
+        assert_eq!(
+            parse_subbatch_ratio(Some("NaN"), "T"),
+            DEFAULT_SUBBATCH_RATIO
+        );
     }
 
     #[test]
