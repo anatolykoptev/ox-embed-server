@@ -1711,7 +1711,9 @@ mod bucket_ladder_tests {
 
 #[cfg(test)]
 mod subbatch_metric_tests {
-    use super::{record_subbatch_groups, set_subbatch_ratio, test_prometheus_handle};
+    use super::{
+        record_subbatch_groups, set_seq_pad_multiple, set_subbatch_ratio, test_prometheus_handle,
+    };
 
     fn series(rendered: &str, needle: &str) -> Option<f64> {
         rendered
@@ -1779,6 +1781,31 @@ mod subbatch_metric_tests {
         )
         .expect("gauge must still be present after being set to 0");
         assert_eq!(v, 0.0, "disabled must render 0, not the previous value");
+    }
+
+    /// The live pad-width rule must be readable off `/metrics`. cargo-mutants
+    /// replaced `set_seq_pad_multiple` with `()` and nothing failed in CI,
+    /// because the only other reader of this gauge is a model-backed test that
+    /// skips there. Model-free, like the ratio gauge test above.
+    #[test]
+    fn seq_pad_multiple_gauge_carries_the_live_rule() {
+        let handle = test_prometheus_handle();
+        set_seq_pad_multiple("t_seq_pad_multiple", 4);
+        let v = series(
+            &handle.render(),
+            "embed_seq_pad_multiple{model=\"t_seq_pad_multiple\"}",
+        )
+        .expect("embed_seq_pad_multiple must be emitted");
+        assert_eq!(v, 4.0);
+
+        // A gauge: a reload under the other rule must overwrite, not add.
+        set_seq_pad_multiple("t_seq_pad_multiple", 16);
+        let v = series(
+            &handle.render(),
+            "embed_seq_pad_multiple{model=\"t_seq_pad_multiple\"}",
+        )
+        .expect("gauge must still be present after being set again");
+        assert_eq!(v, 16.0, "the new rule must replace the old value");
     }
 }
 
