@@ -489,6 +489,17 @@ pub fn record_subbatch_groups(model: &str, groups: usize) {
     .record(groups as f64);
 }
 
+/// Publish the pad-width multiple an embedder chose from its `memory_pattern`
+/// setting, so operators can read which rule is live instead of inferring it
+/// from env.
+pub fn set_seq_pad_multiple(model: &str, multiple: usize) {
+    metrics::gauge!(
+        "embed_seq_pad_multiple",
+        "model" => model.to_string()
+    )
+    .set(multiple as f64);
+}
+
 /// Publish the configured sub-batch length ratio so operators can read the
 /// effective value off `/metrics` instead of reconstructing it from the two
 /// env vars and a default.
@@ -907,7 +918,7 @@ pub fn record_token_cache_miss(model: &str, n: u64) {
 /// Record token-budget per dispatched batch: `batch_size × effective_seq_len`.
 ///
 /// For padded models (all BERT-family dense embedders) effective_seq_len is
-/// the power-of-two-rounded `max(seq_len_in_batch)` that ends up in the actual
+/// the multiple-of-4-rounded `max(seq_len_in_batch)` that ends up in the actual
 /// tensor.  This is the direct predictor of per-inference scratch memory.
 ///
 /// Buckets: 1k, 4k, 16k, 64k, 128k, 256k, 1M, 4M.  The 1.258 GiB tensor
@@ -1700,7 +1711,9 @@ mod bucket_ladder_tests {
 
 #[cfg(test)]
 mod subbatch_metric_tests {
-    use super::{record_subbatch_groups, set_subbatch_ratio, test_prometheus_handle};
+    use super::{
+        record_subbatch_groups, set_seq_pad_multiple, set_subbatch_ratio, test_prometheus_handle,
+    };
 
     fn series(rendered: &str, needle: &str) -> Option<f64> {
         rendered
@@ -1768,6 +1781,31 @@ mod subbatch_metric_tests {
         )
         .expect("gauge must still be present after being set to 0");
         assert_eq!(v, 0.0, "disabled must render 0, not the previous value");
+    }
+
+    /// The live pad-width rule must be readable off `/metrics`. cargo-mutants
+    /// replaced `set_seq_pad_multiple` with `()` and nothing failed in CI,
+    /// because the only other reader of this gauge is a model-backed test that
+    /// skips there. Model-free, like the ratio gauge test above.
+    #[test]
+    fn seq_pad_multiple_gauge_carries_the_live_rule() {
+        let handle = test_prometheus_handle();
+        set_seq_pad_multiple("t_seq_pad_multiple", 4);
+        let v = series(
+            &handle.render(),
+            "embed_seq_pad_multiple{model=\"t_seq_pad_multiple\"}",
+        )
+        .expect("embed_seq_pad_multiple must be emitted");
+        assert_eq!(v, 4.0);
+
+        // A gauge: a reload under the other rule must overwrite, not add.
+        set_seq_pad_multiple("t_seq_pad_multiple", 16);
+        let v = series(
+            &handle.render(),
+            "embed_seq_pad_multiple{model=\"t_seq_pad_multiple\"}",
+        )
+        .expect("gauge must still be present after being set again");
+        assert_eq!(v, 16.0, "the new rule must replace the old value");
     }
 }
 
