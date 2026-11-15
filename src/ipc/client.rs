@@ -57,12 +57,9 @@ impl WorkerClient {
     /// is invisible to the worker-side queue metric.
     async fn acquire_slot(&self, model: &str, n_inputs: usize) -> gate::Permit {
         let priority = gate::current_priority();
-        let t0 = tokio::time::Instant::now();
-        let permit = {
-            let _waiting = crate::metrics::SupervisorWaiter::enter(model, priority.as_str());
-            self.gate.acquire(priority).await
-        };
-        crate::metrics::record_supervisor_wait(model, priority.as_str(), n_inputs, t0.elapsed());
+        let wait = crate::metrics::SupervisorWait::enter(model, priority.as_str(), n_inputs);
+        let permit = self.gate.acquire(priority).await;
+        wait.granted();
         permit
     }
 
@@ -248,6 +245,18 @@ mod tests {
         handle.render()
     }
 
+    /// Value of the first rendered series `name{...}` whose label set contains
+    /// every fragment in `frags` (label order in the exposition is not part of
+    /// the contract).
+    fn series_value(rendered: &str, name: &str, frags: &[&str]) -> Option<f64> {
+        rendered
+            .lines()
+            .filter(|l| l.starts_with(&format!("{name}{{")))
+            .find(|l| frags.iter().all(|f| l.contains(f)))
+            .and_then(|l| l.rsplit(' ').next())
+            .and_then(|v| v.parse().ok())
+    }
+
     /// The wait histogram must be observed at the dispatch call site, labelled
     /// with model, the request's priority and the input-count bucket.
     #[test]
@@ -271,17 +280,93 @@ mod tests {
                     .expect("io");
             })
             .await;
+            // heartbeat-style probe scope
+            with_priority(Priority::Probe, async {
+                client
+                    .dispatch_embed("m".into(), texts(1), 8)
+                    .await
+                    .expect("io");
+            })
+            .await;
         });
-        for needle in [
-            r#"embed_supervisor_wait_duration_seconds_count{model="m",priority="interactive",size="1"} 1"#,
-            r#"embed_supervisor_wait_duration_seconds_count{model="m",priority="bulk",size="2-4"} 1"#,
+        for frags in [
+            [
+                r#"model="m""#,
+                r#"priority="interactive""#,
+                r#"size="1""#,
+                r#"outcome="granted""#,
+            ],
+            [
+                r#"model="m""#,
+                r#"priority="bulk""#,
+                r#"size="2-4""#,
+                r#"outcome="granted""#,
+            ],
+            [
+                r#"model="m""#,
+                r#"priority="probe""#,
+                r#"size="1""#,
+                r#"outcome="granted""#,
+            ],
         ] {
-            assert!(rendered.contains(needle), "missing {needle}\n{rendered}");
+            assert_eq!(
+                series_value(
+                    &rendered,
+                    "embed_supervisor_wait_duration_seconds_count",
+                    &frags
+                ),
+                Some(1.0),
+                "missing {frags:?}\n{rendered}"
+            );
         }
         // Waiters gauge returns to zero once every request is admitted.
-        assert!(
-            rendered.contains(r#"embed_supervisor_waiters{model="m",priority="bulk"} 0"#),
+        assert_eq!(
+            series_value(
+                &rendered,
+                "embed_supervisor_waiters",
+                &[r#"priority="bulk""#]
+            ),
+            Some(0.0),
             "waiters gauge must net to zero:\n{rendered}"
+        );
+    }
+
+    /// A request that gives up while queued (client disconnect, timeout) must
+    /// still be observed, as `outcome="cancelled"`, and must leave the gauge at
+    /// zero. Otherwise p99 under saturation is biased low.
+    #[test]
+    fn abandoned_wait_is_recorded_as_cancelled() {
+        let rendered = render_with_local_recorder(|| async {
+            let dir = tempfile::tempdir().expect("tmp");
+            let sock = dir.path().join("w.sock");
+            let _srv = spawn_echo_worker(&sock);
+            let client = WorkerClient::connect(sock, 1).await.expect("connect");
+            let held = client.gate.acquire(Priority::Interactive).await;
+            let r = tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                client.dispatch_embed("m".into(), vec!["t".into()], 8),
+            )
+            .await;
+            assert!(r.is_err(), "must still be queued behind the held slot");
+            drop(held);
+        });
+        assert_eq!(
+            series_value(
+                &rendered,
+                "embed_supervisor_wait_duration_seconds_count",
+                &[r#"outcome="cancelled""#, r#"priority="interactive""#]
+            ),
+            Some(1.0),
+            "abandoned wait not recorded:\n{rendered}"
+        );
+        assert_eq!(
+            series_value(
+                &rendered,
+                "embed_supervisor_waiters",
+                &[r#"priority="interactive""#]
+            ),
+            Some(0.0),
+            "waiters gauge leaked on cancel:\n{rendered}"
         );
     }
 

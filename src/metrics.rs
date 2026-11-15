@@ -375,40 +375,49 @@ pub fn request_size_bucket(n_inputs: usize) -> &'static str {
 }
 
 /// Record the time one request waited for a supervisor connection slot
-/// (arrival -> permit acquired), before any byte reaches the worker.
+/// (arrival -> permit acquired, or arrival -> abandoned), before any byte
+/// reaches the worker.
 ///
 /// This is the wait the worker-side `embed_worker_queue_wait_duration_seconds`
 /// cannot see: with `pool_size` permits on the supervisor, requests queue
 /// here and arrive at the worker one per session, so the worker queue reads
 /// about zero. Name ends in `_duration_seconds` so it picks up the shared
 /// latency bucket ladder. Labels are bounded: model (configured), priority
-/// (2), size (5).
-pub fn record_supervisor_wait(
+/// (3), size (5), outcome (2). `cancelled` waits are recorded so that p99
+/// under saturation is not biased low by the requests that gave up waiting.
+fn record_supervisor_wait(
     model: &str,
     priority: &'static str,
     n_inputs: usize,
     wait: Duration,
+    outcome: &'static str,
 ) {
     metrics::histogram!(
         "embed_supervisor_wait_duration_seconds",
         "model" => model.to_string(),
         "priority" => priority,
-        "size" => request_size_bucket(n_inputs)
+        "size" => request_size_bucket(n_inputs),
+        "outcome" => outcome
     )
     .record(wait.as_secs_f64());
 }
 
-/// RAII member of the `embed_supervisor_waiters` gauge: requests currently
-/// waiting for a supervisor slot. Increments on creation and decrements on
-/// drop, so a cancelled request (client disconnect, timeout) leaves the gauge
-/// correct without a separate cleanup path.
-pub struct SupervisorWaiter {
+/// One request's wait for a supervisor slot. Created on arrival: bumps the
+/// `embed_supervisor_waiters` gauge (requests currently waiting). Dropped
+/// either after [`SupervisorWait::granted`] (outcome `granted`) or without it,
+/// i.e. the future was cancelled by a client disconnect or timeout (outcome
+/// `cancelled`). Drop decrements the gauge and records the histogram, so every
+/// exit path is covered by one mechanism.
+pub struct SupervisorWait {
     model: String,
     priority: &'static str,
+    n_inputs: usize,
+    start: tokio::time::Instant,
+    granted: bool,
 }
 
-impl SupervisorWaiter {
-    pub fn enter(model: &str, priority: &'static str) -> Self {
+impl SupervisorWait {
+    pub fn enter(model: &str, priority: &'static str, n_inputs: usize) -> Self {
         metrics::gauge!(
             "embed_supervisor_waiters",
             "model" => model.to_string(),
@@ -418,11 +427,19 @@ impl SupervisorWaiter {
         Self {
             model: model.to_string(),
             priority,
+            n_inputs,
+            start: tokio::time::Instant::now(),
+            granted: false,
         }
+    }
+
+    /// The slot was acquired; the wait ends here.
+    pub fn granted(mut self) {
+        self.granted = true;
     }
 }
 
-impl Drop for SupervisorWaiter {
+impl Drop for SupervisorWait {
     fn drop(&mut self) {
         metrics::gauge!(
             "embed_supervisor_waiters",
@@ -430,6 +447,14 @@ impl Drop for SupervisorWaiter {
             "priority" => self.priority
         )
         .decrement(1.0);
+        let outcome = if self.granted { "granted" } else { "cancelled" };
+        record_supervisor_wait(
+            &self.model,
+            self.priority,
+            self.n_inputs,
+            self.start.elapsed(),
+            outcome,
+        );
     }
 }
 

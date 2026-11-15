@@ -45,6 +45,10 @@ pub enum Priority {
     #[default]
     Interactive,
     Bulk,
+    /// Internal liveness probes (heartbeat, `/ready`). Queued as interactive;
+    /// a separate value only so they do not pollute the wait metric that
+    /// callers' latency is read from. Never produced from a header.
+    Probe,
 }
 
 impl Priority {
@@ -53,6 +57,7 @@ impl Priority {
         match self {
             Self::Interactive => "interactive",
             Self::Bulk => "bulk",
+            Self::Probe => "probe",
         }
     }
 
@@ -97,6 +102,15 @@ pub async fn scope_from_headers(
         .map(Priority::from_header)
         .unwrap_or_default();
     with_priority(priority, next.run(req)).await
+}
+
+/// Install the request-priority layer on a router. The single place both the
+/// server and its test build the layering, so the test covers the real wiring.
+pub fn with_priority_layer<S>(router: axum::Router<S>) -> axum::Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router.layer(axum::middleware::from_fn(scope_from_headers))
 }
 
 /// Resolve the aging bound from `EMBED_BULK_AGING_MS`. Zero or garbage falls
@@ -168,6 +182,13 @@ impl PriorityGate {
         self.lock().permits
     }
 
+    /// Queued waiters (interactive, bulk) right now (tests).
+    #[cfg(test)]
+    fn queued(&self) -> (usize, usize) {
+        let st = self.lock();
+        (st.interactive.len(), st.bulk.len())
+    }
+
     /// Wait for a permit. Cancel-safe: dropping the returned future at any
     /// point leaves the gate's permit count unchanged.
     pub async fn acquire(self: &Arc<Self>, priority: Priority) -> Permit {
@@ -188,7 +209,7 @@ impl PriorityGate {
                 tx,
             };
             match priority {
-                Priority::Interactive => st.interactive.push_back(waiter),
+                Priority::Interactive | Priority::Probe => st.interactive.push_back(waiter),
                 Priority::Bulk => st.bulk.push_back(waiter),
             }
             (id, rx)
@@ -307,6 +328,15 @@ mod tests {
         })
     }
 
+    /// Every paused-time test body runs under this. A lost wakeup (a waiter
+    /// that is never granted) leaves nothing runnable, so paused time would
+    /// stall CI forever; the timeout turns that into a failure.
+    async fn bounded<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(120), fut)
+            .await
+            .expect("lost wakeup: test did not finish in 120 s of virtual time")
+    }
+
     async fn settle() {
         for _ in 0..5 {
             tokio::task::yield_now().await;
@@ -331,46 +361,55 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn interactive_is_admitted_before_earlier_bulk() {
-        let gate = PriorityGate::new(1, AGING);
-        let order = Arc::new(Mutex::new(Vec::new()));
-        let holder = gate.acquire(Priority::Interactive).await;
+        bounded(async {
+            let gate = PriorityGate::new(1, AGING);
+            let order = Arc::new(Mutex::new(Vec::new()));
+            let holder = gate.acquire(Priority::Interactive).await;
 
-        // Bulk arrives FIRST, interactive second: priority must flip them.
-        let b = spawn_waiter(&gate, Priority::Bulk, "bulk", &order, Duration::ZERO);
-        settle().await;
-        let i = spawn_waiter(
-            &gate,
-            Priority::Interactive,
-            "inter",
-            &order,
-            Duration::ZERO,
-        );
-        settle().await;
+            // Bulk arrives FIRST, interactive second: priority must flip them.
+            let b = spawn_waiter(&gate, Priority::Bulk, "bulk", &order, Duration::ZERO);
+            settle().await;
+            let i = spawn_waiter(
+                &gate,
+                Priority::Interactive,
+                "inter",
+                &order,
+                Duration::ZERO,
+            );
+            settle().await;
 
-        drop(holder);
-        let _ = tokio::join!(b, i);
-        assert_eq!(*order.lock().unwrap(), vec!["inter", "bulk"]);
+            drop(holder);
+            let _ = tokio::join!(b, i);
+            assert_eq!(*order.lock().unwrap(), vec!["inter", "bulk"]);
+        })
+        .await;
     }
 
     #[tokio::test(start_paused = true)]
     async fn same_class_is_fifo() {
-        let gate = PriorityGate::new(1, AGING);
-        let order = Arc::new(Mutex::new(Vec::new()));
-        let holder = gate.acquire(Priority::Interactive).await;
-        let a = spawn_waiter(&gate, Priority::Interactive, "a", &order, Duration::ZERO);
-        settle().await;
-        let b = spawn_waiter(&gate, Priority::Interactive, "b", &order, Duration::ZERO);
-        settle().await;
-        drop(holder);
-        let _ = tokio::join!(a, b);
-        assert_eq!(*order.lock().unwrap(), vec!["a", "b"]);
+        bounded(async {
+            let gate = PriorityGate::new(1, AGING);
+            let order = Arc::new(Mutex::new(Vec::new()));
+            let holder = gate.acquire(Priority::Interactive).await;
+            let a = spawn_waiter(&gate, Priority::Interactive, "a", &order, Duration::ZERO);
+            settle().await;
+            let b = spawn_waiter(&gate, Priority::Interactive, "b", &order, Duration::ZERO);
+            settle().await;
+            drop(holder);
+            let _ = tokio::join!(a, b);
+            assert_eq!(*order.lock().unwrap(), vec!["a", "b"]);
+        })
+        .await;
     }
 
     #[tokio::test(start_paused = true)]
     async fn idle_bulk_is_admitted_immediately() {
-        let gate = PriorityGate::new(1, AGING);
-        let _p = gate.acquire(Priority::Bulk).await;
-        assert_eq!(gate.available(), 0);
+        bounded(async {
+            let gate = PriorityGate::new(1, AGING);
+            let _p = gate.acquire(Priority::Bulk).await;
+            assert_eq!(gate.available(), 0);
+        })
+        .await;
     }
 
     /// Sustained interactive load: every permit release finds a fresh
@@ -378,130 +417,256 @@ mod tests {
     /// never runs; with aging it is served once it is older than the bound.
     #[tokio::test(start_paused = true)]
     async fn bulk_is_not_starved_by_sustained_interactive_load() {
-        let gate = PriorityGate::new(1, AGING);
-        let order = Arc::new(Mutex::new(Vec::new()));
-        let bulk_done = Arc::new(AtomicUsize::new(0));
+        bounded(async {
+            let gate = PriorityGate::new(1, AGING);
+            let order = Arc::new(Mutex::new(Vec::new()));
+            let bulk_done = Arc::new(AtomicUsize::new(0));
 
-        let holder = gate.acquire(Priority::Interactive).await;
-        let bulk = {
-            let gate = Arc::clone(&gate);
-            let done = Arc::clone(&bulk_done);
-            tokio::spawn(async move {
-                let _p = gate.acquire(Priority::Bulk).await;
-                done.fetch_add(1, Ordering::SeqCst);
-            })
-        };
-        settle().await;
+            let holder = gate.acquire(Priority::Interactive).await;
+            let bulk = {
+                let gate = Arc::clone(&gate);
+                let done = Arc::clone(&bulk_done);
+                tokio::spawn(async move {
+                    let _p = gate.acquire(Priority::Bulk).await;
+                    done.fetch_add(1, Ordering::SeqCst);
+                })
+            };
+            settle().await;
 
-        // Interactive chain: 20 waiters, each holds 500 ms, always one queued.
-        let mut chain = Vec::new();
-        for _ in 0..20 {
-            chain.push(spawn_waiter(
-                &gate,
-                Priority::Interactive,
-                "i",
-                &order,
-                Duration::from_millis(500),
-            ));
-            settle().await;
-        }
-        drop(holder);
-        // 8 s of virtual time >> 2 s aging bound, with interactive still queued.
-        for _ in 0..80 {
-            advance(Duration::from_millis(100)).await;
-            settle().await;
-        }
-        assert_eq!(
-            bulk_done.load(Ordering::SeqCst),
-            1,
-            "bulk waiter starved despite aging bound"
-        );
-        // And it did not jump the whole chain: interactive work was served too.
-        assert!(order.lock().unwrap().len() >= 3);
-        bulk.await.unwrap();
-        for c in chain {
-            c.abort();
-        }
+            // Interactive chain: 20 waiters, each holds 500 ms, always one queued.
+            let mut chain = Vec::new();
+            for _ in 0..20 {
+                chain.push(spawn_waiter(
+                    &gate,
+                    Priority::Interactive,
+                    "i",
+                    &order,
+                    Duration::from_millis(500),
+                ));
+                settle().await;
+            }
+            drop(holder);
+            // 8 s of virtual time >> 2 s aging bound, with interactive still queued.
+            for _ in 0..80 {
+                advance(Duration::from_millis(100)).await;
+                settle().await;
+            }
+            assert_eq!(
+                bulk_done.load(Ordering::SeqCst),
+                1,
+                "bulk waiter starved despite aging bound"
+            );
+            // And it did not jump the whole chain: interactive work was served too.
+            assert!(order.lock().unwrap().len() >= 3);
+            bulk.await.unwrap();
+            for c in chain {
+                c.abort();
+            }
+        })
+        .await;
     }
 
     #[tokio::test(start_paused = true)]
     async fn bulk_is_held_back_until_it_ages() {
-        let gate = PriorityGate::new(1, AGING);
-        let order = Arc::new(Mutex::new(Vec::new()));
-        let holder = gate.acquire(Priority::Interactive).await;
-        let b = spawn_waiter(&gate, Priority::Bulk, "bulk", &order, Duration::ZERO);
-        settle().await;
-        advance(Duration::from_millis(500)).await; // bulk is 0.5 s old: young
-        let i = spawn_waiter(
-            &gate,
-            Priority::Interactive,
-            "inter",
-            &order,
-            Duration::ZERO,
-        );
-        settle().await;
-        drop(holder);
-        let _ = tokio::join!(b, i);
-        assert_eq!(*order.lock().unwrap(), vec!["inter", "bulk"]);
+        bounded(async {
+            let gate = PriorityGate::new(1, AGING);
+            let order = Arc::new(Mutex::new(Vec::new()));
+            let holder = gate.acquire(Priority::Interactive).await;
+            let b = spawn_waiter(&gate, Priority::Bulk, "bulk", &order, Duration::ZERO);
+            settle().await;
+            advance(Duration::from_millis(500)).await; // bulk is 0.5 s old: young
+            let i = spawn_waiter(
+                &gate,
+                Priority::Interactive,
+                "inter",
+                &order,
+                Duration::ZERO,
+            );
+            settle().await;
+            drop(holder);
+            let _ = tokio::join!(b, i);
+            assert_eq!(*order.lock().unwrap(), vec!["inter", "bulk"]);
+        })
+        .await;
     }
 
     /// Cancelling a queued waiter must not lose a permit.
     #[tokio::test(start_paused = true)]
     async fn cancelled_waiter_leaks_no_permit() {
-        let gate = PriorityGate::new(1, AGING);
-        let holder = gate.acquire(Priority::Interactive).await;
+        bounded(async {
+            let gate = PriorityGate::new(1, AGING);
+            let holder = gate.acquire(Priority::Interactive).await;
 
-        let victim = {
-            let gate = Arc::clone(&gate);
-            tokio::spawn(async move {
-                let _p = gate.acquire(Priority::Interactive).await;
-            })
-        };
-        settle().await;
-        victim.abort(); // client disconnect / axum timeout
-        let _ = victim.await;
-        settle().await;
+            let victim = {
+                let gate = Arc::clone(&gate);
+                tokio::spawn(async move {
+                    let _p = gate.acquire(Priority::Interactive).await;
+                })
+            };
+            settle().await;
+            assert_eq!(gate.queued(), (1, 0), "victim should be queued");
+            victim.abort(); // client disconnect / axum timeout
+            let _ = victim.await;
+            settle().await;
+            assert_eq!(gate.queued(), (0, 0), "cancelled waiter left in queue");
 
-        drop(holder);
-        assert_eq!(gate.available(), 1, "permit leaked after waiter cancel");
-        // And the gate still admits.
-        let _p = gate.acquire(Priority::Bulk).await;
+            drop(holder);
+            assert_eq!(gate.available(), 1, "permit leaked after waiter cancel");
+            // And the gate still admits.
+            let _p = gate.acquire(Priority::Bulk).await;
+        })
+        .await;
     }
 
     /// The nasty race: the permit was already granted to a waiter whose
     /// future is dropped before it ever polls the grant.
     #[tokio::test(start_paused = true)]
     async fn grant_then_cancel_before_pickup_returns_permit() {
-        let gate = PriorityGate::new(1, AGING);
-        let holder = gate.acquire(Priority::Interactive).await;
+        bounded(async {
+            let gate = PriorityGate::new(1, AGING);
+            let holder = gate.acquire(Priority::Interactive).await;
 
-        let victim = {
-            let gate = Arc::clone(&gate);
-            tokio::spawn(async move {
-                let _p = gate.acquire(Priority::Interactive).await;
-                sleep(Duration::from_secs(60)).await;
-            })
-        };
-        settle().await;
-        // Grant (releases to the queued victim), then cancel it before it runs.
-        drop(holder);
-        victim.abort();
-        let _ = victim.await;
-        settle().await;
-        assert_eq!(gate.available(), 1, "granted-but-cancelled permit leaked");
+            let victim = {
+                let gate = Arc::clone(&gate);
+                tokio::spawn(async move {
+                    let _p = gate.acquire(Priority::Interactive).await;
+                    sleep(Duration::from_secs(60)).await;
+                })
+            };
+            settle().await;
+            // Grant (releases to the queued victim), then cancel it before it runs.
+            drop(holder);
+            victim.abort();
+            let _ = victim.await;
+            settle().await;
+            assert_eq!(gate.available(), 1, "granted-but-cancelled permit leaked");
+        })
+        .await;
     }
 
     #[tokio::test(start_paused = true)]
     async fn timeout_around_acquire_leaks_nothing() {
-        let gate = PriorityGate::new(1, AGING);
-        let _holder = gate.acquire(Priority::Interactive).await;
-        for _ in 0..10 {
-            let r =
-                tokio::time::timeout(Duration::from_millis(50), gate.acquire(Priority::Bulk)).await;
-            assert!(r.is_err());
+        bounded(async {
+            let gate = PriorityGate::new(1, AGING);
+            let _holder = gate.acquire(Priority::Interactive).await;
+            for _ in 0..10 {
+                let r =
+                    tokio::time::timeout(Duration::from_millis(50), gate.acquire(Priority::Bulk))
+                        .await;
+                assert!(r.is_err());
+            }
+            drop(_holder);
+            assert_eq!(gate.available(), 1);
+        })
+        .await;
+    }
+
+    /// Interactive arrived FIRST, bulk later; both are past the aging bound
+    /// when the permit frees. Aging only promotes bulk to "interactive
+    /// class", where arrival order rules, so interactive still goes first.
+    #[tokio::test(start_paused = true)]
+    async fn aged_bulk_does_not_jump_an_older_interactive() {
+        bounded(async {
+            let gate = PriorityGate::new(1, AGING);
+            let order = Arc::new(Mutex::new(Vec::new()));
+            let holder = gate.acquire(Priority::Interactive).await;
+            let i = spawn_waiter(
+                &gate,
+                Priority::Interactive,
+                "inter",
+                &order,
+                Duration::ZERO,
+            );
+            settle().await;
+            advance(Duration::from_millis(100)).await;
+            let b = spawn_waiter(&gate, Priority::Bulk, "bulk", &order, Duration::ZERO);
+            settle().await;
+            advance(AGING * 2).await; // both now far older than the bound
+            drop(holder);
+            let _ = tokio::join!(i, b);
+            assert_eq!(*order.lock().unwrap(), vec!["inter", "bulk"]);
+        })
+        .await;
+    }
+
+    /// A bulk waiter exactly `aging` old is promoted (`>=`); one tick younger
+    /// is not.
+    #[tokio::test(start_paused = true)]
+    async fn aging_boundary_is_inclusive() {
+        for (age, expect) in [
+            (AGING, vec!["bulk", "inter"]),
+            (AGING - Duration::from_millis(1), vec!["inter", "bulk"]),
+        ] {
+            bounded(async {
+                let gate = PriorityGate::new(1, AGING);
+                let order = Arc::new(Mutex::new(Vec::new()));
+                let holder = gate.acquire(Priority::Interactive).await;
+                let b = spawn_waiter(&gate, Priority::Bulk, "bulk", &order, Duration::ZERO);
+                settle().await;
+                advance(age).await;
+                let i = spawn_waiter(
+                    &gate,
+                    Priority::Interactive,
+                    "inter",
+                    &order,
+                    Duration::ZERO,
+                );
+                settle().await;
+                drop(holder); // no time passes between the advance and the grant
+                let _ = tokio::join!(b, i);
+                assert_eq!(*order.lock().unwrap(), expect, "bulk age {age:?}");
+            })
+            .await;
         }
-        drop(_holder);
-        assert_eq!(gate.available(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn probe_queues_as_interactive_and_has_its_own_label() {
+        bounded(async {
+            assert_eq!(Priority::Probe.as_str(), "probe");
+            assert_eq!(Priority::from_header("probe"), Priority::Interactive);
+            let gate = PriorityGate::new(1, AGING);
+            let order = Arc::new(Mutex::new(Vec::new()));
+            let holder = gate.acquire(Priority::Interactive).await;
+            let b = spawn_waiter(&gate, Priority::Bulk, "bulk", &order, Duration::ZERO);
+            settle().await;
+            let p = spawn_waiter(&gate, Priority::Probe, "probe", &order, Duration::ZERO);
+            settle().await;
+            drop(holder);
+            let _ = tokio::join!(b, p);
+            assert_eq!(*order.lock().unwrap(), vec!["probe", "bulk"]);
+        })
+        .await;
+    }
+
+    /// The header reaches the gate only through `with_priority_layer`, the
+    /// function `main` builds its router with. Dropping the layer there makes
+    /// the bulk case read Interactive.
+    #[tokio::test]
+    async fn router_layer_carries_header_to_current_priority() {
+        use tower::ServiceExt;
+        let app = with_priority_layer(axum::Router::new().route(
+            "/p",
+            axum::routing::post(|| async { current_priority().as_str() }),
+        ));
+        for (header, expect) in [
+            (Some("bulk"), "bulk"),
+            (Some("BULK"), "bulk"),
+            (Some("nonsense"), "interactive"),
+            (None, "interactive"),
+        ] {
+            let mut req = axum::http::Request::post("/p");
+            if let Some(h) = header {
+                req = req.header("X-Embed-Priority", h);
+            }
+            let resp = app
+                .clone()
+                .oneshot(req.body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(resp.into_body(), 64).await.unwrap();
+            assert_eq!(&body[..], expect.as_bytes(), "header {header:?}");
+        }
     }
 
     #[test]
