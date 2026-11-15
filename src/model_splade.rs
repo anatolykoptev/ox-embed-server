@@ -163,7 +163,8 @@ impl SpladeModel {
             let t_commit = std::time::Instant::now();
             // memory_pattern: per-model knob (EMBED_MEMORY_PATTERN_<MODEL_UPPER>).
             // Default true (back-compat). See config::ModelDef::memory_pattern for rationale.
-            let builder = Session::builder().map_err(|e| format!("session builder #{i}: {e}"))?;
+            let builder = Session::builder(crate::arena::ort_env()?)
+                .map_err(|e| format!("session builder #{i}: {e}"))?;
             let builder = onnx_cache::apply_plan(builder, &plan, opt_level)
                 .map_err(|e| format!("apply cache plan #{i}: {e}"))?;
             let allow_spinning = crate::arena::parse_intra_op_spinning();

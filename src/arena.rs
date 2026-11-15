@@ -44,6 +44,7 @@
 use std::ffi::{CString, c_char};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use ort::AsPointer;
 use ort::environment::Environment;
@@ -311,13 +312,42 @@ pub(crate) fn parse_intra_op_spinning() -> bool {
     )
 }
 
+/// The process-wide ORT environment. Since `ort` 2.0.0-rc.14 an
+/// `Environment` is an explicit value that every `Session::builder` takes
+/// and that owns the allocators registered on it, so it must outlive every
+/// session. `ort` allows exactly one per process (a second `build()` fails
+/// even after the first is dropped), hence a `static` rather than threading
+/// it through every loader.
+static ORT_ENV: OnceLock<Environment> = OnceLock::new();
+static ORT_ENV_INIT: Mutex<()> = Mutex::new(());
+
+/// Builds the ORT environment on first call (loading the shared library via
+/// `ORT_DYLIB_PATH`) and returns it; later calls return the same instance.
+///
+/// Called explicitly at process start so a missing or incompatible dylib
+/// fails there rather than at the first model load.
+pub fn ort_env() -> Result<&'static Environment, String> {
+    if let Some(env) = ORT_ENV.get() {
+        return Ok(env);
+    }
+    let _guard = ORT_ENV_INIT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(env) = ORT_ENV.get() {
+        return Ok(env);
+    }
+    let env = ort::init()
+        .build()
+        .map_err(|e| format!("ort environment init: {e}"))?;
+    Ok(ORT_ENV.get_or_init(|| env))
+}
+
 /// Registers a process-global shared CPU arena allocator with
 /// `kSameAsRequested` extend strategy. Idempotent: calling twice will fail
 /// the second time on `CreateAndRegisterAllocator`; we treat that as a
 /// success and log instead of panicking, since the registration only needs
 /// to happen once per env.
 ///
-/// MUST be called after `ort::init().commit()` and BEFORE any
+/// MUST be called after `ort_env()` initialises the environment (it does so
+/// lazily if needed) and BEFORE any
 /// `Session::builder()`. Sessions then opt in via `.with_env_allocators()`.
 ///
 /// `model_key` — the model this worker serves (e.g. `"jina-code-v2"`).
@@ -411,9 +441,8 @@ fn register_shared_cpu_arena_with_cfg(cfg: ArenaCfg) -> Result<(), String> {
         return Err("CreateArenaCfgV2 returned non-null status".into());
     }
 
-    // 3. Register on the global environment. Environment::current() returns
-    //    the singleton committed by ort::init().
-    let env = Environment::current().map_err(|e| format!("Environment::current: {e}"))?;
+    // 3. Register on the process-wide environment (see `ort_env`).
+    let env = ort_env()?;
     // SAFETY: ORT C API takes *mut OrtEnv but only mutates internal env state
     // (allocator registry) under its own lock. Casting *const to *mut is safe
     // here per ORT API contract.

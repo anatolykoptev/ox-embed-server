@@ -247,11 +247,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize the ORT runtime explicitly BEFORE arena registration.
     // arena::register_shared_cpu_arena documents that it MUST be called
-    // after `ort::init().commit()` — the worker previously relied on
+    // after `arena::ort_env()` — the worker previously relied on
     // lazy init, which meant the global thread pool options were never
     // set in the process that actually runs inference.
-    if !ort::init().commit() {
-        tracing::warn!("ort init failed (environment already configured?)");
+    if let Err(e) = embed_server::arena::ort_env() {
+        tracing::warn!("{e}");
     }
     tracing::info!(model = %model_name, "ort runtime initialized in worker");
 
