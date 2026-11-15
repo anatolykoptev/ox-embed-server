@@ -38,6 +38,10 @@ by default — currently `multilingual-e5-large`).
 - `POST /v1/embeddings` — OpenAI-compat. 503 + `Retry-After: 1` on full
   queue, 503 + `Retry-After: 5` during shutdown drain.
 - `POST /v1/rerank` — Cohere-compatible cross-encoder reranking. See below.
+- Optional header `X-Embed-Priority: bulk` on any POST endpoint: background
+  work is admitted after interactive requests on the per-model worker slot
+  wait, and is promoted once it has waited `EMBED_BULK_AGING_MS` (default
+  2000), so it never starves. No header = interactive.
 - `GET /health` — `ok`.
 - `GET /metrics` — Prometheus text exposition. Series: `embed_requests_total`,
   `embed_request_duration_seconds`, `embed_inference_duration_seconds`,

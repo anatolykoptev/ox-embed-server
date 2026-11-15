@@ -793,8 +793,9 @@ impl WorkerSupervisor {
                         >,
                     >,
             },
-        )
-        .await;
+        );
+        // Probe priority keeps these out of the caller-facing wait metric.
+        let probe = crate::ipc::gate::with_priority(crate::ipc::gate::Priority::Probe, probe).await;
 
         let failed = match probe {
             // A worker that ANSWERS with an error is not healthy. The old

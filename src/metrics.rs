@@ -361,6 +361,103 @@ pub fn record_worker_queue_wait(model: &str, duration: Duration) {
     .record(duration.as_secs_f64());
 }
 
+/// Request-size bucket for the supervisor-wait histogram: number of inputs
+/// (texts for embed/splade, documents for rerank) in fixed buckets, so the
+/// label set stays at five values regardless of traffic.
+pub fn request_size_bucket(n_inputs: usize) -> &'static str {
+    match n_inputs {
+        0..=1 => "1",
+        2..=4 => "2-4",
+        5..=16 => "5-16",
+        17..=64 => "17-64",
+        _ => "65+",
+    }
+}
+
+/// Record the time one request waited for a supervisor connection slot
+/// (arrival -> permit acquired, or arrival -> abandoned), before any byte
+/// reaches the worker.
+///
+/// This is the wait the worker-side `embed_worker_queue_wait_duration_seconds`
+/// cannot see: with `pool_size` permits on the supervisor, requests queue
+/// here and arrive at the worker one per session, so the worker queue reads
+/// about zero. Name ends in `_duration_seconds` so it picks up the shared
+/// latency bucket ladder. Labels are bounded: model (configured), priority
+/// (3), size (5), outcome (2). `cancelled` waits are recorded so that p99
+/// under saturation is not biased low by the requests that gave up waiting.
+fn record_supervisor_wait(
+    model: &str,
+    priority: &'static str,
+    n_inputs: usize,
+    wait: Duration,
+    outcome: &'static str,
+) {
+    metrics::histogram!(
+        "embed_supervisor_wait_duration_seconds",
+        "model" => model.to_string(),
+        "priority" => priority,
+        "size" => request_size_bucket(n_inputs),
+        "outcome" => outcome
+    )
+    .record(wait.as_secs_f64());
+}
+
+/// One request's wait for a supervisor slot. Created on arrival: bumps the
+/// `embed_supervisor_waiters` gauge (requests currently waiting). Dropped
+/// either after [`SupervisorWait::granted`] (outcome `granted`) or without it,
+/// i.e. the future was cancelled by a client disconnect or timeout (outcome
+/// `cancelled`). Drop decrements the gauge and records the histogram, so every
+/// exit path is covered by one mechanism.
+pub struct SupervisorWait {
+    model: String,
+    priority: &'static str,
+    n_inputs: usize,
+    start: tokio::time::Instant,
+    granted: bool,
+}
+
+impl SupervisorWait {
+    pub fn enter(model: &str, priority: &'static str, n_inputs: usize) -> Self {
+        metrics::gauge!(
+            "embed_supervisor_waiters",
+            "model" => model.to_string(),
+            "priority" => priority
+        )
+        .increment(1.0);
+        Self {
+            model: model.to_string(),
+            priority,
+            n_inputs,
+            start: tokio::time::Instant::now(),
+            granted: false,
+        }
+    }
+
+    /// The slot was acquired; the wait ends here.
+    pub fn granted(mut self) {
+        self.granted = true;
+    }
+}
+
+impl Drop for SupervisorWait {
+    fn drop(&mut self) {
+        metrics::gauge!(
+            "embed_supervisor_waiters",
+            "model" => self.model.clone(),
+            "priority" => self.priority
+        )
+        .decrement(1.0);
+        let outcome = if self.granted { "granted" } else { "cancelled" };
+        record_supervisor_wait(
+            &self.model,
+            self.priority,
+            self.n_inputs,
+            self.start.elapsed(),
+            outcome,
+        );
+    }
+}
+
 /// Increment rejected-due-to-backpressure counter. Called from the
 /// `DynamicBatcher` 80%-of-capacity gate and its belt-and-suspenders
 /// `try_send` fallthrough — so every item that produces a 429 on the
@@ -2127,6 +2224,31 @@ mod inference_failures_touch_tests {
                 rendered.lines().any(|l| l == expected),
                 "missing pre-touched series {expected}; got:\n{rendered}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod request_size_bucket_tests {
+    use super::request_size_bucket;
+
+    /// Every bucket edge, both sides: the label values are consumed by
+    /// dashboards, and a deleted arm silently folds a size class into `65+`.
+    #[test]
+    fn size_bucket_edges() {
+        for (n, want) in [
+            (0, "1"),
+            (1, "1"),
+            (2, "2-4"),
+            (4, "2-4"),
+            (5, "5-16"),
+            (16, "5-16"),
+            (17, "17-64"),
+            (64, "17-64"),
+            (65, "65+"),
+            (10_000, "65+"),
+        ] {
+            assert_eq!(request_size_bucket(n), want, "n_inputs={n}");
         }
     }
 }

@@ -62,9 +62,12 @@ pub async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
     // Multi-process mode: dispatch via worker pool.
     if let Some(pool) = state.worker_pool.as_ref() {
-        let result = tokio::time::timeout(
-            timeout,
-            pool.dispatch_embed(&model_name, vec!["test".to_string()], 8),
+        let result = crate::ipc::gate::with_priority(
+            crate::ipc::gate::Priority::Probe,
+            tokio::time::timeout(
+                timeout,
+                pool.dispatch_embed(&model_name, vec!["test".to_string()], 8),
+            ),
         )
         .await;
 

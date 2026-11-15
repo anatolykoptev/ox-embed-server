@@ -22,6 +22,8 @@ axum HTTP server serving 4 ONNX models for dense embedding, reranking, and spars
 - `POST /v1/embeddings` — OpenAI-compat. 429 + `Retry-After: 1` on queue full, 503 + `Retry-After: 5` during shutdown. Response cache in front.
 - `POST /v1/rerank` — Cohere-shape. Documents accepted as plain string or `{"text":...}` (untagged serde). No cache.
 - `POST /embed_sparse` — TEI convention (no `/v1/` prefix). Body: `{"input":["text",...]}` (singular `input`).
+- `X-Embed-Priority: bulk` (optional header, all three POST endpoints) — marks background work. On the supervisor wait for a worker slot (`pool_size` permits per model) interactive requests, the default, are admitted first; a bulk request waiting longer than `EMBED_BULK_AGING_MS` (default 2000) is served as interactive, so it cannot starve. Idle server: no effect. Any other value, or no header, is interactive. Metrics: `embed_supervisor_wait_duration_seconds{model,priority,size,outcome}` (outcome = `granted` or `cancelled`, so abandoned waits are not dropped from the tail; size = inputs per request: 1, 2-4, 5-16, 17-64, 65+) and gauge `embed_supervisor_waiters{model,priority}`.
+  Internal batch callers (background scoring, precompute, bulk ingest) should send `X-Embed-Priority: bulk`; interactive callers send nothing. Heartbeat and `/ready` probes use an internal `probe` priority and are not mixed into caller latency.
 - `GET /health` — `ok`.
 - `GET /metrics` — Prometheus. Multi-process specific: `embed_worker_restart_total{model}` (pre-touched to 0). Full series list: see `metrics::init` in `src/metrics.rs`.
 
