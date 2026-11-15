@@ -1422,6 +1422,20 @@ pub fn record_rerank_input_docs_size(n: usize) {
     .record(n as f64);
 }
 
+/// Recorder builder for a worker process.
+///
+/// Stamps `model` on every series the worker exposes. Most series set it
+/// themselves; the process-wide ones (the `embed_arena_*` gauges) do not, so on
+/// a worker's `/metrics` they could only be attributed to a model through a
+/// scrape-time label kept by hand next to the port map, and that map drifted
+/// when a model was added. A label the worker stamps on itself cannot. Labels a
+/// series sets explicitly win over this one.
+// `allow(dead_code)`: see `record_worker_inference` — main.rs compiles a private copy of this module.
+#[allow(dead_code)]
+pub fn worker_recorder_builder(model: &str) -> PrometheusBuilder {
+    apply_histogram_buckets(PrometheusBuilder::new()).add_global_label("model", model)
+}
+
 // ── shared test helper ────────────────────────────────────────────────────────
 
 /// Install a Prometheus recorder the first time it's needed and return its
@@ -1951,5 +1965,32 @@ mod worker_heartbeat_touch_tests {
                 "worker_heartbeat_touch must pre-touch {expected}; got:\n{rendered}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod worker_recorder_tests {
+    use super::{set_arena_gauges, set_seq_pad_multiple, worker_recorder_builder};
+
+    /// Series without their own `model` label (the arena gauges) must come out
+    /// of a worker recorder attributed to that worker's model, and a series
+    /// that sets `model` itself must keep its own value.
+    #[test]
+    fn worker_recorder_stamps_model_on_unlabelled_series() {
+        let recorder = worker_recorder_builder("wr-model").build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            set_arena_gauges(1024, 512, 256, 1);
+            set_seq_pad_multiple("wr-other", 4);
+        });
+        let out = handle.render();
+        assert!(
+            out.contains("embed_arena_max_mem_bytes{model=\"wr-model\"} 1024"),
+            "arena gauge must carry the worker's model label:\n{out}"
+        );
+        assert!(
+            out.contains("embed_seq_pad_multiple{model=\"wr-other\"} 4"),
+            "an explicit model label must win over the worker-wide one:\n{out}"
+        );
     }
 }
