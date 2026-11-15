@@ -2012,3 +2012,28 @@ mod worker_heartbeat_touch_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod request_size_bucket_tests {
+    use super::request_size_bucket;
+
+    /// Every bucket edge, both sides: the label values are consumed by
+    /// dashboards, and a deleted arm silently folds a size class into `65+`.
+    #[test]
+    fn size_bucket_edges() {
+        for (n, want) in [
+            (0, "1"),
+            (1, "1"),
+            (2, "2-4"),
+            (4, "2-4"),
+            (5, "5-16"),
+            (16, "5-16"),
+            (17, "17-64"),
+            (64, "17-64"),
+            (65, "65+"),
+            (10_000, "65+"),
+        ] {
+            assert_eq!(request_size_bucket(n), want, "n_inputs={n}");
+        }
+    }
+}
