@@ -885,6 +885,9 @@ async fn main() {
         // spans, but at default sampling (5 %) they're effectively
         // free; can exclude via env-driven sampler if it ever matters.
         .layer(axum::middleware::from_fn(otel::trace_request))
+        // `X-Embed-Priority: bulk` demotes a request on the supervisor wait
+        // (interactive first, bulk aged in). Absent header = interactive.
+        .layer(axum::middleware::from_fn(ipc::gate::scope_from_headers))
         .with_state(router_state);
 
     let addr = format!("0.0.0.0:{}", cfg.port);

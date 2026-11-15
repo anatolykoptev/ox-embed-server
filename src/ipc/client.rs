@@ -11,17 +11,20 @@
 //! response. Per-request conn drops on cancellation — no stale buffer.
 
 use crate::ipc::frame::{read_frame, write_frame};
+use crate::ipc::gate::{self, PriorityGate};
 use crate::ipc::protocol::{
     EmbedRequest, RerankRequest, SpladeRequest, WorkerRequest, WorkerResponse,
 };
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::net::UnixStream;
 
 pub struct WorkerClient {
     socket_path: PathBuf,
-    /// Semaphore caps concurrent in-flight connections. Capacity = `conns` arg to connect().
-    semaphore: tokio::sync::Semaphore,
+    /// Caps concurrent in-flight connections (capacity = `conns` arg to
+    /// connect()) and admits interactive requests before bulk ones.
+    gate: Arc<PriorityGate>,
     request_counter: AtomicU64,
 }
 
@@ -40,7 +43,7 @@ impl WorkerClient {
         drop(probe);
         Ok(Self {
             socket_path,
-            semaphore: tokio::sync::Semaphore::new(conns),
+            gate: PriorityGate::new(conns, gate::bulk_aging_from_env()),
             request_counter: AtomicU64::new(0),
         })
     }
@@ -49,10 +52,30 @@ impl WorkerClient {
         &self.socket_path
     }
 
+    /// Wait for a connection slot, metering the wait. The time from arrival to
+    /// acquire is the part of request latency that sits outside the worker and
+    /// is invisible to the worker-side queue metric.
+    async fn acquire_slot(&self, model: &str, n_inputs: usize) -> gate::Permit {
+        let priority = gate::current_priority();
+        let t0 = tokio::time::Instant::now();
+        let permit = {
+            let _waiting = crate::metrics::SupervisorWaiter::enter(model, priority.as_str());
+            self.gate.acquire(priority).await
+        };
+        crate::metrics::record_supervisor_wait(model, priority.as_str(), n_inputs, t0.elapsed());
+        permit
+    }
+
     /// Send a request and receive a response over a fresh UDS connection.
     /// The connection is dropped when this future completes or is cancelled.
     async fn send_request(&self, req: WorkerRequest) -> std::io::Result<WorkerResponse> {
-        let _permit = self.semaphore.acquire().await.expect("semaphore closed");
+        // Model + input count label the supervisor-wait metric.
+        let (model, n_inputs) = match &req {
+            WorkerRequest::Embed(r) => (r.model.clone(), r.texts.len()),
+            WorkerRequest::Rerank(r) => (r.model.clone(), r.documents.len()),
+            WorkerRequest::Splade(r) => (r.model.clone(), r.texts.len()),
+        };
+        let _permit = self.acquire_slot(&model, n_inputs).await;
         let req_id = req.request_id();
         let mut stream = UnixStream::connect(&self.socket_path).await?;
         write_frame(&mut stream, &req).await?;
@@ -173,6 +196,122 @@ impl WorkerClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::ipc::gate::{Priority, with_priority};
+    use crate::ipc::protocol::EmbedResponseOk;
+
+    /// Echo worker on a temp UDS: answers every Embed with one 2-d vector per
+    /// text. No model, so it runs in CI.
+    fn spawn_echo_worker(path: &std::path::Path) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::UnixListener::bind(path).expect("bind");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let Ok(WorkerRequest::Embed(r)) =
+                        read_frame::<_, WorkerRequest>(&mut stream).await
+                    else {
+                        return;
+                    };
+                    let resp = WorkerResponse::Embed(EmbedResponseOk {
+                        request_id: r.request_id,
+                        vectors: vec![vec![0.0, 1.0]; r.texts.len()],
+                        dims: 2,
+                    });
+                    let _ = write_frame(&mut stream, &resp).await;
+                });
+            }
+        })
+    }
+
+    /// Drive `f` with a LOCAL Prometheus recorder (no process-global state, so
+    /// tests stay parallel-safe) and return the rendered exposition text.
+    fn render_with_local_recorder<F, Fut>(f: F) -> String
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let recorder = crate::metrics::apply_histogram_buckets(
+            metrics_exporter_prometheus::PrometheusBuilder::new(),
+        )
+        .build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("rt")
+                .block_on(f());
+        });
+        handle.render()
+    }
+
+    /// The wait histogram must be observed at the dispatch call site, labelled
+    /// with model, the request's priority and the input-count bucket.
+    #[test]
+    fn dispatch_observes_supervisor_wait_with_priority_and_size_labels() {
+        let rendered = render_with_local_recorder(|| async {
+            let dir = tempfile::tempdir().expect("tmp");
+            let sock = dir.path().join("w.sock");
+            let _srv = spawn_echo_worker(&sock);
+            let client = WorkerClient::connect(sock, 1).await.expect("connect");
+            let texts = |n: usize| vec!["t".to_string(); n];
+            // default (no scope) -> interactive, 1 input
+            client
+                .dispatch_embed("m".into(), texts(1), 8)
+                .await
+                .expect("io");
+            // bulk scope, 3 inputs
+            with_priority(Priority::Bulk, async {
+                client
+                    .dispatch_embed("m".into(), texts(3), 8)
+                    .await
+                    .expect("io");
+            })
+            .await;
+        });
+        for needle in [
+            r#"embed_supervisor_wait_duration_seconds_count{model="m",priority="interactive",size="1"} 1"#,
+            r#"embed_supervisor_wait_duration_seconds_count{model="m",priority="bulk",size="2-4"} 1"#,
+        ] {
+            assert!(rendered.contains(needle), "missing {needle}\n{rendered}");
+        }
+        // Waiters gauge returns to zero once every request is admitted.
+        assert!(
+            rendered.contains(r#"embed_supervisor_waiters{model="m",priority="bulk"} 0"#),
+            "waiters gauge must net to zero:\n{rendered}"
+        );
+    }
+
+    /// Dropping a dispatch that is queued behind a busy slot must not leak the
+    /// slot: afterwards a fresh dispatch is admitted at once.
+    #[tokio::test]
+    async fn cancelled_dispatch_does_not_leak_connection_slot() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let sock = dir.path().join("w.sock");
+        let _srv = spawn_echo_worker(&sock);
+        let client = WorkerClient::connect(sock, 1).await.expect("connect");
+        let held = client.gate.acquire(Priority::Interactive).await;
+        for _ in 0..5 {
+            let r = tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                client.dispatch_embed("m".into(), vec!["t".into()], 8),
+            )
+            .await;
+            assert!(r.is_err(), "must still be queued behind the held slot");
+        }
+        drop(held);
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.dispatch_embed("m".into(), vec!["t".into()], 8),
+        )
+        .await
+        .expect("slot leaked: dispatch never admitted")
+        .expect("io");
+        assert!(matches!(r, WorkerResponse::Embed(_)));
+    }
 
     #[tokio::test]
     async fn connect_rejects_zero_concurrency() {

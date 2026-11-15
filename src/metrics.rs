@@ -361,6 +361,78 @@ pub fn record_worker_queue_wait(model: &str, duration: Duration) {
     .record(duration.as_secs_f64());
 }
 
+/// Request-size bucket for the supervisor-wait histogram: number of inputs
+/// (texts for embed/splade, documents for rerank) in fixed buckets, so the
+/// label set stays at five values regardless of traffic.
+pub fn request_size_bucket(n_inputs: usize) -> &'static str {
+    match n_inputs {
+        0..=1 => "1",
+        2..=4 => "2-4",
+        5..=16 => "5-16",
+        17..=64 => "17-64",
+        _ => "65+",
+    }
+}
+
+/// Record the time one request waited for a supervisor connection slot
+/// (arrival -> permit acquired), before any byte reaches the worker.
+///
+/// This is the wait the worker-side `embed_worker_queue_wait_duration_seconds`
+/// cannot see: with `pool_size` permits on the supervisor, requests queue
+/// here and arrive at the worker one per session, so the worker queue reads
+/// about zero. Name ends in `_duration_seconds` so it picks up the shared
+/// latency bucket ladder. Labels are bounded: model (configured), priority
+/// (2), size (5).
+pub fn record_supervisor_wait(
+    model: &str,
+    priority: &'static str,
+    n_inputs: usize,
+    wait: Duration,
+) {
+    metrics::histogram!(
+        "embed_supervisor_wait_duration_seconds",
+        "model" => model.to_string(),
+        "priority" => priority,
+        "size" => request_size_bucket(n_inputs)
+    )
+    .record(wait.as_secs_f64());
+}
+
+/// RAII member of the `embed_supervisor_waiters` gauge: requests currently
+/// waiting for a supervisor slot. Increments on creation and decrements on
+/// drop, so a cancelled request (client disconnect, timeout) leaves the gauge
+/// correct without a separate cleanup path.
+pub struct SupervisorWaiter {
+    model: String,
+    priority: &'static str,
+}
+
+impl SupervisorWaiter {
+    pub fn enter(model: &str, priority: &'static str) -> Self {
+        metrics::gauge!(
+            "embed_supervisor_waiters",
+            "model" => model.to_string(),
+            "priority" => priority
+        )
+        .increment(1.0);
+        Self {
+            model: model.to_string(),
+            priority,
+        }
+    }
+}
+
+impl Drop for SupervisorWaiter {
+    fn drop(&mut self) {
+        metrics::gauge!(
+            "embed_supervisor_waiters",
+            "model" => self.model.clone(),
+            "priority" => self.priority
+        )
+        .decrement(1.0);
+    }
+}
+
 /// Increment rejected-due-to-backpressure counter. Called from the
 /// `DynamicBatcher` 80%-of-capacity gate and its belt-and-suspenders
 /// `try_send` fallthrough — so every item that produces a 429 on the
