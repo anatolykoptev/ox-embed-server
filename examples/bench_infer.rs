@@ -17,7 +17,12 @@
 //! appears in the matching `*_MODELS` variable. Flags: `--threads N` (ORT
 //! intra-op threads, default 2), `--pool N` (session pool, default 1),
 //! `--iters N` (timed iterations, default 8), `--warmup N` (default 2),
-//! `--only <substring>` (run scenarios whose label contains it).
+//! `--only <substring>` (run scenarios whose label contains it), `--seed N`
+//! (a different deterministic corpus), `--dump FILE` (write the scores /
+//! vectors for offline comparison between two builds), `--alone` (with
+//! `--dump`, rerank only: score each pair in its own forward pass, the
+//! least-padded reference), `--par K` (embed only: split the request over K
+//! threads against a `--pool K` embedder).
 //!
 //! The corpus is built from this repository's own docs plus a short built-in
 //! Russian passage, so token density is realistic for mixed EN/RU traffic and
