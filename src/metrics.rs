@@ -586,6 +586,17 @@ pub fn record_subbatch_groups(model: &str, groups: usize) {
     .record(groups as f64);
 }
 
+/// Publish the pad-width multiple an embedder chose from its `memory_pattern`
+/// setting, so operators can read which rule is live instead of inferring it
+/// from env.
+pub fn set_seq_pad_multiple(model: &str, multiple: usize) {
+    metrics::gauge!(
+        "embed_seq_pad_multiple",
+        "model" => model.to_string()
+    )
+    .set(multiple as f64);
+}
+
 /// Publish the configured sub-batch length ratio so operators can read the
 /// effective value off `/metrics` instead of reconstructing it from the two
 /// env vars and a default.
@@ -1004,7 +1015,7 @@ pub fn record_token_cache_miss(model: &str, n: u64) {
 /// Record token-budget per dispatched batch: `batch_size × effective_seq_len`.
 ///
 /// For padded models (all BERT-family dense embedders) effective_seq_len is
-/// the power-of-two-rounded `max(seq_len_in_batch)` that ends up in the actual
+/// the multiple-of-4-rounded `max(seq_len_in_batch)` that ends up in the actual
 /// tensor.  This is the direct predictor of per-inference scratch memory.
 ///
 /// Buckets: 1k, 4k, 16k, 64k, 128k, 256k, 1M, 4M.  The 1.258 GiB tensor
@@ -1508,6 +1519,20 @@ pub fn record_rerank_input_docs_size(n: usize) {
     .record(n as f64);
 }
 
+/// Recorder builder for a worker process.
+///
+/// Stamps `model` on every series the worker exposes. Most series set it
+/// themselves; the process-wide ones (the `embed_arena_*` gauges) do not, so on
+/// a worker's `/metrics` they could only be attributed to a model through a
+/// scrape-time label kept by hand next to the port map, and that map drifted
+/// when a model was added. A label the worker stamps on itself cannot. Labels a
+/// series sets explicitly win over this one.
+// `allow(dead_code)`: see `record_worker_inference` — main.rs compiles a private copy of this module.
+#[allow(dead_code)]
+pub fn worker_recorder_builder(model: &str) -> PrometheusBuilder {
+    apply_histogram_buckets(PrometheusBuilder::new()).add_global_label("model", model)
+}
+
 // ── shared test helper ────────────────────────────────────────────────────────
 
 /// Install a Prometheus recorder the first time it's needed and return its
@@ -1797,7 +1822,9 @@ mod bucket_ladder_tests {
 
 #[cfg(test)]
 mod subbatch_metric_tests {
-    use super::{record_subbatch_groups, set_subbatch_ratio, test_prometheus_handle};
+    use super::{
+        record_subbatch_groups, set_seq_pad_multiple, set_subbatch_ratio, test_prometheus_handle,
+    };
 
     fn series(rendered: &str, needle: &str) -> Option<f64> {
         rendered
@@ -1865,6 +1892,31 @@ mod subbatch_metric_tests {
         )
         .expect("gauge must still be present after being set to 0");
         assert_eq!(v, 0.0, "disabled must render 0, not the previous value");
+    }
+
+    /// The live pad-width rule must be readable off `/metrics`. cargo-mutants
+    /// replaced `set_seq_pad_multiple` with `()` and nothing failed in CI,
+    /// because the only other reader of this gauge is a model-backed test that
+    /// skips there. Model-free, like the ratio gauge test above.
+    #[test]
+    fn seq_pad_multiple_gauge_carries_the_live_rule() {
+        let handle = test_prometheus_handle();
+        set_seq_pad_multiple("t_seq_pad_multiple", 4);
+        let v = series(
+            &handle.render(),
+            "embed_seq_pad_multiple{model=\"t_seq_pad_multiple\"}",
+        )
+        .expect("embed_seq_pad_multiple must be emitted");
+        assert_eq!(v, 4.0);
+
+        // A gauge: a reload under the other rule must overwrite, not add.
+        set_seq_pad_multiple("t_seq_pad_multiple", 16);
+        let v = series(
+            &handle.render(),
+            "embed_seq_pad_multiple{model=\"t_seq_pad_multiple\"}",
+        )
+        .expect("gauge must still be present after being set again");
+        assert_eq!(v, 16.0, "the new rule must replace the old value");
     }
 }
 
@@ -2035,5 +2087,32 @@ mod request_size_bucket_tests {
         ] {
             assert_eq!(request_size_bucket(n), want, "n_inputs={n}");
         }
+    }
+}
+
+#[cfg(test)]
+mod worker_recorder_tests {
+    use super::{set_arena_gauges, set_seq_pad_multiple, worker_recorder_builder};
+
+    /// Series without their own `model` label (the arena gauges) must come out
+    /// of a worker recorder attributed to that worker's model, and a series
+    /// that sets `model` itself must keep its own value.
+    #[test]
+    fn worker_recorder_stamps_model_on_unlabelled_series() {
+        let recorder = worker_recorder_builder("wr-model").build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            set_arena_gauges(1024, 512, 256, 1);
+            set_seq_pad_multiple("wr-other", 4);
+        });
+        let out = handle.render();
+        assert!(
+            out.contains("embed_arena_max_mem_bytes{model=\"wr-model\"} 1024"),
+            "arena gauge must carry the worker's model label:\n{out}"
+        );
+        assert!(
+            out.contains("embed_seq_pad_multiple{model=\"wr-other\"} 4"),
+            "an explicit model label must win over the worker-wide one:\n{out}"
+        );
     }
 }

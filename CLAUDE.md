@@ -40,15 +40,19 @@ Models (format `name:dir:dim:max_len:pad_id:has_tti[:model_file]`):
 - `RERANKER_MODELS="gte-multi-rerank:/models-gte-rerank:256:true"` — format `name:dir:max_len:padded`
 - `SPLADE_MODELS="splade-v3-distilbert:/models-splade:256"` — format `name:dir:max_len`
 
-ORT tuning:
-- `EMBED_INTRA_THREADS=2`, `EMBED_SESSION_POOL_SIZE=2` — `pool_size * intra_threads ≤ cores` rule.
-- `EMBED_MEMORY_PATTERN_JINA_CODE_V2=false` — required for jina (variable seq + ALiBi). Other models keep default `true`.
-- `EMBED_ARENA_MAX_MEM_BYTES=6442450944` (6 GiB) — BFCArena ceiling per worker.
+ORT tuning (the values here are defaults and examples; a deployment overrides them per model, so read the live setting, not this list):
+- `EMBED_INTRA_THREADS` (default `2`), `EMBED_SESSION_POOL_SIZE` — `pool_size * intra_threads ≤ cores` rule. Per-model overrides exist (e.g. `RERANKER_INTRA_THREADS`); a deployment may run a model, e5 for instance, with a different thread count than the default.
+- `EMBED_MEMORY_PATTERN_<MODEL>=false` — required for jina (variable seq + ALiBi). The code default is `true`; a deployment may set it `false` for any model, and the embedder pad rule below follows each model's setting.
+- `EMBED_ARENA_MAX_MEM_BYTES` (default 6 GiB) — BFCArena ceiling **per worker**; `EMBED_ARENA_MAX_MEM_BYTES_<MODEL>` overrides it for one worker.
 - `ORT_DYLIB_PATH=/usr/lib/libonnxruntime.so` — required by `ort` with `load-dynamic`.
 
 Batcher:
 - `BATCH_MAX=32`, `BATCH_MAX_TOKENS=16384`, `BATCH_MAX_SEQ=256`, `BATCH_WAIT_MS=30`, `MAX_QUEUE_SIZE=256`.
 - `BATCH_LENGTH_RATIO_THRESHOLD` — (default `0.0` = disabled) when > 0.0, items whose `max_seq_len` exceeds `accum.max_len * threshold` are carried to the next batch to reduce padding waste on padded models.
+
+Padding / sub-batching (worker path):
+- Embedders pad each forward pass to the longest sequence rounded up to a multiple of 4 tokens when the model's `memory_pattern` is off (`pool::SEQ_PAD_MULTIPLE`), or of 16 when it is on (`pool::SEQ_PAD_MULTIPLE_PATTERN_ON`: ORT keeps one plan per distinct shape, so the shape count must stay bounded). Neither is a power of two any more. The live multiple is `embed_seq_pad_multiple{model}`. `EMBED_SUBBATCH_RATIO[_<MODEL>]` (default `2.0`, `<= 1.0` disables) splits a request into length-homogeneous passes.
+- `RERANKER_SUBBATCH_RATIO` (default `2.0`, `<= 1.0` disables) does the same for `/v1/rerank`: pairs whose lengths differ by more than the ratio run in separate forward passes. Scores are returned in input order. Observable as `embed_subbatch_groups{model}`.
 
 ## CI
 

@@ -151,6 +151,114 @@ pub fn mean_pool_normalize(
     Ok(result)
 }
 
+/// Round `n` (the longest real sequence in a batch) up to a multiple of
+/// `multiple`, capped at `cap`. `n <= 1` stays 1 so an empty or singleton
+/// batch is a 1-token tensor, as before.
+///
+/// Replaces round-up-to-power-of-two, which padded a 33-token batch to 64 and
+/// so spent ~2x the compute the batch needed. Measured 1.8x on 128 short
+/// sentences (see the PR description); `multiple` keeps the GEMM row counts
+/// aligned without that waste. `multiple <= 1` means no rounding.
+pub fn round_up_to_multiple(n: usize, multiple: usize, cap: usize) -> usize {
+    if n <= 1 {
+        return 1;
+    }
+    n.div_ceil(multiple.max(1))
+        .saturating_mul(multiple.max(1))
+        .min(cap)
+}
+
+/// Pad width multiple for a model whose ORT `memory_pattern` is OFF (the
+/// production setting). Was: the next power of two, which padded a 33-token
+/// batch to 64 on the short-sentence batches callers send. 4 beat 8, 16 and 32
+/// on the target CPU; see the PR description. With the pattern off ORT keeps no
+/// per-shape plan, so the up-to-64 distinct widths this allows cost nothing.
+pub const SEQ_PAD_MULTIPLE: usize = 4;
+
+/// Pad width multiple for a model whose `memory_pattern` is ON (the code
+/// default). ORT keeps one memory plan per distinct input shape and the shared
+/// arena has a hard cap (docs/arena.md; the jina and reranker OOMs), so the
+/// number of distinct widths must stay small: multiple-of-16 allows at most 16
+/// for a 256-token model. Measured: RSS flat over 200 random-length requests
+/// with pattern on, for both multiple-of-16 and the old power of two.
+pub const SEQ_PAD_MULTIPLE_PATTERN_ON: usize = 16;
+
+/// The pad multiple for a model, by its `memory_pattern` setting.
+pub fn seq_pad_multiple(memory_pattern: bool) -> usize {
+    if memory_pattern {
+        SEQ_PAD_MULTIPLE_PATTERN_ON
+    } else {
+        SEQ_PAD_MULTIPLE
+    }
+}
+
+/// The tensor width for a batch whose longest real sequence is `n` tokens,
+/// never above the model's `cap`, under the `memory_pattern=false` rule. The
+/// batcher's `embed_batch_max_effective_seq` metric uses this; it does not know
+/// the model's pattern setting, so for a pattern-on model that metric is an
+/// approximation.
+pub fn round_up_seq_len(n: usize, cap: usize) -> usize {
+    round_up_to_multiple(n, SEQ_PAD_MULTIPLE, cap)
+}
+
+/// Tokens the tensors of a plan will hold: for each group, its size times the
+/// width `width_of` gives for the group's longest sequence. `lens` are the
+/// per-input lengths already capped at the model's `max_len`.
+///
+/// Used for the request-wide padding-waste metric. It sums over ALL groups: a
+/// per-group ratio improves by construction as groups narrow, so it would
+/// report success even when a split saved nothing.
+pub fn padded_tokens(
+    groups: &[Vec<usize>],
+    lens: &[usize],
+    width_of: impl Fn(usize) -> usize,
+) -> usize {
+    groups
+        .iter()
+        .map(|g| {
+            let widest = g.iter().map(|&i| lens[i]).max().unwrap_or(0);
+            g.len() * width_of(widest)
+        })
+        .sum()
+}
+
+/// Run `run` once per planned group and scatter the rows back to input order.
+///
+/// `groups` is a partition of `0..total` (see `plan_subbatches`); `run`
+/// receives one group's original indices and must return exactly one row per
+/// index, in that order. A plan that drops an index, repeats one, or a `run`
+/// that returns the wrong number of rows is an `Err` — never a silently wrong
+/// or empty row, because a scatter bug here hands a caller another input's
+/// score or vector with no error and no metric.
+pub fn run_grouped<T, F>(groups: &[Vec<usize>], total: usize, mut run: F) -> Result<Vec<T>, String>
+where
+    F: FnMut(&[usize]) -> Result<Vec<T>, String>,
+{
+    let mut out: Vec<Option<T>> = (0..total).map(|_| None).collect();
+    for group in groups {
+        let rows = run(group)?;
+        if rows.len() != group.len() {
+            return Err(format!(
+                "sub-batch cardinality: expected {}, got {}",
+                group.len(),
+                rows.len()
+            ));
+        }
+        for (&index, row) in group.iter().zip(rows) {
+            let slot = out
+                .get_mut(index)
+                .ok_or_else(|| format!("sub-batch index {index} out of range {total}"))?;
+            if slot.replace(row).is_some() {
+                return Err(format!("sub-batch plan repeats index {index}"));
+            }
+        }
+    }
+    out.into_iter()
+        .enumerate()
+        .map(|(i, row)| row.ok_or_else(|| format!("sub-batch plan left row {i} unfilled")))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,6 +448,113 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn round_up_to_multiple_pads_to_the_next_multiple_not_the_next_power_of_two() {
+        // 33 used to pad to 64; the point of the change is that it does not.
+        assert_eq!(round_up_to_multiple(33, 8, 256), 40);
+        assert_eq!(round_up_to_multiple(40, 8, 256), 40, "exact multiple stays");
+        assert_eq!(round_up_to_multiple(41, 8, 256), 48);
+        assert_eq!(round_up_to_multiple(130, 8, 256), 136);
+    }
+
+    #[test]
+    fn round_up_to_multiple_caps_and_keeps_tiny_batches_at_one() {
+        assert_eq!(round_up_to_multiple(250, 8, 256), 256);
+        assert_eq!(
+            round_up_to_multiple(254, 8, 250),
+            250,
+            "cap wins over rounding"
+        );
+        assert_eq!(round_up_to_multiple(0, 8, 256), 1);
+        assert_eq!(round_up_to_multiple(1, 8, 256), 1);
+        assert_eq!(
+            round_up_to_multiple(5, 0, 256),
+            5,
+            "multiple 0 = no rounding"
+        );
+        assert_eq!(round_up_to_multiple(5, 1, 256), 5);
+    }
+
+    #[test]
+    fn pad_multiple_follows_memory_pattern() {
+        // Pattern off (production): fine rule. Pattern on (code default):
+        // coarse rule that bounds ORT's per-shape plans.
+        assert_eq!(seq_pad_multiple(false), 4);
+        assert_eq!(seq_pad_multiple(true), 16);
+        // The two branches really give different widths for the same batch.
+        assert_eq!(round_up_to_multiple(33, seq_pad_multiple(false), 256), 36);
+        assert_eq!(round_up_to_multiple(33, seq_pad_multiple(true), 256), 48);
+    }
+
+    #[test]
+    fn pattern_on_rule_bounds_the_number_of_distinct_widths() {
+        // The reason the coarse rule exists: with memory_pattern on every
+        // distinct width is a plan ORT keeps. For a 256-token model every
+        // possible longest length must land on <= 17 widths (16 multiples
+        // plus the 1-token floor); the fine rule is allowed 65.
+        let widths = |memory_pattern: bool| {
+            let mut w: Vec<usize> = (1..=256)
+                .map(|n| round_up_to_multiple(n, seq_pad_multiple(memory_pattern), 256))
+                .collect();
+            w.sort_unstable();
+            w.dedup();
+            w.len()
+        };
+        assert_eq!(widths(true), 17);
+        assert_eq!(widths(false), 65);
+    }
+
+    #[test]
+    fn padded_tokens_sums_every_group_at_its_own_width() {
+        // Two groups: {0, 3} widest 10, {1, 2} widest 4. Identity width.
+        let lens = [10, 4, 3, 7];
+        let groups = vec![vec![0, 3], vec![1, 2]];
+        assert_eq!(padded_tokens(&groups, &lens, |w| w), 2 * 10 + 2 * 4);
+        // The width rule is applied to each group's widest, not to the batch's.
+        assert_eq!(
+            padded_tokens(&groups, &lens, |w| round_up_to_multiple(w, 4, 256)),
+            2 * 12 + 2 * 4
+        );
+        // One group is the old single-pass figure: batch x widest.
+        assert_eq!(padded_tokens(&[vec![0, 1, 2, 3]], &lens, |w| w), 4 * 10);
+        assert_eq!(padded_tokens(&[], &lens, |w| w), 0);
+    }
+
+    #[test]
+    fn run_grouped_scatters_rows_back_to_input_order() {
+        // Groups deliberately out of input order, as plan_subbatches emits
+        // them (longest first): row i must come back at position i.
+        let groups = vec![vec![3, 0], vec![2], vec![1, 4]];
+        let got = run_grouped(&groups, 5, |idx| {
+            Ok(idx.iter().map(|&i| i as f32 * 10.0).collect())
+        })
+        .unwrap();
+        assert_eq!(got, vec![0.0, 10.0, 20.0, 30.0, 40.0]);
+    }
+
+    #[test]
+    fn run_grouped_rejects_wrong_row_count() {
+        let groups = vec![vec![0, 1]];
+        let err = run_grouped(&groups, 2, |_| Ok(vec![1.0f32])).unwrap_err();
+        assert!(err.contains("cardinality"), "{err}");
+    }
+
+    #[test]
+    fn run_grouped_rejects_a_plan_that_drops_or_repeats_an_index() {
+        let err = run_grouped(&[vec![0]], 2, |i| Ok(vec![0.0f32; i.len()])).unwrap_err();
+        assert!(err.contains("unfilled"), "dropped index: {err}");
+        let err = run_grouped(&[vec![0], vec![0]], 1, |i| Ok(vec![0.0f32; i.len()])).unwrap_err();
+        assert!(err.contains("repeats"), "repeated index: {err}");
+        let err = run_grouped(&[vec![7]], 2, |i| Ok(vec![0.0f32; i.len()])).unwrap_err();
+        assert!(err.contains("out of range"), "{err}");
+    }
+
+    #[test]
+    fn run_grouped_propagates_the_runner_error() {
+        let err = run_grouped::<f32, _>(&[vec![0]], 1, |_| Err("boom".into())).unwrap_err();
+        assert_eq!(err, "boom");
     }
 
     #[test]

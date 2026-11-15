@@ -106,6 +106,9 @@ pub struct RerankerModel {
     /// `AtomicUsize` so a busy `b=5` pool can't stall the `b=1` pool
     /// (and neither can stall the dynamic `next` cursor).
     pub(super) static_session_cursors: BTreeMap<usize, AtomicUsize>,
+    /// Max widest/shortest length ratio inside one dynamic forward pass; see
+    /// `crate::model::plan_subbatches`. `<= 1.0` = always one pass.
+    pub(super) subbatch_ratio: f32,
 }
 
 impl RerankerModel {
@@ -213,6 +216,40 @@ impl RerankerModel {
             return self.score_pairs_static(token_ids, static_pool, cursor);
         }
 
+        // Split a length-heterogeneous request into length-homogeneous
+        // sub-batches so a 30-token snippet is not padded to the 256 tokens
+        // of the longest page chunk next to it. Same planner the embedders
+        // use; a request whose lengths already sit inside one band (the common
+        // all-docs-hit-the-cap case) is exactly one pass, as before.
+        let lens: Vec<usize> = token_ids
+            .iter()
+            .map(|v| v.len().min(self.max_len))
+            .collect();
+        let groups = crate::model::plan_subbatches(&lens, self.subbatch_ratio);
+        crate::metrics::record_subbatch_groups(&self.name, groups.len());
+        // Padding waste is reported across the WHOLE request (as the embedder
+        // does), not per pass: a per-pass ratio improves by construction as
+        // passes narrow, so it would report success even when a split saved
+        // nothing.
+        crate::metrics::record_rerank_padding_waste(
+            &self.name,
+            pool::padded_tokens(&groups, &lens, |w| w),
+            lens.iter().sum(),
+        );
+        if groups.len() <= 1 {
+            return self.score_dynamic_pass(token_ids);
+        }
+        pool::run_grouped(&groups, token_ids.len(), |indices| {
+            let sub: Vec<Vec<u32>> = indices.iter().map(|&i| token_ids[i].clone()).collect();
+            self.score_dynamic_pass(&sub)
+        })
+    }
+
+    /// One dynamic-shape forward pass over `token_ids`, padded to the longest
+    /// sequence in the slice (capped at `max_len`). Always the dynamic graph:
+    /// the static-shape fast path is chosen by `score_pairs` on the whole
+    /// request, never per sub-batch.
+    fn score_dynamic_pass(&self, token_ids: &[Vec<u32>]) -> Result<Vec<f32>, String> {
         let max_seq = token_ids
             .iter()
             .map(|v| v.len())
@@ -220,10 +257,6 @@ impl RerankerModel {
             .unwrap_or(0)
             .min(self.max_len);
         let batch = token_ids.len();
-        // Sum of clipped real lengths — used for padding-waste ratio. Each
-        // sequence contributes `min(len, max_len)` tokens of actual compute;
-        // the rest of the `[batch, max_seq]` tensor is padding.
-        let real_tokens: usize = token_ids.iter().map(|v| v.len().min(self.max_len)).sum();
         // Reuse `pool::build_tensors_from_ids` with `with_tti = false` — the
         // reranker ONNX graph has no `token_type_ids` input (confirmed via
         // `Session::inputs()` at load), so we skip the allocation entirely.
@@ -258,11 +291,6 @@ impl RerankerModel {
             })
             .map_err(|e| format!("reranker inference: {e}"))?;
         crate::metrics::record_rerank_inference(&self.name, inference_start.elapsed(), batch);
-        crate::metrics::record_rerank_padding_waste(
-            &self.name,
-            batch.saturating_mul(max_seq),
-            real_tokens,
-        );
 
         // The reranker emits a single output tensor named "logits" of
         // shape [batch, 1]. Extract, reshape, then flatten the trailing

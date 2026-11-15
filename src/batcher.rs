@@ -6,19 +6,7 @@
 //! padded total tokens `max(seq_len_in_batch) * n_items`, not by item count.
 use std::cmp::max;
 
-/// Round up `n` to the next power of two, capped at `cap`.
-///
-/// Mirrors `round_up_seq_len` in `model.rs`. Duplicated here (vs. making it
-/// pub in model.rs) to avoid importing the ONNX session dependency from
-/// batcher tests. Both copies are ≤5 lines; the architecture "3rd copy →
-/// extract" rule hasn't triggered. If a third call site emerges, move to a
-/// `seq_util` module.
-fn round_up_seq_len(n: usize, cap: usize) -> usize {
-    if n <= 1 {
-        return 1;
-    }
-    n.next_power_of_two().min(cap)
-}
+use crate::pool::round_up_seq_len;
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -159,7 +147,7 @@ struct BatcherConfig {
     ///
     /// Equals `ModelDef.max_len`. `usize::MAX` is the safe default for
     /// tests that don't care about this metric — `round_up_seq_len` treats
-    /// it as "no cap" and just does `next_power_of_two`.
+    /// it as "no cap" and just rounds up to the pad multiple.
     model_max_len: usize,
     /// Length-ratio carry threshold for padded models. When > 0.0, an
     /// item whose `max_seq_len` exceeds `accum.max_len * threshold` is
@@ -2311,8 +2299,8 @@ mod tests {
             /*wait_ms*/ 50,
             /*max_queue*/ 16,
         ));
-        // Send a 64-token item. After round_up_seq_len (next power of 2), it
-        // becomes 64 (already a power of 2). The histogram must record 64.
+        // Send a 64-token item. After round_up_seq_len (multiple of 4) it
+        // stays 64. The histogram must record 64.
         let _ = b.embed_tokens(vec![vec![0u32; 64]]).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
         let text = handle.render();
