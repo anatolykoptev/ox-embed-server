@@ -20,7 +20,7 @@
 //! `--only <substring>` (run scenarios whose label contains it), `--seed N`
 //! (a different deterministic corpus), `--dump FILE` (write the scores /
 //! vectors for offline comparison between two builds), `--alone` (with
-//! `--dump`, rerank only: score each pair in its own forward pass, the
+//! `--dump`: score / embed each text in its own forward pass, the
 //! least-padded reference), `--par K` (embed only: split the request over K
 //! threads against a `--pool K` embedder).
 //!
@@ -248,12 +248,21 @@ fn main() -> anyhow::Result<()> {
                 }
             } else if let Some(e) = &embedder {
                 // Whole vectors, flattened: cosine is computed offline.
-                e.infer(docs.clone(), 0)
-                    .map_err(|e| anyhow::anyhow!("infer: {e}"))?
-                    .0
-                    .into_iter()
-                    .flatten()
-                    .collect()
+                // `--alone` embeds each text in its own pass (batch of 1, so
+                // the pad width follows that text alone).
+                let batches: Vec<Vec<String>> = if args.iter().any(|a| a == "--alone") {
+                    docs.iter().map(|d| vec![d.clone()]).collect()
+                } else {
+                    vec![docs.clone()]
+                };
+                let mut out = Vec::new();
+                for batch in batches {
+                    let (vecs, _) = e
+                        .infer(batch, 0)
+                        .map_err(|e| anyhow::anyhow!("infer: {e}"))?;
+                    out.extend(vecs.into_iter().flatten());
+                }
+                out
             } else {
                 vec![]
             };

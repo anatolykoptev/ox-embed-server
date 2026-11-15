@@ -39,8 +39,24 @@ The 32 and 16 rows come from an earlier single-round sweep on a quiet host
 the less padding, the faster, so the "power-of-two tiles are cheaper" assumption did
 not hold on this CPU.
 
-Vectors are unchanged: cosine between old and new
-builds is 1.0000000 (7 decimals) on 32/32/128/512 texts, and top-1 neighbours agree.
+Embedding quality, measured on the same host (128 sentences, seed 3, old build vs
+new build, cosine per vector):
+
+| comparison | min cos | mean cos |
+|---|---|---|
+| old vs new, embedded as one batch of 128 | 1.0000000 | 1.0000000 |
+| old vs new, each text embedded alone (batch of 1) | 0.9922 | 0.9986 |
+| old: batch of 128 vs each text alone (existing behaviour) | 0.9891 | 0.9931 |
+| new: batch of 128 vs each text alone | 0.9901 | 0.9931 |
+
+The int8 dynamic quantisation takes each activation scale from the whole tensor,
+so pad rows move a vector only when the tensor holds little else: in a batch the
+real tokens of the other rows dominate the range and the new width changes nothing,
+but a lone short text (old: padded to 32 or 64; new: to the next multiple of 4)
+shifts by about 0.1% cosine on average, 0.8% at worst. That is smaller than the
+batch-composition drift the old code already has (0.993 mean between a text embedded
+in a batch and alone). If vectors computed before this change are stored next to
+vectors computed after it, expect that order of difference for single-text requests.
 
 ## Before / after (2 intra threads, pool 1)
 
@@ -55,7 +71,7 @@ slower than `old` on uniform lengths (where the code path is identical) are nois
 | rerank 32 docs x 200 ch | 4.34 | 4.27 | same path |
 | rerank 32 docs x 1000 ch | 9.64 | 10.06 | same path (noise) |
 | rerank 32 docs, mixed 80-1400 ch | 9.77 | 8.94 | -8% |
-| rerank 32 docs, bimodal 200/1000 ch | 10.01 | 7.00 | -30% |
+| rerank 32 docs, bimodal 200/1000 ch | 9.87 | 7.00 | -29% |
 | embed 32 texts, mixed lengths | 24.4 | 23.6 | -3% |
 | embed 32 texts x 1000 ch | 26.0 | 26.9 | same path (noise) |
 | embed 128 sentences (120 ch) | 47.8 | 24.5 | **-49%** |
@@ -67,9 +83,10 @@ that mix short and long documents.
 
 ## Rerank quality (sub-batching)
 
-int8 dynamic quantisation derives each activation scale from the whole tensor, so a
-pair's logit moves a little with its batch-mates and pad width, in the old code and
-in the new. Five seeds x 32 docs, one query, `RERANKER_SUBBATCH_RATIO=1.0` (old
+Measured on Apple silicon (same ORT build and model files as the N1 runs), not on
+the N1 host. int8 dynamic quantisation derives each activation scale from the whole
+tensor, so a pair's logit moves a little with its batch-mates and pad width, in the
+old code and in the new. Five seeds x 32 docs, one query, `RERANKER_SUBBATCH_RATIO=1.0` (old
 behaviour) against `2.0` (new), and each against scoring every pair alone
 (no padding, no batch-mates):
 
