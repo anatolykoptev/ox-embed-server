@@ -441,8 +441,7 @@ fn register_shared_cpu_arena_with_cfg(cfg: ArenaCfg) -> Result<(), String> {
         return Err("CreateArenaCfgV2 returned non-null status".into());
     }
 
-    // 3. Register on the global environment. Environment::current() returns
-    //    the singleton committed by ort::init().
+    // 3. Register on the process-wide environment (see `ort_env`).
     let env = ort_env()?;
     // SAFETY: ORT C API takes *mut OrtEnv but only mutates internal env state
     // (allocator registry) under its own lock. Casting *const to *mut is safe
