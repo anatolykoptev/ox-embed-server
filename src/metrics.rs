@@ -1573,6 +1573,18 @@ mod classify_worker_error_tests {
         }
     }
 
+    /// Both halves of the first ORT message must be present: "Available
+    /// memory of" alone (or "smaller than requested bytes" alone) is not an
+    /// arena failure.
+    #[test]
+    fn partial_ort_text_is_not_arena_oom() {
+        assert_eq!(classify_worker_error("Available memory of 1 GiB"), "other");
+        assert_eq!(
+            classify_worker_error("value is smaller than requested bytes of 4"),
+            "other"
+        );
+    }
+
     /// `oom` is a word, not a substring: "room" must not read as an OOM.
     #[test]
     fn oom_is_matched_as_a_word() {
