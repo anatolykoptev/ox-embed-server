@@ -197,17 +197,19 @@ pub async fn sparse_embeddings(
             }
             Ok(_unexpected) => {
                 tracing::error!(model = %model_name, "worker returned unexpected variant for splade request");
+                crate::metrics::record_inference_failure(&model_name, "unexpected_response", 0);
                 return server_error("splade failed: unexpected response kind".to_string());
             }
             Err(e) => {
-                use crate::supervisor::pool::DispatchError;
                 tracing::error!(model = %model_name, error = ?e, "worker_pool splade dispatch failed");
+                crate::metrics::record_inference_failure(&model_name, e.failure_reason(), 0);
                 // #97 / #150: dispatch timeout → 503 + Retry-After (transient).
                 // Distinct error_type from the 429 backpressure path so clients
                 // can tell respawn from rate-limit. retry-after=5 (respawn
                 // takes 5-15s) vs the 429's 1s backpressure hint.
+                // `Ipc` (worker died mid-request) is equally transient.
                 let resp = match &e {
-                    DispatchError::Timeout { .. } => (
+                    e if e.is_transient() => (
                         StatusCode::SERVICE_UNAVAILABLE,
                         [("retry-after", "5")],
                         Json(ErrorResponse {

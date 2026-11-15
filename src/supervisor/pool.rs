@@ -35,6 +35,24 @@ pub enum DispatchError {
     Ipc(#[from] std::io::Error),
 }
 
+impl DispatchError {
+    /// Bounded `reason` label for `embed_inference_failures_total`.
+    pub fn failure_reason(&self) -> &'static str {
+        match self {
+            DispatchError::NoWorker { .. } => "no_worker",
+            DispatchError::Timeout { .. } => "worker_unavailable",
+            DispatchError::Ipc(_) => "worker_died",
+        }
+    }
+
+    /// True when a retry can succeed once the worker has respawned: the
+    /// handlers answer 503 + `Retry-After` instead of a permanent-looking 500.
+    /// `NoWorker` is a config error and stays 500.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, DispatchError::Timeout { .. } | DispatchError::Ipc(_))
+    }
+}
+
 // ── pool tuning defaults ───────────────────────────────────────────────────────
 
 /// Maximum time to wait for a respawning worker to become available.
@@ -232,6 +250,29 @@ mod tests {
     use crate::supervisor::util::resolve_duration_secs_env;
     use serial_test::serial;
     use std::time::Duration;
+
+    #[test]
+    fn dispatch_error_reason_and_retryability() {
+        use super::DispatchError;
+        let ipc = DispatchError::Ipc(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        let timeout = DispatchError::Timeout {
+            model: "m".into(),
+            timeout_secs: 1,
+        };
+        let none = DispatchError::NoWorker { model: "m".into() };
+        assert_eq!(ipc.failure_reason(), "worker_died");
+        assert_eq!(timeout.failure_reason(), "worker_unavailable");
+        assert_eq!(none.failure_reason(), "no_worker");
+        assert!(ipc.is_transient() && timeout.is_transient());
+        assert!(!none.is_transient(), "a missing worker is a config error");
+        for e in [&ipc, &timeout, &none] {
+            assert!(
+                crate::metrics::INFERENCE_FAILURE_REASONS.contains(&e.failure_reason()),
+                "reason must be pre-touched: {}",
+                e.failure_reason()
+            );
+        }
+    }
 
     fn resolve_dispatch_timeout() -> Duration {
         resolve_duration_secs_env(

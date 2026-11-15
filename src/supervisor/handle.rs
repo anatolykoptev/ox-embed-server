@@ -448,6 +448,8 @@ impl WorkerSupervisor {
         // observable as a present-but-zero series, not absent (which
         // Prometheus operators read as "metric not wired").
         crate::metrics::worker_restart_touch(&supervisor.spec.model);
+        // Pre-touch the failure counter for every reason — see the function doc.
+        crate::metrics::inference_failures_touch(&supervisor.spec.model);
         // Pre-touch RSS gauge to 0 — same rationale as restart counter:
         // makes "healthy worker, RSS not yet sampled" visible in Prometheus
         // as 0 rather than absent.
@@ -1236,6 +1238,43 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&socket_dir);
+    }
+
+    /// `launch` must publish `embed_inference_failures_total` at 0 for the
+    /// model. A mini worker that only binds the UDS socket is enough: `launch`
+    /// waits for the socket and probes it.
+    #[tokio::test]
+    async fn launch_pre_touches_inference_failure_counter() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker = dir.path().join("mini_worker.sh");
+        std::fs::write(
+            &worker,
+            "#!/bin/sh\nexec python3 -c \"import os,socket,time;s=socket.socket(socket.AF_UNIX);\\\ns.bind(os.environ['EMBED_WORKER_SOCKET']);s.listen(8);time.sleep(60)\"\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let spec = SpawnSpec {
+            model: "launch-touch-model".into(),
+            kind: super::WorkerKind::Embed,
+            worker_bin: worker,
+            socket_dir: dir.path().to_path_buf(),
+            pool_size: 1,
+            intra_threads: 1,
+            env_extra: vec![],
+        };
+        let handle = crate::metrics::test_prometheus_handle();
+        let _sup = WorkerSupervisor::launch(spec)
+            .await
+            .expect("mini worker launches");
+
+        let rendered = handle.render();
+        assert!(
+            rendered.lines().any(|l| l
+                == "embed_inference_failures_total{model=\"launch-touch-model\",reason=\"arena_oom\",bin_num=\"0\"} 0"),
+            "launch must pre-touch embed_inference_failures_total; got:\n{rendered}"
+        );
     }
 
     // ── heartbeat wedge detector (#90, #134, #135) ──────────────────────────

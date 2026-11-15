@@ -239,6 +239,7 @@ pub async fn embeddings(
                     request_id = unexpected.request_id(),
                     "worker returned unexpected response variant for embed request",
                 );
+                crate::metrics::record_inference_failure(&model_name, "unexpected_response", 0);
                 crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -252,16 +253,18 @@ pub async fn embeddings(
                     .into_response();
             }
             Err(e) => {
-                use crate::supervisor::pool::DispatchError;
                 tracing::error!(model = %model_name, error = ?e, "worker_pool dispatch failed");
+                crate::metrics::record_inference_failure(&model_name, e.failure_reason(), 0);
                 // #97 / #150: dispatch timeout (worker respawning) is transient →
                 // 503 + Retry-After so clients retry instead of treating it
                 // as a hard 500 failure. The status label and error_type are
                 // DISTINCT from the 500 path so operators and clients can
                 // tell "worker respawning, retry in 5s" apart from "request
                 // broken" and from 429 backpressure ("slow down, retry in 1s").
+                // `Ipc` (worker died mid-request; the supervisor respawns it) is
+                // equally transient, so it takes the same 503 branch.
                 return match &e {
-                    DispatchError::Timeout { .. } => {
+                    e if e.is_transient() => {
                         status = "worker_unavailable";
                         crate::metrics::record_request(
                             &model_name,
@@ -471,6 +474,7 @@ pub async fn embeddings(
             got = miss_vectors.len(),
             "miss vector count mismatch"
         );
+        crate::metrics::record_inference_failure(&model_name, "count_mismatch", 0);
         crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1094,5 +1098,146 @@ mod tests {
             retry_after, "1",
             "503 worker-respawn Retry-After should differ from the 429 backpressure hint"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Every 5xx on the worker path must be counted in
+    // `embed_inference_failures_total`, and a dead worker must be retryable.
+    // ------------------------------------------------------------------
+
+    /// Current value of `embed_inference_failures_total{model,reason}`
+    /// (0 when the series is absent).
+    fn failures(model: &str, reason: &str) -> f64 {
+        let needle = format!(
+            "embed_inference_failures_total{{model=\"{model}\",reason=\"{reason}\",bin_num=\"0\"}} "
+        );
+        test_prom()
+            .render()
+            .lines()
+            .find_map(|l| l.strip_prefix(needle.as_str()))
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(0.0)
+    }
+
+    fn request_for(model: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"input": ["a"], "model": model}).to_string(),
+            ))
+            .unwrap()
+    }
+
+    fn state_with_pool(model: &str, pool: WorkerPool) -> Arc<AppState> {
+        Arc::new(AppState {
+            models: HashMap::from([(
+                model.to_string(),
+                crate::types::ModelEntry {
+                    model: None,
+                    batcher: None,
+                },
+            )]),
+            rerankers: HashMap::new(),
+            splades: HashMap::new(),
+            default_model: model.to_string(),
+            shutdown: CancellationToken::new(),
+            drain_timeout: Duration::from_secs(5),
+            cache: Arc::new(EmbeddingCache::new(0)),
+            token_cache: Arc::new(crate::token_cache::TokenCache::new(0)),
+            rerank_semaphore: None,
+            embed_max_input_array: 32,
+            rerank_max_input_docs: 32,
+            worker_pool: Some(Arc::new(pool)),
+            ready_probe_timeout_ms: 2000,
+        })
+    }
+
+    fn spec_for(model: &str) -> SpawnSpec {
+        SpawnSpec {
+            model: model.to_string(),
+            kind: WorkerKind::Embed,
+            worker_bin: PathBuf::from("/bin/true"),
+            socket_dir: PathBuf::from("/tmp"),
+            pool_size: 1,
+            intra_threads: 1,
+            env_extra: vec![],
+        }
+    }
+
+    /// A worker that died mid-request: the client connected once (so the
+    /// supervisor holds a live `WorkerClient`), then the socket went away.
+    /// `dispatch_embed` returns `DispatchError::Ipc`.
+    ///
+    /// Before: 500 and no failure counter. Now: 503 + Retry-After and
+    /// `reason="worker_died"` counted once.
+    #[tokio::test]
+    async fn embed_ipc_failure_is_counted_and_retryable() {
+        let model = "ipc-dead-model";
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("w.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let client = crate::ipc::client::WorkerClient::connect(sock.clone(), 1)
+            .await
+            .unwrap();
+        drop(listener);
+        std::fs::remove_file(&sock).unwrap();
+
+        let pool = WorkerPool::with_dispatch_timeout(Duration::from_millis(50));
+        pool.add(WorkerSupervisor::for_test(
+            spec_for(model),
+            Arc::new(client),
+        ))
+        .await;
+        let before = failures(model, "worker_died");
+
+        let resp = make_app(state_with_pool(model, pool))
+            .oneshot(request_for(model))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers().get("retry-after").unwrap(), "5");
+        assert_eq!(
+            failures(model, "worker_died") - before,
+            1.0,
+            "an Ipc failure must increment embed_inference_failures_total{{reason=\"worker_died\"}}"
+        );
+    }
+
+    /// A dispatch timeout (worker respawning) is a 503 and was uncounted too.
+    #[tokio::test]
+    async fn embed_dispatch_timeout_is_counted() {
+        let model = "timeout-counted-model";
+        let pool = WorkerPool::with_dispatch_timeout(Duration::from_millis(1));
+        pool.add(WorkerSupervisor::for_test_no_client(spec_for(model)))
+            .await;
+        let before = failures(model, "worker_unavailable");
+
+        let resp = make_app(state_with_pool(model, pool))
+            .oneshot(request_for(model))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(failures(model, "worker_unavailable") - before, 1.0);
+    }
+
+    /// No registered worker is a config error: stays 500 (a retry cannot
+    /// fix it) but is counted.
+    #[tokio::test]
+    async fn embed_no_worker_is_500_and_counted() {
+        let model = "no-worker-model";
+        let pool = WorkerPool::with_dispatch_timeout(Duration::from_millis(1));
+        let before = failures(model, "no_worker");
+
+        let resp = make_app(state_with_pool(model, pool))
+            .oneshot(request_for(model))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(failures(model, "no_worker") - before, 1.0);
     }
 }

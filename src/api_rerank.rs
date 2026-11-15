@@ -456,20 +456,22 @@ pub async fn rerank(
                     model = %model_name,
                     "worker returned unexpected response variant for rerank request"
                 );
+                crate::metrics::record_inference_failure(&model_name, "unexpected_response", 0);
                 finish!(
                     "server_error",
                     server_error("rerank failed: unexpected response kind".to_string())
                 );
             }
             Err(e) => {
-                use crate::supervisor::pool::DispatchError;
                 tracing::error!(model = %model_name, error = ?e, "worker_pool rerank dispatch failed");
+                crate::metrics::record_inference_failure(&model_name, e.failure_reason(), 0);
                 // #97 / #150: dispatch timeout → 503 + Retry-After (transient).
                 // Distinct status label + error_type from the 500 path so
                 // operators and clients can tell respawn from hard failure
                 // and from 429 backpressure.
+                // `Ipc` (worker died mid-request) is equally transient.
                 let (label, resp) = match &e {
-                    DispatchError::Timeout { .. } => (
+                    e if e.is_transient() => (
                         "worker_unavailable",
                         (
                             StatusCode::SERVICE_UNAVAILABLE,
@@ -554,6 +556,7 @@ pub async fn rerank(
             got = scores.len(),
             "rerank score count mismatch"
         );
+        metrics::record_inference_failure(&model_name, "count_mismatch", 0);
         finish!(
             "server_error",
             server_error("internal error: score count mismatch".to_string())
@@ -1216,8 +1219,12 @@ mod tests {
     /// `WorkerPool` with a no-client supervisor + 1 ms timeout, and a
     /// metadata-only `RerankerEntry` (multi-process shape).
     async fn make_state_rerank_worker_respawning() -> Arc<AppState> {
+        make_state_rerank_worker_respawning_for("test-reranker").await
+    }
+
+    async fn make_state_rerank_worker_respawning_for(name: &str) -> Arc<AppState> {
         let spec = SpawnSpec {
-            model: "test-reranker".to_string(),
+            model: name.to_string(),
             kind: WorkerKind::Rerank,
             worker_bin: PathBuf::from("/bin/true"),
             socket_dir: PathBuf::from("/tmp"),
@@ -1231,7 +1238,7 @@ mod tests {
         Arc::new(AppState {
             models: HashMap::new(),
             rerankers: HashMap::from([(
-                "test-reranker".to_string(),
+                name.to_string(),
                 crate::types::RerankerEntry {
                     model: None,
                     batcher: None,
@@ -1253,8 +1260,12 @@ mod tests {
 
     /// Build a POST /v1/rerank request targeting `test-reranker`.
     fn make_rerank_request_named() -> Request<Body> {
+        make_rerank_request_for("test-reranker")
+    }
+
+    fn make_rerank_request_for(model: &str) -> Request<Body> {
         let body = serde_json::json!({
-            "model": "test-reranker",
+            "model": model,
             "query": "test query",
             "documents": ["doc 0"]
         });
@@ -1299,5 +1310,30 @@ mod tests {
             "rerank metrics must contain a distinct `worker_unavailable` status line for the 503 path; \
              got:\n{metrics_text}"
         );
+    }
+
+    /// The rerank dispatch-failure arm must count the failure (it was
+    /// uncounted for `Timeout`/`Ipc`/`NoWorker`). Removing the
+    /// `record_inference_failure` call in that arm makes this RED.
+    #[tokio::test]
+    async fn rerank_dispatch_failure_is_counted() {
+        let handle = test_prom();
+        let needle = "embed_inference_failures_total{model=\"rerank-count-model\",reason=\"worker_unavailable\",bin_num=\"0\"} ";
+        let read = || {
+            handle
+                .render()
+                .lines()
+                .find_map(|l| l.strip_prefix(needle))
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .unwrap_or(0.0)
+        };
+        let before = read();
+        let state = make_state_rerank_worker_respawning_for("rerank-count-model").await;
+        let resp = make_app(state)
+            .oneshot(make_rerank_request_for("rerank-count-model"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(read() - before, 1.0);
     }
 }
