@@ -1165,7 +1165,7 @@ pub fn classify_worker_error(message: &str) -> &'static str {
         "semaphore_closed"
     } else if m.contains("saturated") {
         "worker_saturated"
-    } else if m.contains("bfcarena") || m.contains("arena") || m.contains("oom") {
+    } else if is_arena_oom(&m) {
         "arena_oom"
     } else if m.contains("kind mismatch") {
         "kind_mismatch"
@@ -1173,6 +1173,82 @@ pub fn classify_worker_error(message: &str) -> &'static str {
         "tokenize"
     } else {
         "other"
+    }
+}
+
+/// True when a lower-cased worker error is an ORT BFCArena allocation failure.
+///
+/// The strings come from `onnxruntime/core/framework/bfc_arena.cc` at the
+/// pinned ORT release (v1.24.3):
+/// - `BFCArena::Extend`: "Available memory of <N> is smaller than requested
+///   bytes of <M>" (`ORT_MAKE_STATUS(... FAIL, ...)`, line 105)
+/// - `BFCArena::Extend`: "Failed to allocate memory for requested buffer of
+///   size <M>" (line 201)
+/// - `AllocateRawInternal`, line 343: "Failed to find a free memory block despite
+///   calling Extend. rounded_bytes=<M>"
+/// - `AllocateRawInternal` rethrows either one with `ORT_THROW`, which prefixes
+///   the source location, so the file name `bfc_arena.cc` may precede the text.
+///
+/// Neither core message contains "arena" or "oom", so the previous
+/// substring match on those words alone classified every real arena OOM as
+/// `other` and the arena-OOM alert could not fire. The loose words are kept
+/// for other phrasings, with `oom` matched as a whole word so "room" does not
+/// count.
+fn is_arena_oom(m: &str) -> bool {
+    (m.contains("available memory of") && m.contains("smaller than requested bytes"))
+        || m.contains("failed to allocate memory for requested buffer")
+        || m.contains("failed to find a free memory block")
+        || m.contains("arena")
+        || m.contains("out of memory")
+        || m.split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|w| w == "oom")
+}
+
+/// Case-insensitive [`is_arena_oom`] on a raw error string, for callers that
+/// do not go through [`classify_worker_error`] (the in-process ORT path).
+pub fn is_arena_oom_message(msg: &str) -> bool {
+    is_arena_oom(&msg.to_ascii_lowercase())
+}
+
+/// Every `reason` label `embed_inference_failures_total` can carry: the
+/// [`classify_worker_error`] buckets plus the supervisor-side failure modes
+/// that never reach a worker message. Pre-touched per model by
+/// [`inference_failures_touch`].
+pub const INFERENCE_FAILURE_REASONS: &[&str] = &[
+    "arena_oom",
+    "queue_overflow",
+    "semaphore_closed",
+    "worker_saturated",
+    "kind_mismatch",
+    "tokenize",
+    "other",
+    // Supervisor-side: the worker never produced an error message.
+    "worker_died",
+    "worker_unavailable",
+    "no_worker",
+    "unexpected_response",
+    // A live worker broke the IPC contract (response id or cardinality
+    // mismatch): deterministic, not retryable.
+    "ipc_protocol",
+];
+
+/// Pre-touch `embed_inference_failures_total` at 0 for every reason.
+///
+/// A counter born at 1 gives `increase()` nothing to subtract, so the first
+/// failure after a restart (the arena OOM that matters) would not satisfy
+/// `increase(...) >= 1`, and an absent series is indistinguishable from "not
+/// wired". Called once per model from `WorkerSupervisor::launch`, next to the
+/// restart-counter touch. Labels must match [`record_inference_failure`]
+/// exactly (`bin_num="0"` is the only value the worker-pool path emits).
+pub fn inference_failures_touch(model: &str) {
+    for reason in INFERENCE_FAILURE_REASONS {
+        metrics::counter!(
+            "embed_inference_failures_total",
+            "model" => model.to_string(),
+            "reason" => (*reason).to_string(),
+            "bin_num" => "0",
+        )
+        .absolute(0);
     }
 }
 
@@ -1597,6 +1673,67 @@ mod classify_worker_error_tests {
         assert_eq!(classify_worker_error("bfcarena out of memory"), "arena_oom");
         assert_eq!(classify_worker_error("arena alloc failed"), "arena_oom");
         assert_eq!(classify_worker_error("oom kill"), "arena_oom");
+    }
+
+    /// The exact text ORT 1.24.3 emits, built the way `bfc_arena.cc` builds it:
+    /// `ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Available memory of ", available,
+    /// " is smaller than requested bytes of ", rounded)` — numbers are
+    /// concatenated with no unit. `ORT_THROW` then prefixes the throw
+    /// location, so the real worker message carries `bfc_arena.cc`.
+    /// None of these contain "arena" (first two) or "oom".
+    #[test]
+    fn real_ort_arena_allocation_failure_text() {
+        for msg in [
+            "Available memory of 1073741824 is smaller than requested bytes of 1258291200",
+            "Failed to allocate memory for requested buffer of size 1258291200",
+            "Failed to find a free memory block despite calling Extend. rounded_bytes=1258291200",
+            "/onnxruntime/onnxruntime/core/framework/bfc_arena.cc:359 void* \
+             onnxruntime::BFCArena::AllocateRawInternal(size_t, bool, \
+             onnxruntime::Stream*, bool, onnxruntime::WaitNotificationFn) \
+             Available memory of 1073741824 is smaller than requested bytes of 1258291200",
+        ] {
+            assert_eq!(classify_worker_error(msg), "arena_oom", "message: {msg}");
+        }
+    }
+
+    /// Every output of `classify_worker_error` must be a pre-touched reason,
+    /// or `rate()` over that reason has no series at 0.
+    #[test]
+    fn every_classifier_output_is_pre_touched() {
+        for msg in [
+            "worker queue overflow",
+            "worker semaphore closed",
+            "worker saturated",
+            "Available memory of 1 is smaller than requested bytes of 2",
+            "kind mismatch: model is embed",
+            "tokenizer failed",
+            "something else",
+        ] {
+            let reason = classify_worker_error(msg);
+            assert!(
+                crate::metrics::INFERENCE_FAILURE_REASONS.contains(&reason),
+                "{reason} (from {msg:?}) missing from INFERENCE_FAILURE_REASONS"
+            );
+        }
+    }
+
+    /// Both halves of the first ORT message must be present: "Available
+    /// memory of" alone (or "smaller than requested bytes" alone) is not an
+    /// arena failure.
+    #[test]
+    fn partial_ort_text_is_not_arena_oom() {
+        assert_eq!(classify_worker_error("Available memory of 1 GiB"), "other");
+        assert_eq!(
+            classify_worker_error("value is smaller than requested bytes of 4"),
+            "other"
+        );
+    }
+
+    /// `oom` is a word, not a substring: "room" must not read as an OOM.
+    #[test]
+    fn oom_is_matched_as_a_word() {
+        assert_eq!(classify_worker_error("no room left in buffer"), "other");
+        assert_eq!(classify_worker_error("worker killed: OOM"), "arena_oom");
     }
 
     #[test]
@@ -2060,6 +2197,32 @@ mod worker_heartbeat_touch_tests {
             assert!(
                 rendered.contains(&expected),
                 "worker_heartbeat_touch must pre-touch {expected}; got:\n{rendered}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod inference_failures_touch_tests {
+    use crate::metrics::{
+        INFERENCE_FAILURE_REASONS, inference_failures_touch, test_prometheus_handle,
+    };
+
+    /// Every reason must be a real, rendered zero for the model — an absent
+    /// series is what made `increase(...{reason="arena_oom"}[15m]) >= 1`
+    /// unable to fire on the first failure after a restart.
+    #[test]
+    fn touch_publishes_every_reason_at_zero() {
+        let handle = test_prometheus_handle();
+        inference_failures_touch("fail-touch-model");
+        let rendered = handle.render();
+        for reason in INFERENCE_FAILURE_REASONS {
+            let expected = format!(
+                "embed_inference_failures_total{{model=\"fail-touch-model\",reason=\"{reason}\",bin_num=\"0\"}} 0"
+            );
+            assert!(
+                rendered.lines().any(|l| l == expected),
+                "missing pre-touched series {expected}; got:\n{rendered}"
             );
         }
     }
