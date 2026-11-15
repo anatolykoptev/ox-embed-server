@@ -66,6 +66,8 @@ codegen-units = 256
 debug = false
 
 [dev-dependencies]
+# tokio test-util: paused virtual time for the priority-gate tests (src/ipc/gate.rs).
+tokio = { version = "1", features = ["full", "test-util"] }
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 # tower + http-body-util: used by api.rs handler tests (axum oneshot call pattern).
 # Tower is already a transitive dep of axum; pinning explicitly makes the test

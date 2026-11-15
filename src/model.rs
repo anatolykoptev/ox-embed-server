@@ -1446,13 +1446,13 @@ fn read_rss_bytes() -> u64 {
 /// Classify an ORT error message into a `(reason, bin_num)` pair for
 /// `embed_inference_failures_total`.
 ///
-/// Recognised pattern (from BFCArena C++ source):
-///   "Available memory of X bytes is smaller than requested bytes of Y"
-/// Returns `("arena_oom", 0)` for that pattern.
+/// Arena-exhaustion text is recognised by the shared
+/// [`crate::metrics::is_arena_oom_message`] (BFCArena messages, see there).
+/// Returns `("arena_oom", 0)` for it.
 ///
 /// Returns `("other", 0)` for everything else.
 fn classify_ort_error(msg: &str) -> (&'static str, u32) {
-    if msg.contains("Available memory of") && msg.contains("smaller than requested") {
+    if crate::metrics::is_arena_oom_message(msg) {
         ("arena_oom", 0)
     } else {
         ("other", 0)
@@ -1474,6 +1474,19 @@ mod forensic_tests {
         let (reason, bin_num) = classify_ort_error(msg);
         assert_eq!(reason, "arena_oom");
         assert_eq!(bin_num, 0);
+    }
+
+    /// The other ORT arena-exhaustion messages (`bfc_arena.cc`, v1.24.3) share
+    /// the metrics classifier, so the in-process path no longer misses them.
+    #[test]
+    fn classify_other_ort_arena_messages() {
+        for msg in [
+            "Failed to allocate memory for requested buffer of size 1258291200",
+            "Failed to find a free memory block despite calling Extend. rounded_bytes=1258291200",
+            "Available memory of 1073741824 is smaller than requested bytes of 1258291200",
+        ] {
+            assert_eq!(classify_ort_error(msg), ("arena_oom", 0), "{msg}");
+        }
     }
 
     #[test]
