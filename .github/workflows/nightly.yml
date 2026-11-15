@@ -27,7 +27,12 @@ on:
     # lane exists to measure and ratchet the standing debt, which does not
     # move fast enough to be worth 20 machine-hours a night.
     - cron: "0 4 * * 0" # Sundays 04:00 UTC
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      full_mutants:
+        description: "Also run the ~20 machine-hour mutation sweep (default: cheap lanes only)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -47,11 +52,29 @@ env:
   OSV_SCANNER_VERSION: 2.4.0
 
 jobs:
+  # GitHub disables the schedule of a workflow in a public repository after 60
+  # days without repository activity, silently: no failed run, no notification.
+  # This repo went 97 days without a commit and the schedule stopped at day 61.
+  # Re-enabling an already-enabled workflow resets that timer, so every run
+  # pushes the cutoff out again for as long as the schedule keeps firing.
+  keepalive:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Re-enable this workflow to reset the inactivity timer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh workflow enable nightly.yml
+
   full-mutants:
-    # Weekly cron only (plus manual dispatch). `github.event.schedule` carries
-    # the cron expression that fired, which is the only way to bind a job to
-    # one of several schedules.
-    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 4 * * 0'
+    # Weekly cron, or a manual dispatch that explicitly asks for it: a plain
+    # dispatch must stay cheap, since the sweep costs ~20 machine-hours.
+    # `github.event.schedule` carries the cron expression that fired, which is
+    # the only way to bind a job to one of several schedules.
+    if: (github.event_name == 'workflow_dispatch' && inputs.full_mutants) || github.event.schedule == '0 4 * * 0'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 300
     strategy:
