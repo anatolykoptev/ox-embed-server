@@ -48,6 +48,10 @@ Batcher:
 - `BATCH_MAX=32`, `BATCH_MAX_TOKENS=16384`, `BATCH_MAX_SEQ=256`, `BATCH_WAIT_MS=30`, `MAX_QUEUE_SIZE=256`.
 - `BATCH_LENGTH_RATIO_THRESHOLD` — (default `0.0` = disabled) when > 0.0, items whose `max_seq_len` exceeds `accum.max_len * threshold` are carried to the next batch to reduce padding waste on padded models.
 
+Padding / sub-batching (worker path):
+- Embedders pad each forward pass to the longest sequence rounded up to a multiple of 4 tokens (`pool::SEQ_PAD_MULTIPLE`), not to a power of two. `EMBED_SUBBATCH_RATIO[_<MODEL>]` (default `2.0`, `<= 1.0` disables) splits a request into length-homogeneous passes.
+- `RERANKER_SUBBATCH_RATIO` (default `2.0`, `<= 1.0` disables) does the same for `/v1/rerank`: pairs whose lengths differ by more than the ratio run in separate forward passes. Scores are returned in input order. Observable as `embed_subbatch_groups{model}`.
+
 ## CI
 
 Two lanes, both on GitHub-hosted `ubuntu-24.04-arm` (public repo → free + unlimited, and arm64 is what production runs).

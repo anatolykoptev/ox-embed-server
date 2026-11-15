@@ -907,7 +907,7 @@ pub fn record_token_cache_miss(model: &str, n: u64) {
 /// Record token-budget per dispatched batch: `batch_size × effective_seq_len`.
 ///
 /// For padded models (all BERT-family dense embedders) effective_seq_len is
-/// the power-of-two-rounded `max(seq_len_in_batch)` that ends up in the actual
+/// the multiple-of-4-rounded `max(seq_len_in_batch)` that ends up in the actual
 /// tensor.  This is the direct predictor of per-inference scratch memory.
 ///
 /// Buckets: 1k, 4k, 16k, 64k, 128k, 256k, 1M, 4M.  The 1.258 GiB tensor

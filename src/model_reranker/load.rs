@@ -165,6 +165,14 @@ impl RerankerModel {
             "loaded reranker model"
         );
 
+        // `RERANKER_SUBBATCH_RATIO` (default 2.0, `<= 1.0` disables): the
+        // widest pair in one forward pass may be at most this many times the
+        // shortest.
+        let subbatch_ratio = crate::model::parse_subbatch_ratio(
+            std::env::var("RERANKER_SUBBATCH_RATIO").ok().as_deref(),
+        );
+        tracing::info!(model = %name, subbatch_ratio, "reranker sub-batch ratio");
+
         Ok(Self {
             name: name.to_string(),
             sessions,
@@ -175,6 +183,7 @@ impl RerankerModel {
             pad_id,
             static_session_pools,
             static_session_cursors,
+            subbatch_ratio,
         })
     }
 }
