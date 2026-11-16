@@ -1,97 +1,118 @@
-//! Exercises worker binary against multilingual-e5-large.
+//! Drives the real `embed-worker` binary over its Unix socket against the tiny
+//! embed fixture (`tests/fixtures/tiny/embed`).
 //!
-//! Requires model files reachable via Config::from_env() — set EMBED_MODELS,
-//! EMBED_DEFAULT_MODEL, ORT_DYLIB_PATH before running.
+//! Beyond shape, this pins the properties the worker's batching path must keep:
+//! a text's vector must not depend on its batch-mates (padding is masked out of
+//! the mean pool) and must come back at the caller's position even when the
+//! planner splits the request into length-homogeneous sub-batches.
 //!
-//! Skip gracefully if env not set (CI-safe).
-//!
-//! Wave 2.4b: migrated from InferRequest/InferResponse to
-//! WorkerRequest::Embed + WorkerResponse::Embed.
-
+//! Runs on CI; a missing fixture or ONNX Runtime fails there (see `common`).
 #[path = "common/mod.rs"]
 mod common;
 use common::ChildGuard;
-
 use embed_server::ipc::frame::{read_frame, write_frame};
 use embed_server::ipc::protocol::{EmbedRequest, WorkerRequest, WorkerResponse};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use tokio::net::UnixStream;
 
+async fn embed(conn: &mut UnixStream, request_id: u64, texts: Vec<String>) -> Vec<Vec<f32>> {
+    let n = texts.len();
+    let req = WorkerRequest::Embed(EmbedRequest {
+        request_id,
+        model: common::EMBED_NAME.into(),
+        texts,
+        max_seq_len: common::MAX_LEN as u32,
+    });
+    write_frame(conn, &req).await.expect("send WorkerRequest");
+    let resp: WorkerResponse = read_frame(conn).await.expect("recv WorkerResponse");
+    match resp {
+        WorkerResponse::Embed(ok) => {
+            assert_eq!(ok.request_id, request_id, "request_id round-trip");
+            assert_eq!(ok.vectors.len(), n, "one vector per text");
+            assert_eq!(ok.dims as usize, common::EMBED_DIM, "dims from the fixture");
+            ok.vectors
+        }
+        WorkerResponse::Err { message, .. } => panic!("inference failed: {message}"),
+        other => panic!("unexpected response variant: {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn worker_infers_e5_batch() {
-    let Some(models_env) = std::env::var("EMBED_MODELS").ok() else {
-        eprintln!("SKIP: EMBED_MODELS not set");
+    let Some(env) = common::setup() else {
         return;
     };
-    let ort_path = std::env::var("ORT_DYLIB_PATH").unwrap_or_default();
-    if ort_path.is_empty() || !std::path::Path::new(&ort_path).exists() {
-        eprintln!("SKIP: ORT_DYLIB_PATH not set or file missing (got: {ort_path:?})");
-        return;
-    }
-
     let socket: PathBuf =
         std::env::temp_dir().join(format!("embed-worker-e5-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
-
-    let worker_bin = env!("CARGO_BIN_EXE_embed-worker");
-    let child = Command::new(worker_bin)
-        .env("EMBED_WORKER_MODEL", "multilingual-e5-large")
+    let child = Command::new(env!("CARGO_BIN_EXE_embed-worker"))
+        .env("EMBED_WORKER_MODEL", common::EMBED_NAME)
         .env("EMBED_WORKER_KIND", "embed")
         .env("EMBED_WORKER_SOCKET", &socket)
         .env("EMBED_WORKER_POOL_SIZE", "1")
-        .env("EMBED_MODELS", &models_env)
-        .env("ORT_DYLIB_PATH", &ort_path)
-        .env("EMBED_DEFAULT_MODEL", "multilingual-e5-large")
+        .env("EMBED_MODELS", env.embed_spec())
+        .env("ORT_DYLIB_PATH", &env.ort)
+        .env("EMBED_DEFAULT_MODEL", common::EMBED_NAME)
+        .env(common::MEMORY_PATTERN_ENV.0, common::MEMORY_PATTERN_ENV.1)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
+        .process_group(0)
         .spawn()
         .expect("spawn worker binary");
-
     let _guard = ChildGuard {
         child: Some(child),
         socket: socket.clone(),
     };
-
-    // Wait up to 30 s for the worker to create the socket (model load ~5-10 s).
-    for _ in 0..300 {
+    for _ in 0..600 {
         if socket.exists() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(socket.exists(), "worker socket missing after 30 s");
-
+    assert!(socket.exists(), "worker socket missing after 60 s");
     let mut conn = UnixStream::connect(&socket)
         .await
         .expect("connect to worker UDS");
-    let req = WorkerRequest::Embed(EmbedRequest {
-        request_id: 1,
-        model: "multilingual-e5-large".into(),
-        texts: vec!["query: hello".into(), "query: world".into()],
-        max_seq_len: 128,
-    });
-    write_frame(&mut conn, &req)
-        .await
-        .expect("send WorkerRequest");
 
-    let resp: WorkerResponse = read_frame(&mut conn).await.expect("recv WorkerResponse");
-    match resp {
-        WorkerResponse::Embed(ok) => {
-            assert_eq!(ok.request_id, 1, "request_id round-trip");
-            assert_eq!(ok.vectors.len(), 2, "two texts → two vectors");
-            assert_eq!(ok.dims, 1024, "multilingual-e5-large is 1024-d");
-            assert_eq!(ok.vectors[0].len(), 1024, "vector length matches dims");
-            // Sanity: L2-normalised vectors should have norm ≈ 1.0.
-            let norm: f32 = ok.vectors[0].iter().map(|x| x * x).sum::<f32>().sqrt();
+    let texts = common::probe_texts();
+
+    // Reference: each text alone.
+    let mut solo: Vec<Vec<f32>> = Vec::new();
+    for (i, t) in texts.iter().enumerate() {
+        solo.push(
+            embed(&mut conn, 100 + i as u64, vec![t.clone()])
+                .await
+                .remove(0),
+        );
+    }
+    assert_ne!(
+        common::max_abs_diff(&solo[0], &solo[4]),
+        0.0,
+        "fixture must give distinct texts distinct vectors"
+    );
+    for v in &solo {
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            (norm - 1.0).abs() < 0.01,
+            "vector should be L2-normalised, got norm={norm}"
+        );
+    }
+
+    // Every text, in every probe batch, must equal its solo vector and sit at
+    // the caller's position.
+    for (n, batch) in common::PROBE_BATCHES.iter().enumerate() {
+        let req: Vec<String> = batch.iter().map(|&i| texts[i].clone()).collect();
+        let got = embed(&mut conn, n as u64, req).await;
+        for (pos, &i) in batch.iter().enumerate() {
+            let d = common::max_abs_diff(&got[pos], &solo[i]);
             assert!(
-                (norm - 1.0).abs() < 0.01,
-                "vector should be L2-normalised, got norm={norm}"
+                d < 1e-4,
+                "batch {batch:?}, position {pos} (text {i}): vector depends on its \
+                 batch-mates or is out of order (max abs diff {d})"
             );
         }
-        WorkerResponse::Err { message, .. } => panic!("inference failed: {message}"),
-        other => panic!("unexpected response variant: {other:?}"),
     }
-    // `_guard` drops here — ChildGuard::drop calls kill() + wait() + socket cleanup.
 }

@@ -1,0 +1,8 @@
+# Pinned toolchain for scripts/gen_test_fixtures.py (CPU torch, Python 3.12).
+# Install with: pip install --extra-index-url https://download.pytorch.org/whl/cpu -r <this file>
+torch==2.15.0
+transformers==5.23.0
+onnx==1.23.2
+onnxscript==0.7.2
+tokenizers==0.23.3
+numpy==2.5.5

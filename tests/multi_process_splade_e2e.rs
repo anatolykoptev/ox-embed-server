@@ -1,141 +1,125 @@
-//! End-to-end test: spin up embed-server in multi-process mode on a random
-//! port with a SPLADE model, POST /embed_sparse, verify response shape.
+//! End-to-end: `embed-server` in multi-process mode, `POST /embed_sparse`
+//! served by a real SPLADE worker loading the tiny masked-LM fixture.
 //!
-//! Skips gracefully when SPLADE_MODELS or ORT_DYLIB_PATH are unset so the
-//! standard `cargo nextest run --lib` suite stays green without model files.
+//! Weights are random, so the test checks the response contract and that a
+//! text's sparse vector does not depend on its batch-mates.
 //!
-//! Run with real model:
-//!   SPLADE_MODELS="splade-v3:/models-splade:128" \
-//!   ORT_DYLIB_PATH=/usr/lib/libonnxruntime.so \
-//!   cargo nextest run --locked --test multi_process_splade_e2e
-
+//! Runs on CI; a missing fixture or ONNX Runtime fails there (see `common`).
 #[path = "common/mod.rs"]
 mod common;
-use common::ChildGuard;
-
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
-#[test]
-fn multi_process_splade_e2e() {
-    let Some(splade_env) = std::env::var("SPLADE_MODELS").ok() else {
-        eprintln!("SKIP: SPLADE_MODELS not set");
-        return;
-    };
-    let ort_path = std::env::var("ORT_DYLIB_PATH").unwrap_or_default();
-    if ort_path.is_empty() || !std::path::Path::new(&ort_path).exists() {
-        eprintln!("SKIP: ORT_DYLIB_PATH not set or missing");
-        return;
+type Sparse = BTreeMap<u64, f64>;
+
+fn embed_sparse(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    input: &[&str],
+    top_k: Option<usize>,
+) -> Vec<Sparse> {
+    let mut body = serde_json::json!({ "model": common::SPLADE_NAME, "input": input });
+    if let Some(k) = top_k {
+        body["top_k"] = k.into();
     }
-
-    let port: u16 = 28102 + (std::process::id() % 10) as u16;
-    let socket_dir: PathBuf =
-        std::env::temp_dir().join(format!("embed-splade-e2e-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&socket_dir);
-    std::fs::create_dir_all(&socket_dir).expect("create socket dir");
-
-    let worker_bin = env!("CARGO_BIN_EXE_embed-worker");
-    let server_bin = env!("CARGO_BIN_EXE_embed-server");
-
-    let server = Command::new(server_bin)
-        .env("EMBED_MULTI_PROCESS", "1")
-        .env("EMBED_WORKER_BIN", worker_bin)
-        .env("EMBED_WORKER_SOCKET_DIR", &socket_dir)
-        .env("EMBED_PORT", port.to_string())
-        .env("SPLADE_MODELS", &splade_env)
-        .env("ORT_DYLIB_PATH", &ort_path)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn embed-server");
-
-    let server_socket = socket_dir.join("server.marker");
-    let _guard = ChildGuard {
-        child: Some(server),
-        socket: server_socket.clone(),
-    };
-
-    // Wait for server to become healthy (up to 60s for cold model load).
-    let url = format!("http://127.0.0.1:{port}");
-    let health_url = format!("{url}/health");
-    let mut healthy = false;
-    for _ in 0..120 {
-        std::thread::sleep(Duration::from_millis(500));
-        if let Ok(resp) = reqwest::blocking::get(&health_url)
-            && resp.status().is_success()
-        {
-            healthy = true;
-            break;
-        }
-    }
-    if !healthy {
-        eprintln!("SKIP: server did not become healthy within 60s");
-        return;
-    }
-
-    // Parse SPLADE model name from SPLADE_MODELS (format: name:dir:max_len)
-    let splade_name = splade_env
-        .split(',')
-        .next()
-        .and_then(|s| s.split(':').next())
-        .unwrap_or("splade-v3")
-        .to_string();
-
-    let body = serde_json::json!({
-        "model": splade_name,
-        "input": [
-            "ONNX is an open format for machine learning models",
-            "Paris is the capital of France"
-        ]
-    });
-
-    let client = reqwest::blocking::Client::new();
     let resp = client
-        .post(format!("{url}/embed_sparse"))
+        .post(format!("{base}/embed_sparse"))
         .json(&body)
         .send()
         .expect("POST /embed_sparse");
-
     assert!(
         resp.status().is_success(),
         "expected 200 from /embed_sparse, got {}",
         resp.status()
     );
-
     let json: serde_json::Value = resp.json().expect("parse response json");
     let data = json["data"].as_array().expect("data array");
+    assert_eq!(data.len(), input.len(), "one sparse vector per text");
+    data.iter()
+        .enumerate()
+        .map(|(i, item)| {
+            assert_eq!(item["index"].as_u64().expect("index field"), i as u64);
+            let indices = item["indices"].as_array().expect("indices array");
+            let values = item["values"].as_array().expect("values array");
+            assert_eq!(
+                indices.len(),
+                values.len(),
+                "indices and values must be aligned"
+            );
+            assert!(!indices.is_empty(), "sparse vector must have a term");
+            indices
+                .iter()
+                .zip(values)
+                .map(|(k, v)| {
+                    let w = v.as_f64().expect("weight value");
+                    assert!(w > 0.0, "weight must be positive, got {w}");
+                    (k.as_u64().expect("token id"), w)
+                })
+                .collect()
+        })
+        .collect()
+}
 
-    // 2 texts in → 2 sparse vectors out.
-    assert_eq!(data.len(), 2, "expected 2 sparse vectors for 2 texts");
-
-    for item in data {
-        let indices = item["indices"].as_array().expect("indices array");
-        let values = item["values"].as_array().expect("values array");
-
-        // indices and values must be aligned.
-        assert_eq!(
-            indices.len(),
-            values.len(),
-            "indices and values must have equal length"
-        );
-
-        // SPLADE should produce at least one non-zero term per non-trivial input.
-        assert!(
-            !indices.is_empty(),
-            "sparse vector must have at least one term"
-        );
-
-        // All weights should be positive (log(1 + ReLU(logit)) ≥ 0, filtered > min_weight).
-        for v in values {
-            let w = v.as_f64().expect("weight value");
-            assert!(w > 0.0, "weight must be positive, got {w}");
-        }
-
-        // index field should be 0-based.
-        let idx = item["index"].as_u64().expect("index field");
-        assert!(idx < 2, "index {idx} out of range");
+fn assert_same(what: &str, a: &Sparse, b: &Sparse) {
+    assert_eq!(
+        a.keys().collect::<Vec<_>>(),
+        b.keys().collect::<Vec<_>>(),
+        "{what}: different term sets"
+    );
+    for (k, wa) in a {
+        let d = (wa - b[k]).abs();
+        assert!(d < 1e-4, "{what}: weight of term {k} differs by {d}");
     }
+}
 
-    let _ = std::fs::remove_dir_all(&socket_dir);
+#[test]
+fn multi_process_splade_e2e() {
+    let Some(env) = common::setup() else {
+        return;
+    };
+    let server = common::spawn_server(
+        &env,
+        "splade-e2e",
+        env!("CARGO_BIN_EXE_embed-server"),
+        env!("CARGO_BIN_EXE_embed-worker"),
+    );
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("build reqwest client");
+
+    let a = "onnx is an open format for machine learning models";
+    let b = "paris is the capital of france";
+    let both = embed_sparse(&client, &server.base, &[a, b], None);
+    let only_a = embed_sparse(&client, &server.base, &[a], None);
+    let only_b = embed_sparse(&client, &server.base, &[b], None);
+    assert_same("text a alone vs batched", &only_a[0], &both[0]);
+    assert_same("text b alone vs batched", &only_b[0], &both[1]);
+
+    // The tokenizer must feed the model the actual text: two different texts
+    // cannot produce the same sparse vector.
+    assert_ne!(
+        only_a[0], only_b[0],
+        "different texts must give different sparse vectors"
+    );
+
+    // top_k keeps the heaviest terms: a prefix of the full vector by weight.
+    let k = 3;
+    let top = embed_sparse(&client, &server.base, &[a], Some(k));
+    assert_eq!(
+        top[0].len(),
+        k.min(only_a[0].len()),
+        "top_k must cap the terms"
+    );
+    let mut full: Vec<(&u64, &f64)> = only_a[0].iter().collect();
+    full.sort_by(|x, y| y.1.total_cmp(x.1));
+    for (id, w) in full.iter().take(k) {
+        let got = top[0]
+            .get(*id)
+            .unwrap_or_else(|| panic!("top_k dropped heavy term {id} (weight {w})"));
+        assert!(
+            (got - **w).abs() < 1e-4,
+            "top_k changed weight of term {id}"
+        );
+    }
 }

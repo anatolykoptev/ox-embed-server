@@ -734,60 +734,57 @@ mod tests {
     }
 
     // ── factory called outside lock (MAJOR 3 rewrite) ───────────────────────
-    /// M4 proof: with pool_size=1, a slow factory (100ms) must NOT block a
-    /// concurrent acquire on the mutex. Thread 2 should return AllBusy quickly
-    /// (within 10ms) rather than blocking for the full 100ms factory duration.
+    /// M4 proof: with pool_size=1, a slow factory must NOT block a concurrent
+    /// acquire on the mutex. Deterministic: the factory parks on a channel until
+    /// the test releases it, so t2 acquires while the factory is provably
+    /// in flight. If the factory ran inside the mutex, t2 would never return
+    /// and the bounded wait below fails the test (no wall-clock threshold).
     #[test]
     fn factory_called_outside_lock() {
-        use std::time::{Duration, Instant};
-
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
         // pool_size=1: only one slot, so both threads compete for the same slot.
         let pool = Arc::new(EvictablePool::from_items(
             vec![0u32],
             1,
             "slow-factory-m4",
-            Arc::new(|| {
-                // Simulate slow ONNX cold start — 100ms.
-                std::thread::sleep(Duration::from_millis(100));
+            Arc::new(move || {
+                let _ = entered_tx.send(());
+                // Parked until released (or until the test drops the sender).
+                let _ = release_rx.lock().unwrap().recv();
                 Ok(77u32)
             }),
         ));
-
         // Evict the single slot so t1 will trigger a reinit (and call factory).
         pool.force_last_used_ago(10);
         pool.evict_idle(1);
         assert!(pool.slot_is_evicted(0), "slot must be evicted before test");
-
         let p1 = pool.clone();
         let p2 = pool.clone();
-
-        // t1 starts first and enters the slow factory path.
         let t1 = std::thread::spawn(move || p1.acquire());
-
-        // Give t1 time to enter the reinit branch and start the factory call,
-        // but NOT enough time to finish it (factory takes 100ms).
-        std::thread::sleep(Duration::from_millis(10));
-
-        // t2 should return AllBusy quickly WITHOUT blocking on the mutex.
-        let t2_start = Instant::now();
-        let t2 = std::thread::spawn(move || p2.acquire());
-        let r2 = t2.join().expect("t2 must not panic");
-        let t2_elapsed = t2_start.elapsed();
-
-        let _r1 = t1.join().expect("t1 must not panic");
-
-        // If factory was called inside the mutex, t2 would block ~90ms.
-        // With factory outside the mutex, t2 returns AllBusy within ~5ms.
-        assert!(
-            t2_elapsed < Duration::from_millis(20),
-            "t2 blocked {t2_elapsed:?} — factory must be called OUTSIDE the mutex (M4)"
+        // Wait until t1 is inside the factory: from here the slot is claimed.
+        entered_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("t1 must reach the factory");
+        let (r2_tx, r2_rx) = mpsc::channel();
+        let t2 = std::thread::spawn(move || {
+            let _ = r2_tx.send(p2.acquire());
+        });
+        // t2 must return while the factory is still parked.
+        let r2 = r2_rx.recv_timeout(Duration::from_secs(30)).expect(
+            "t2 blocked while the factory was in flight: factory must be called OUTSIDE the mutex (M4)",
         );
         assert!(
             matches!(r2, Err(AcquireError::AllBusy)),
             "t2 must get AllBusy (slot is being reinitialised)"
         );
+        release_tx.send(()).expect("release the factory");
+        t2.join().expect("t2 must not panic");
+        let _r1 = t1.join().expect("t1 must not panic");
     }
-
     // ── BLOCKER 1: dual-reinit race in acquire reinit path ───────────────────
     /// Two threads racing on an evicted slot must call factory exactly once.
     /// The winner gets the guard; the loser gets AllBusy.

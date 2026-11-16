@@ -1,139 +1,113 @@
-//! End-to-end test: spin up embed-server in multi-process mode on a random
-//! port with a reranker, POST /v1/rerank, verify response shape.
+//! End-to-end: `embed-server` in multi-process mode, `POST /v1/rerank` served by
+//! a real reranker worker loading the tiny cross-encoder fixture.
 //!
-//! Skips gracefully when RERANKER_MODELS or ORT_DYLIB_PATH are unset so the
-//! standard `cargo nextest run --lib` suite stays green without model files.
+//! The fixture's weights are random, so the test checks the response contract
+//! and that a document's score does not depend on its batch-mates, not which
+//! document ranks first.
 //!
-//! Run with real model:
-//!   RERANKER_MODELS="gte-multi-rerank:/models-gte-rerank:256:true" \
-//!   ORT_DYLIB_PATH=/usr/lib/libonnxruntime.so \
-//!   cargo nextest run --locked --test multi_process_rerank_e2e
-
+//! Runs on CI; a missing fixture or ONNX Runtime fails there (see `common`).
 #[path = "common/mod.rs"]
 mod common;
-use common::ChildGuard;
-
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::time::Duration;
 
-#[test]
-fn multi_process_rerank_e2e() {
-    let Some(reranker_env) = std::env::var("RERANKER_MODELS").ok() else {
-        eprintln!("SKIP: RERANKER_MODELS not set");
-        return;
-    };
-    let ort_path = std::env::var("ORT_DYLIB_PATH").unwrap_or_default();
-    if ort_path.is_empty() || !std::path::Path::new(&ort_path).exists() {
-        eprintln!("SKIP: ORT_DYLIB_PATH not set or missing");
-        return;
-    }
-
-    let port: u16 = 28092 + (std::process::id() % 10) as u16;
-    let socket_dir: PathBuf =
-        std::env::temp_dir().join(format!("embed-rerank-e2e-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&socket_dir);
-    std::fs::create_dir_all(&socket_dir).expect("create socket dir");
-
-    let worker_bin = env!("CARGO_BIN_EXE_embed-worker");
-    let server_bin = env!("CARGO_BIN_EXE_embed-server");
-
-    // Need a dummy EMBED_MODELS for the server to boot (even if empty reranker list)
-    // Use a value that won't load (no path) — server may fail embed model load but
-    // reranker path still exercises the worker dispatch. Use EMBED_MODELS unset and
-    // rely on the server's config parser allowing empty embed models.
-    let server = Command::new(server_bin)
-        .env("EMBED_MULTI_PROCESS", "1")
-        .env("EMBED_WORKER_BIN", worker_bin)
-        .env("EMBED_WORKER_SOCKET_DIR", &socket_dir)
-        .env("EMBED_PORT", port.to_string())
-        .env("RERANKER_MODELS", &reranker_env)
-        .env("ORT_DYLIB_PATH", &ort_path)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn embed-server");
-
-    let server_socket = socket_dir.join("server.marker");
-    let _guard = ChildGuard {
-        child: Some(server),
-        socket: server_socket.clone(),
-    };
-
-    // Wait for server to become healthy (up to 60s for cold model load).
-    let url = format!("http://127.0.0.1:{port}");
-    let health_url = format!("{url}/health");
-    let mut healthy = false;
-    for _ in 0..120 {
-        std::thread::sleep(Duration::from_millis(500));
-        if let Ok(resp) = reqwest::blocking::get(&health_url)
-            && resp.status().is_success()
-        {
-            healthy = true;
-            break;
-        }
-    }
-    if !healthy {
-        eprintln!("SKIP: server did not become healthy within 60s");
-        return;
-    }
-
-    // Parse reranker name from RERANKER_MODELS (format: name:dir:max_len:padded)
-    let reranker_name = reranker_env
-        .split(',')
-        .next()
-        .and_then(|s| s.split(':').next())
-        .unwrap_or("gte-multi-rerank")
-        .to_string();
-
-    let body = serde_json::json!({
-        "model": reranker_name,
-        "query": "what is ONNX?",
-        "documents": [
-            "ONNX is an open format for machine learning models",
-            "Paris is the capital of France",
-            "ONNX Runtime accelerates inference"
-        ]
+fn rerank(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    query: &str,
+    docs: &[String],
+    top_n: Option<usize>,
+) -> Vec<(usize, f64)> {
+    let mut body = serde_json::json!({
+        "model": common::RERANK_NAME,
+        "query": query,
+        "documents": docs,
     });
-
-    let client = reqwest::blocking::Client::new();
+    if let Some(n) = top_n {
+        body["top_n"] = n.into();
+    }
     let resp = client
-        .post(format!("{url}/v1/rerank"))
+        .post(format!("{base}/v1/rerank"))
         .json(&body)
         .send()
         .expect("POST /v1/rerank");
-
     assert!(
         resp.status().is_success(),
         "expected 200 from /v1/rerank, got {}",
         resp.status()
     );
-
     let json: serde_json::Value = resp.json().expect("parse response json");
-    let results = json["results"].as_array().expect("results array");
+    json["results"]
+        .as_array()
+        .expect("results array")
+        .iter()
+        .map(|r| {
+            (
+                r["index"].as_u64().expect("index field") as usize,
+                r["relevance_score"].as_f64().expect("relevance_score"),
+            )
+        })
+        .collect()
+}
 
-    // 3 documents in → 3 results out.
+#[test]
+fn multi_process_rerank_e2e() {
+    let Some(env) = common::setup() else {
+        return;
+    };
+    let server = common::spawn_server(
+        &env,
+        "rerank-e2e",
+        env!("CARGO_BIN_EXE_embed-server"),
+        env!("CARGO_BIN_EXE_embed-worker"),
+    );
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("build reqwest client");
+
+    let query = "what is onnx";
+    let docs = vec![
+        "onnx is an open format for machine learning models".to_string(),
+        "paris is the capital of france".to_string(),
+        common::probe_texts()[4].clone(),
+    ];
+    let results = rerank(&client, &server.base, query, &docs, None);
+
     assert_eq!(results.len(), 3, "expected 3 results for 3 documents");
+    let mut seen: Vec<usize> = results.iter().map(|r| r.0).collect();
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        vec![0, 1, 2],
+        "results must cover every document once"
+    );
+    for (_, score) in &results {
+        assert!(score.is_finite(), "relevance_score must be finite: {score}");
+    }
+    for w in results.windows(2) {
+        assert!(w[0].1 >= w[1].1, "scores not descending: {results:?}");
+    }
 
-    // Each result must have index (0-2) and relevance_score (float).
-    for r in results {
-        let idx = r["index"].as_u64().expect("index field");
-        assert!(idx < 3, "index {idx} out of range");
-        let score = r["relevance_score"]
-            .as_f64()
-            .expect("relevance_score field");
+    // Each document scored alone must match its score inside the 3-document
+    // call: the pad width differs (the long document sets it in the batch).
+    for (idx, batched) in &results {
+        let alone = rerank(
+            &client,
+            &server.base,
+            query,
+            std::slice::from_ref(&docs[*idx]),
+            None,
+        );
+        assert_eq!(alone.len(), 1);
+        let d = (alone[0].1 - batched).abs();
         assert!(
-            score.is_finite(),
-            "relevance_score must be finite, got {score}"
+            d < 1e-4,
+            "doc {idx}: score depends on its batch-mates ({} alone vs {batched} batched)",
+            alone[0].1
         );
     }
 
-    // First result (highest score) should be one of the ONNX docs (index 0 or 2).
-    let top_index = results[0]["index"].as_u64().expect("top index");
-    assert!(
-        top_index == 0 || top_index == 2,
-        "expected ONNX doc to rank top, got index {top_index}"
-    );
-
-    let _ = std::fs::remove_dir_all(&socket_dir);
+    let top = rerank(&client, &server.base, query, &docs, Some(2));
+    assert_eq!(top.len(), 2, "top_n=2 must cap the results");
+    assert_eq!(top, results[..2], "top_n must keep the best-scored prefix");
 }

@@ -1,0 +1,215 @@
+{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [],
+  "normalizer": {
+    "type": "BertNormalizer",
+    "clean_text": true,
+    "handle_chinese_chars": true,
+    "strip_accents": null,
+    "lowercase": true
+  },
+  "pre_tokenizer": {
+    "type": "BertPreTokenizer"
+  },
+  "post_processor": {
+    "type": "TemplateProcessing",
+    "single": [
+      {
+        "SpecialToken": {
+          "id": "[CLS]",
+          "type_id": 0
+        }
+      },
+      {
+        "Sequence": {
+          "id": "A",
+          "type_id": 0
+        }
+      },
+      {
+        "SpecialToken": {
+          "id": "[SEP]",
+          "type_id": 0
+        }
+      }
+    ],
+    "pair": [
+      {
+        "SpecialToken": {
+          "id": "[CLS]",
+          "type_id": 0
+        }
+      },
+      {
+        "Sequence": {
+          "id": "A",
+          "type_id": 0
+        }
+      },
+      {
+        "SpecialToken": {
+          "id": "[SEP]",
+          "type_id": 0
+        }
+      },
+      {
+        "Sequence": {
+          "id": "B",
+          "type_id": 1
+        }
+      },
+      {
+        "SpecialToken": {
+          "id": "[SEP]",
+          "type_id": 1
+        }
+      }
+    ],
+    "special_tokens": {
+      "[CLS]": {
+        "id": "[CLS]",
+        "ids": [
+          2
+        ],
+        "tokens": [
+          "[CLS]"
+        ]
+      },
+      "[SEP]": {
+        "id": "[SEP]",
+        "ids": [
+          3
+        ],
+        "tokens": [
+          "[SEP]"
+        ]
+      }
+    }
+  },
+  "decoder": null,
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 100,
+    "vocab": {
+      "[PAD]": 0,
+      "[UNK]": 1,
+      "[CLS]": 2,
+      "[SEP]": 3,
+      "[MASK]": 4,
+      "a": 5,
+      "accelerates": 6,
+      "an": 7,
+      "and": 8,
+      "are": 9,
+      "as": 10,
+      "at": 11,
+      "be": 12,
+      "by": 13,
+      "capital": 14,
+      "for": 15,
+      "format": 16,
+      "france": 17,
+      "from": 18,
+      "has": 19,
+      "hello": 20,
+      "in": 21,
+      "inference": 22,
+      "is": 23,
+      "it": 24,
+      "learning": 25,
+      "machine": 26,
+      "models": 27,
+      "of": 28,
+      "on": 29,
+      "onnx": 30,
+      "open": 31,
+      "paris": 32,
+      "passage": 33,
+      "query": 34,
+      "rerank": 35,
+      "runtime": 36,
+      "sentence": 37,
+      "sparse": 38,
+      "text": 39,
+      "the": 40,
+      "to": 41,
+      "what": 42,
+      "world": 43,
+      "b": 44,
+      "c": 45,
+      "d": 46,
+      "e": 47,
+      "f": 48,
+      "g": 49,
+      "h": 50,
+      "i": 51,
+      "j": 52,
+      "k": 53,
+      "l": 54,
+      "m": 55,
+      "n": 56,
+      "o": 57,
+      "p": 58,
+      "q": 59,
+      "r": 60,
+      "s": 61,
+      "t": 62,
+      "u": 63,
+      "v": 64,
+      "w": 65,
+      "x": 66,
+      "y": 67,
+      "z": 68,
+      "0": 69,
+      "1": 70,
+      "2": 71,
+      "3": 72,
+      "4": 73,
+      "5": 74,
+      "6": 75,
+      "7": 76,
+      "8": 77,
+      "9": 78,
+      "##a": 79,
+      "##b": 80,
+      "##c": 81,
+      "##d": 82,
+      "##e": 83,
+      "##f": 84,
+      "##g": 85,
+      "##h": 86,
+      "##i": 87,
+      "##j": 88,
+      "##k": 89,
+      "##l": 90,
+      "##m": 91,
+      "##n": 92,
+      "##o": 93,
+      "##p": 94,
+      "##q": 95,
+      "##r": 96,
+      "##s": 97,
+      "##t": 98,
+      "##u": 99,
+      "##v": 100,
+      "##w": 101,
+      "##x": 102,
+      "##y": 103,
+      "##z": 104,
+      "##0": 105,
+      "##1": 106,
+      "##2": 107,
+      "##3": 108,
+      "##4": 109,
+      "##5": 110,
+      "##6": 111,
+      "##7": 112,
+      "##8": 113,
+      "##9": 114
+    }
+  }
+}
