@@ -21,10 +21,9 @@ fn encode_base64(vec: &[f32]) -> String {
 }
 
 /// Build the cache-model key that partitions entries by both model name and
-/// input_type. This future-proofs the cache against asymmetric models (e.g.
-/// Voyage) where "document" and "query" inputs produce different vectors for
-/// the same text. For current symmetric models this is a no-op distinction,
-/// but baking it in now prevents cache pollution on a model swap.
+/// input_type. For a model with `EMBED_INPUT_PREFIX_<MODEL>` set, "document"
+/// and "query" inputs produce different vectors for the same text; for the
+/// rest the split only costs cache capacity.
 fn cache_model_key(model_name: &str, input_type: InputType) -> String {
     match input_type {
         InputType::Document => model_name.to_string(),
@@ -127,8 +126,8 @@ pub async fn embeddings(
         }
     };
 
-    // Cache key includes input_type to prevent pollution between document/query
-    // vectors if an asymmetric model is deployed in the future.
+    // Cache key includes input_type so document and query vectors of an
+    // asymmetric (prefixed) model never share an entry.
     let cache_key = cache_model_key(&model_name, input_type);
 
     // Capture the original request size — this is what clients asked for
@@ -211,6 +210,11 @@ pub async fn embeddings(
     // key order we'll use to zip miss vectors back to original positions.
     let pending_texts: Vec<String> = pending.keys().cloned().collect();
     let n_pending = pending_texts.len();
+    // The model sees the prefixed text (when the model opts in); the cache and
+    // the scatter below stay keyed by the caller's raw text.
+    let infer_texts = entry
+        .input_prefix
+        .apply(input_type == InputType::Query, &pending_texts);
 
     // Run inference via worker pool (multi-process), batcher, or legacy spawn_blocking path.
     // Only the miss set flows through here.
@@ -224,25 +228,22 @@ pub async fn embeddings(
         // on the supervisor — the worker re-tokenizes authoritatively for inference,
         // so the supervisor-side pass was pure waste (~1.5-3ms for batch=32).
         // Off-by-one OK for billing — exact count requires tokenizer in supervisor.
-        let estimated_total_tokens: u32 = pending_texts
+        let estimated_total_tokens: u32 = infer_texts
             .iter()
             .map(|t| ((t.chars().count() as f32 / 4.0).ceil() as u32).max(1))
             .sum();
-        let estimated_max_seq_len: u32 = pending_texts
+        let estimated_max_seq_len: u32 = infer_texts
             .iter()
             .map(|t| ((t.chars().count() as f32 / 4.0).ceil() as u32).max(1))
             .max()
             .unwrap_or(1);
 
-        // Multi-process path: send raw texts to the worker; the worker handles
-        // tokenization + inference internally.
-        // `pending_texts` is cloned here because it is still needed below for
+        // Multi-process path: send the texts to the worker; the worker handles
+        // tokenization + inference internally. `pending_texts` stays here for
         // the scatter zip (`pending_texts.iter().zip(miss_vectors)`).
-        // The first clone that existed before this commit (into `spawn_blocking(tokenize)`)
-        // has been removed — this is the only remaining clone on the worker path.
         let infer_start = std::time::Instant::now();
         let resp = pool
-            .dispatch_embed(&model_name, pending_texts.clone(), estimated_max_seq_len)
+            .dispatch_embed(&model_name, infer_texts, estimated_max_seq_len)
             .await;
         let infer_elapsed = infer_start.elapsed();
         let vectors = match resp {
@@ -367,7 +368,7 @@ pub async fn embeddings(
                 "in-process EmbedModel session required but not loaded (EMBED_MULTI_PROCESS=1?)",
             )
             .clone();
-        let tokenize_input = pending_texts.clone();
+        let tokenize_input = infer_texts;
         let token_ids =
             match tokio::task::spawn_blocking(move || model.tokenize(&tokenize_input)).await {
                 Ok(Ok(ids)) => ids,
@@ -1145,6 +1146,7 @@ mod tests {
                 crate::types::ModelEntry {
                     model: None,
                     batcher: None,
+                    input_prefix: Default::default(),
                 },
             )]),
             rerankers: HashMap::new(),
@@ -1308,12 +1310,21 @@ mod tests {
         pool: WorkerPool,
         embed_semaphores: HashMap<String, Arc<tokio::sync::Semaphore>>,
     ) -> Arc<AppState> {
+        state_with_pool_prefix(model, pool, embed_semaphores, Default::default())
+    }
+    fn state_with_pool_prefix(
+        model: &str,
+        pool: WorkerPool,
+        embed_semaphores: HashMap<String, Arc<tokio::sync::Semaphore>>,
+        input_prefix: crate::input_prefix::InputPrefix,
+    ) -> Arc<AppState> {
         Arc::new(AppState {
             models: HashMap::from([(
                 model.to_string(),
                 crate::types::ModelEntry {
                     model: None,
                     batcher: None,
+                    input_prefix,
                 },
             )]),
             rerankers: HashMap::new(),
@@ -1635,5 +1646,120 @@ mod tests {
         assert!(resp.headers().get("retry-after").is_none());
         assert_eq!(failures(model, "ipc_protocol") - before, 1.0);
         assert_eq!(failures(model, "worker_died"), died);
+    }
+
+    // ---- input prefix: what the worker is actually asked to embed ----
+
+    /// A worker that records the texts of every Embed request it receives and
+    /// answers with one 2-d vector per text.
+    async fn spy_worker_pool(
+        model: &str,
+        dir: &std::path::Path,
+        seen: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    ) -> WorkerPool {
+        use crate::ipc::frame::{read_frame, write_frame};
+        use crate::ipc::protocol::WorkerRequest;
+        let sock = dir.join("spy.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let Ok(WorkerRequest::Embed(r)) =
+                        read_frame::<_, WorkerRequest>(&mut stream).await
+                    else {
+                        return;
+                    };
+                    seen.lock().unwrap().push(r.texts.clone());
+                    let resp = WorkerResponse::Embed(EmbedResponseOk {
+                        request_id: r.request_id,
+                        vectors: vec![vec![0.0, 1.0]; r.texts.len()],
+                        dims: 2,
+                    });
+                    let _ = write_frame(&mut stream, &resp).await;
+                });
+            }
+        });
+        let client = crate::ipc::client::WorkerClient::connect(sock, 1, Duration::from_secs(60))
+            .await
+            .unwrap();
+        let pool = WorkerPool::with_dispatch_timeout(Duration::from_millis(500));
+        pool.add(WorkerSupervisor::for_test(
+            spec_for(model),
+            Arc::new(client),
+        ))
+        .await;
+        pool
+    }
+
+    /// POST one embed request and return the texts the worker received.
+    async fn texts_seen_by_worker(
+        prefix: crate::input_prefix::InputPrefix,
+        body: serde_json::Value,
+    ) -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pool = spy_worker_pool("prefix-model", dir.path(), seen.clone()).await;
+        let resp = make_app(state_with_pool_prefix(
+            "prefix-model",
+            pool,
+            HashMap::new(),
+            prefix,
+        ))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/embeddings")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut calls = seen.lock().unwrap();
+        assert_eq!(calls.len(), 1, "one worker request expected");
+        calls.remove(0)
+    }
+
+    #[tokio::test]
+    async fn embed_without_prefix_sends_raw_text() {
+        use crate::input_prefix::InputPrefix;
+        let got = texts_seen_by_worker(
+            InputPrefix::Off,
+            serde_json::json!({"input": ["hello"], "model": "prefix-model", "input_type": "query"}),
+        )
+        .await;
+        assert_eq!(got, vec!["hello"], "prefix off must not touch the text");
+    }
+
+    #[tokio::test]
+    async fn embed_with_e5_prefix_follows_input_type() {
+        use crate::input_prefix::InputPrefix;
+        let query = texts_seen_by_worker(
+            InputPrefix::E5,
+            serde_json::json!({"input": ["hello"], "model": "prefix-model", "input_type": "query"}),
+        )
+        .await;
+        assert_eq!(
+            query,
+            vec!["query: hello"],
+            "input_type=query must get the query prefix"
+        );
+        // The worker sees the cache misses in hash-map order: compare sorted.
+        let mut doc = texts_seen_by_worker(
+            InputPrefix::E5,
+            serde_json::json!({"input": ["hello", "passage: kept"], "model": "prefix-model"}),
+        )
+        .await;
+        doc.sort();
+        assert_eq!(
+            doc,
+            vec!["passage: hello", "passage: kept"],
+            "default input_type is document; an already-prefixed text is not prefixed twice"
+        );
     }
 }

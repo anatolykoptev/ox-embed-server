@@ -156,6 +156,17 @@ pub struct EmbedModel {
     ///
     /// Default `2.0` is measured, not guessed — see `plan_subbatches`.
     subbatch_ratio: f32,
+    /// Run every text of a request in its own forward pass, so a text's vector
+    /// does not depend on the texts embedded beside it.
+    ///
+    /// The int8 graph derives each activation scale from the whole tensor, so
+    /// a text's vector moves slightly with its batch-mates (see
+    /// `docs/benchmarks/2026-11-16-embed-batch-drift.md`). A lone text is
+    /// unchanged by this switch; a text embedded inside a larger request now
+    /// gets the vector it would get alone. Off by default: it changes the
+    /// vectors of multi-text requests and costs throughput. Set via
+    /// `EMBED_BATCH_INVARIANT_<MODEL_UPPER>` or `EMBED_BATCH_INVARIANT`.
+    batch_invariant: bool,
     /// Pad-width multiple, chosen from this model's `memory_pattern`
     /// (`pool::seq_pad_multiple`): fine when ORT keeps no per-shape plan,
     /// coarse (bounded shape count) when it does.
@@ -347,6 +358,8 @@ impl EmbedModel {
         crate::metrics::set_arena_shrink_enabled(&def.name, arena_shrink_enabled);
 
         let subbatch_ratio = resolve_subbatch_ratio(&def.name);
+        let batch_invariant = resolve_batch_invariant(&def.name)?;
+        tracing::info!(model = %def.name, batch_invariant, "batch invariance");
         crate::metrics::set_subbatch_ratio(&def.name, subbatch_ratio);
         let pad_multiple = pool::seq_pad_multiple(def.memory_pattern);
         crate::metrics::set_seq_pad_multiple(&def.name, pad_multiple);
@@ -363,6 +376,7 @@ impl EmbedModel {
             has_token_type_ids: def.has_token_type_ids,
             num_heads,
             subbatch_ratio,
+            batch_invariant,
             pad_multiple,
             arena_shrink_enabled,
             run_options,
@@ -444,7 +458,7 @@ impl EmbedModel {
             .iter()
             .map(|v| v.len().min(self.max_len))
             .collect();
-        let groups = plan_subbatches(&lens, self.subbatch_ratio);
+        let groups = plan_request(&lens, self.subbatch_ratio, self.batch_invariant);
 
         // Waste is reported across the WHOLE request, not per group: a
         // per-group ratio improves by construction as groups narrow, so it
@@ -810,6 +824,40 @@ impl EmbedModel {
     }
 }
 
+/// Resolve `EMBED_BATCH_INVARIANT_<MODEL_UPPER>`, then `EMBED_BATCH_INVARIANT`.
+/// Unset means off; an unparseable value is an error, because a typo would
+/// leave vectors batch-dependent while the operator believes otherwise.
+fn resolve_batch_invariant(model_key: &str) -> Result<bool, String> {
+    let per_model = format!(
+        "EMBED_BATCH_INVARIANT_{}",
+        crate::config::model_env_key(model_key)
+    );
+    let raw = std::env::var(&per_model)
+        .ok()
+        .or_else(|| std::env::var("EMBED_BATCH_INVARIANT").ok());
+    parse_batch_invariant(raw.as_deref()).map_err(|e| format!("model '{model_key}': {e}"))
+}
+
+pub(crate) fn parse_batch_invariant(raw: Option<&str>) -> Result<bool, String> {
+    match raw.map(str::trim) {
+        None | Some("") | Some("0") | Some("false") => Ok(false),
+        Some("1") | Some("true") => Ok(true),
+        Some(other) => Err(format!(
+            "EMBED_BATCH_INVARIANT* must be 1, 0, true or false, got '{other}'"
+        )),
+    }
+}
+
+/// The forward passes for one request: one per text when `batch_invariant`
+/// (a text's activation scales then never see another text), otherwise the
+/// length-homogeneous groups of [`plan_subbatches`].
+pub(crate) fn plan_request(lens: &[usize], ratio: f32, batch_invariant: bool) -> Vec<Vec<usize>> {
+    if batch_invariant {
+        return (0..lens.len()).map(|i| vec![i]).collect();
+    }
+    plan_subbatches(lens, ratio)
+}
+
 /// Resolve the sub-batch length ratio for `model_key`.
 ///
 /// Lookup order: `EMBED_SUBBATCH_RATIO_<MODEL_UPPER>`, then the
@@ -1119,7 +1167,10 @@ fn build_one_session(
 
 #[cfg(test)]
 mod seq_pad_tests {
-    use super::{DEFAULT_SUBBATCH_RATIO, parse_subbatch_ratio, plan_subbatches};
+    use super::{
+        DEFAULT_SUBBATCH_RATIO, parse_batch_invariant, parse_subbatch_ratio, plan_request,
+        plan_subbatches,
+    };
     use crate::pool::{SEQ_PAD_MULTIPLE, round_up_seq_len};
 
     /// Flatten a plan back to a sorted index list.
@@ -1141,6 +1192,29 @@ mod seq_pad_tests {
         assert_eq!(flat(&groups), (0..lens.len()).collect::<Vec<_>>());
     }
 
+    // One forward pass per text keeps a text's vector independent of its
+    // batch-mates; the length-homogeneous plan must not be used instead.
+    #[test]
+    fn batch_invariant_plan_is_one_pass_per_text() {
+        let lens = [200, 190, 180, 10];
+        let groups = plan_request(&lens, 2.0, true);
+        assert_eq!(
+            groups,
+            vec![vec![0], vec![1], vec![2], vec![3]],
+            "batch_invariant must give every text its own pass"
+        );
+        // Off: the existing plan, byte for byte.
+        assert_eq!(plan_request(&lens, 2.0, false), plan_subbatches(&lens, 2.0));
+    }
+    #[test]
+    fn batch_invariant_parses_strictly() {
+        assert_eq!(parse_batch_invariant(None), Ok(false));
+        assert_eq!(parse_batch_invariant(Some("")), Ok(false));
+        assert_eq!(parse_batch_invariant(Some("1")), Ok(true));
+        assert_eq!(parse_batch_invariant(Some("true")), Ok(true));
+        assert_eq!(parse_batch_invariant(Some("0")), Ok(false));
+        assert!(parse_batch_invariant(Some("yes")).is_err());
+    }
     #[test]
     fn subbatch_plan_splits_when_spread_exceeds_ratio() {
         // 500 against 10 is a 50× spread — it must not share a pass.
