@@ -76,7 +76,7 @@ pub async fn embeddings(
     // before incurring any model-lookup or batcher cost.
     let texts = req.input.into_vec();
     if texts.is_empty() {
-        crate::metrics::record_request(&metric_model, status, t0.elapsed(), texts_count);
+        crate::metrics::record_request(&metric_model, "bad_request", t0.elapsed(), texts_count);
         return error_json("input must not be empty").into_response();
     }
 
@@ -99,7 +99,7 @@ pub async fn embeddings(
             "input array exceeds cap; rejecting with 400"
         );
         crate::metrics::record_input_array_rejected(&metric_model, "size_cap");
-        crate::metrics::record_request(&metric_model, status, t0.elapsed(), input_len);
+        crate::metrics::record_request(&metric_model, "bad_request", t0.elapsed(), input_len);
         return (
             StatusCode::BAD_REQUEST,
             Json(InputArrayTooLargeResponse {
@@ -121,7 +121,7 @@ pub async fn embeddings(
     let entry = match state.models.get(&model_name) {
         Some(e) => e,
         None => {
-            crate::metrics::record_request(&metric_model, status, t0.elapsed(), texts_count);
+            crate::metrics::record_request(&metric_model, "bad_request", t0.elapsed(), texts_count);
             return error_json(format!("model '{model_name}' not found")).into_response();
         }
     };
@@ -1032,6 +1032,7 @@ mod tests {
             crate::types::ModelEntry {
                 model: None,
                 batcher: None,
+                input_prefix: Default::default(),
             },
         );
         if drain {
@@ -1066,7 +1067,7 @@ mod tests {
         let drain_name = "client-alias-drain-xyz";
         let miss_name = "client-alias-miss-xyz";
         let unknown_shutdown = embed_requests("unknown", "shutdown");
-        let unknown_error = embed_requests("unknown", "error");
+        let unknown_error = embed_requests("unknown", "bad_request");
 
         let r = make_app(state_serving("cfg-m", true))
             .oneshot(body_for(drain_name, 1))
@@ -1093,20 +1094,24 @@ mod tests {
         // `>=`: other tests in this process may also land in the shared
         // `unknown` bucket (an unconfigured `test-model`).
         assert!(embed_requests("unknown", "shutdown") - unknown_shutdown >= 1.0);
-        assert!(embed_requests("unknown", "error") - unknown_error >= 2.0);
+        assert!(embed_requests("unknown", "bad_request") - unknown_error >= 2.0);
     }
 
     /// The bounded label must not erase the real name of a configured model.
     #[tokio::test]
     async fn configured_model_keeps_its_label_on_early_rejects() {
         let model = "kept-label-model";
-        let before = embed_requests(model, "error");
+        let before = embed_requests(model, "bad_request");
         let r = make_app(state_serving(model, false))
             .oneshot(body_for(model, 100))
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(embed_requests(model, "error") - before, 1.0);
+        assert_eq!(
+            embed_requests(model, "bad_request") - before,
+            1.0,
+            "a dense 400 must use the shared `bad_request` status, not `error`"
+        );
     }
 
     // ------------------------------------------------------------------

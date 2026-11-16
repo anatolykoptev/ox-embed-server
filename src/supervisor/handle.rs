@@ -171,8 +171,19 @@ fn next_backoff(current: Duration) -> Duration {
     (current * 2).min(MAX_BACKOFF)
 }
 
+/// Longest line forwarded; the rest of a longer line is dropped and the line
+/// is marked ` [truncated]`. A worker that logs without newlines cannot make
+/// the supervisor buffer without bound.
+const MAX_FORWARDED_LINE: usize = 16 * 1024;
+
 /// Forward every line read from a worker pipe to `emit`, prefixed with `tag`
 /// (`[<model>] `), until the child closes its end.
+///
+/// Reads bytes and decodes lossily, so a line that is not valid UTF-8 is
+/// forwarded with replacement characters instead of ending forwarding for the
+/// rest of the worker's life (`Lines::next_line` returns `Err(InvalidData)`
+/// there, and a `while let Ok(Some(..))` loop stops silently). A real I/O error
+/// is logged once, then forwarding stops.
 ///
 /// `emit` is `println!`/`eprintln!` in production (the supervisor's stdout and
 /// stderr are what `docker logs` shows); it is a parameter so a test can
@@ -182,9 +193,49 @@ where
     R: tokio::io::AsyncRead + Unpin,
     F: FnMut(&str),
 {
-    let mut lines = BufReader::new(reader).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        emit(&format!("{tag}{line}"));
+    let mut reader = BufReader::new(reader);
+    let mut line: Vec<u8> = Vec::new();
+    let mut truncated = false;
+    let mut flush = |line: &mut Vec<u8>, truncated: &mut bool| {
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        let mut text = String::from_utf8_lossy(line).into_owned();
+        if *truncated {
+            text.push_str(" [truncated]");
+        }
+        emit(&format!("{tag}{text}"));
+        line.clear();
+        *truncated = false;
+    };
+    loop {
+        let chunk = match reader.fill_buf().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(tag = %tag.trim(), error = %e, "worker log forwarding stopped on read error");
+                break;
+            }
+        };
+        if chunk.is_empty() {
+            if !line.is_empty() || truncated {
+                flush(&mut line, &mut truncated);
+            }
+            break;
+        }
+        let (take, end_of_line) = match chunk.iter().position(|&b| b == b'\n') {
+            Some(i) => (i, true),
+            None => (chunk.len(), false),
+        };
+        let room = MAX_FORWARDED_LINE.saturating_sub(line.len());
+        let keep = take.min(room);
+        if keep < take {
+            truncated = true;
+        }
+        line.extend_from_slice(&chunk[..keep]);
+        reader.consume(take + usize::from(end_of_line));
+        if end_of_line {
+            flush(&mut line, &mut truncated);
+        }
     }
 }
 
@@ -2526,6 +2577,60 @@ mod tests {
             series("embed_worker_info{model=\"info-model\",kind=\"embed\",metrics_port=\"8204\"}"),
             Some(1.0)
         );
+    }
+
+    /// One non-UTF-8 line must not end forwarding: it comes out lossy and the
+    /// next valid line still arrives. (`lines()` stopped at the bad line.)
+    #[tokio::test]
+    async fn forward_lines_survives_invalid_utf8() {
+        use tokio::io::AsyncWriteExt as _;
+        let (mut w, r) = tokio::io::duplex(1024);
+        w.write_all(b"before\nbad \xff\xfe bytes\r\nafter\n")
+            .await
+            .unwrap();
+        drop(w);
+        let got = std::sync::Mutex::new(Vec::<String>::new());
+        forward_lines(r, "[m] ".into(), |l| got.lock().unwrap().push(l.into())).await;
+        assert_eq!(
+            *got.lock().unwrap(),
+            vec![
+                "[m] before".to_string(),
+                "[m] bad \u{fffd}\u{fffd} bytes".to_string(),
+                "[m] after".to_string()
+            ],
+            "a valid line after invalid UTF-8 must still be forwarded"
+        );
+    }
+
+    /// An over-long line is cut at the cap and marked; the next line is intact;
+    /// a final line without a newline is still flushed at EOF.
+    #[tokio::test]
+    async fn forward_lines_caps_long_lines() {
+        use tokio::io::AsyncWriteExt as _;
+        let (mut w, r) = tokio::io::duplex(64 * 1024);
+        let long = vec![b'x'; MAX_FORWARDED_LINE * 3];
+        let writer = tokio::spawn(async move {
+            w.write_all(&long).await.unwrap();
+            w.write_all(b"\nnext\ntail").await.unwrap();
+        });
+        let got = std::sync::Mutex::new(Vec::<String>::new());
+        forward_lines(r, "[m] ".into(), |l| got.lock().unwrap().push(l.into())).await;
+        writer.await.unwrap();
+        let got = got.lock().unwrap();
+        assert_eq!(
+            got.len(),
+            3,
+            "{:?}",
+            got.iter().map(|l| l.len()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            got[0].len(),
+            "[m] ".len() + MAX_FORWARDED_LINE + " [truncated]".len(),
+            "long line must be capped and marked"
+        );
+        assert!(got[0].ends_with(" [truncated]"));
+        assert_eq!(got[1], "[m] next");
+        assert_eq!(got[2], "[m] tail");
     }
 
     #[test]

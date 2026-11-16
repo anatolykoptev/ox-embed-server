@@ -600,6 +600,14 @@ async fn main() {
         in_process_splades = inproc_splade,
         "model registry built"
     );
+    // Make the drain-time `status="shutdown"` series exist before the first
+    // rejection (see `touch_shutdown_series`).
+    crate::metrics::touch_shutdown_series(
+        model_entries
+            .keys()
+            .chain(splade_entries.keys())
+            .map(String::as_str),
+    );
 
     let drain_timeout = Duration::from_secs(cfg.drain_timeout_s);
     let shutdown_token = CancellationToken::new();

@@ -125,22 +125,6 @@ fn splade_metric_model(state: &AppState, req_model: Option<&str>) -> String {
     }
 }
 
-/// `embed_requests_total{status}` value for a finished sparse response. A
-/// closed set: ok | bad_request | rate_limited | worker_unavailable | error.
-fn splade_status(code: StatusCode) -> &'static str {
-    if code.is_success() {
-        "ok"
-    } else if code == StatusCode::TOO_MANY_REQUESTS {
-        "rate_limited"
-    } else if code == StatusCode::SERVICE_UNAVAILABLE {
-        "worker_unavailable"
-    } else if code.is_client_error() {
-        "bad_request"
-    } else {
-        "error"
-    }
-}
-
 /// POST /embed_sparse.
 ///
 /// Records `embed_requests_total` / `embed_request_duration_seconds` under the
@@ -172,7 +156,7 @@ pub async fn sparse_embeddings(
     let resp = sparse_embeddings_inner(&state, req).await;
     crate::metrics::record_request(
         &metric_model,
-        splade_status(resp.status()),
+        crate::metrics::request_status_for_http(resp.status().as_u16()),
         t0.elapsed(),
         texts,
     );
@@ -506,7 +490,11 @@ mod tests {
             (StatusCode::INTERNAL_SERVER_ERROR, "error"),
             (StatusCode::BAD_GATEWAY, "error"),
         ] {
-            assert_eq!(splade_status(code), want, "{code}");
+            assert_eq!(
+                crate::metrics::request_status_for_http(code.as_u16()),
+                want,
+                "{code}"
+            );
         }
     }
 

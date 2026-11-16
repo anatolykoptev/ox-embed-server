@@ -263,6 +263,46 @@ pub fn bounded_model_label(requested: &str, is_configured: impl Fn(&str) -> bool
     }
 }
 
+/// Every `status` value `embed_requests_total` carries. One vocabulary for the
+/// dense and sparse handlers (rerank keeps its own series but uses the same
+/// words): a closed set, so no status can mint series.
+#[allow(dead_code)] // read by tests; the vocabulary is documentation for the binary
+pub const REQUEST_STATUSES: &[&str] = &[
+    "ok",
+    "bad_request",
+    "rate_limited",
+    "worker_unavailable",
+    "shutdown",
+    "error",
+];
+
+/// `embed_requests_total{status}` value for a finished HTTP response.
+pub fn request_status_for_http(code: u16) -> &'static str {
+    match code {
+        200..=299 => "ok",
+        429 => "rate_limited",
+        503 => "worker_unavailable",
+        400..=499 => "bad_request",
+        _ => "error",
+    }
+}
+
+/// Create `embed_requests_total{model,status="shutdown"}` at 0 for every
+/// configured model, plus the `unknown` bucket. The series otherwise first
+/// exists at the first drain rejection, and the process exits within the drain
+/// window (10 s) against a 30 s scrape interval, so no `rate()` would ever see
+/// it.
+pub fn touch_shutdown_series<'a>(models: impl IntoIterator<Item = &'a str>) {
+    for m in models.into_iter().chain([UNKNOWN_MODEL_LABEL]) {
+        metrics::counter!(
+            "embed_requests_total",
+            "model" => m.to_string(),
+            "status" => "shutdown"
+        )
+        .absolute(0);
+    }
+}
+
 /// Count one request outcome without touching the duration / size histograms.
 ///
 /// For rejections that never started work (drain-time 503), where a ~0 s
@@ -2349,5 +2389,45 @@ mod worker_recorder_tests {
             out.contains("embed_seq_pad_multiple{model=\"wr-other\"} 4"),
             "an explicit model label must win over the worker-wide one:\n{out}"
         );
+    }
+}
+
+#[cfg(test)]
+mod request_status_tests {
+    use super::*;
+
+    /// Whatever HTTP code a handler returns, the status it records is one of
+    /// the shared closed set.
+    #[test]
+    fn http_status_maps_into_the_closed_set() {
+        for code in 100u16..600 {
+            assert!(
+                REQUEST_STATUSES.contains(&request_status_for_http(code)),
+                "{code} mapped outside REQUEST_STATUSES"
+            );
+        }
+        assert_eq!(request_status_for_http(200), "ok");
+        assert_eq!(request_status_for_http(400), "bad_request");
+        assert_eq!(request_status_for_http(404), "bad_request");
+        assert_eq!(request_status_for_http(429), "rate_limited");
+        assert_eq!(request_status_for_http(503), "worker_unavailable");
+        assert_eq!(request_status_for_http(500), "error");
+    }
+
+    /// The drain-time series must exist at 0 before any rejection.
+    #[test]
+    fn shutdown_series_exist_at_zero_after_touch() {
+        let h = test_prometheus_handle();
+        touch_shutdown_series(["touch-model-a", "touch-model-b"]);
+        let r = h.render();
+        for m in ["touch-model-a", "touch-model-b", "unknown"] {
+            let head = format!("embed_requests_total{{model=\"{m}\",status=\"shutdown\"}} ");
+            // `unknown` may already be non-zero from other tests in-process.
+            let ok = r.lines().any(|l| match l.strip_prefix(head.as_str()) {
+                Some(v) => m == "unknown" || v == "0",
+                None => false,
+            });
+            assert!(ok, "missing `{head}0` in:\n{r}");
+        }
     }
 }
