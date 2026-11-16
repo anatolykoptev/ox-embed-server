@@ -1558,7 +1558,7 @@ mod tests {
                 });
             }
         });
-        let client = crate::ipc::client::WorkerClient::connect(sock, 1)
+        let client = crate::ipc::client::WorkerClient::connect(sock, 1, Duration::from_secs(60))
             .await
             .unwrap();
         let pool = WorkerPool::with_dispatch_timeout(Duration::from_millis(500));
