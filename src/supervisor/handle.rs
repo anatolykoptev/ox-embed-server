@@ -171,6 +171,82 @@ fn next_backoff(current: Duration) -> Duration {
     (current * 2).min(MAX_BACKOFF)
 }
 
+/// Longest line forwarded; the rest of a longer line is dropped and the line
+/// is marked ` [truncated]`. A worker that logs without newlines cannot make
+/// the supervisor buffer without bound.
+const MAX_FORWARDED_LINE: usize = 16 * 1024;
+
+/// Forward every line read from a worker pipe to `emit`, prefixed with `tag`
+/// (`[<model>] `), until the child closes its end.
+///
+/// Reads bytes and decodes lossily, so a line that is not valid UTF-8 is
+/// forwarded with replacement characters instead of ending forwarding for the
+/// rest of the worker's life (`Lines::next_line` returns `Err(InvalidData)`
+/// there, and a `while let Ok(Some(..))` loop stops silently). A real I/O error
+/// is logged once, then forwarding stops.
+///
+/// `emit` is `println!`/`eprintln!` in production (the supervisor's stdout and
+/// stderr are what `docker logs` shows); it is a parameter so a test can
+/// capture the stream.
+async fn forward_lines<R, F>(reader: R, tag: String, mut emit: F)
+where
+    R: tokio::io::AsyncRead + Unpin,
+    F: FnMut(&str),
+{
+    let mut reader = BufReader::new(reader);
+    let mut line: Vec<u8> = Vec::new();
+    let mut truncated = false;
+    let mut flush = |line: &mut Vec<u8>, truncated: &mut bool| {
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        let mut text = String::from_utf8_lossy(line).into_owned();
+        if *truncated {
+            text.push_str(" [truncated]");
+        }
+        emit(&format!("{tag}{text}"));
+        line.clear();
+        *truncated = false;
+    };
+    loop {
+        let chunk = match reader.fill_buf().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(tag = %tag.trim(), error = %e, "worker log forwarding stopped on read error");
+                break;
+            }
+        };
+        if chunk.is_empty() {
+            if !line.is_empty() || truncated {
+                flush(&mut line, &mut truncated);
+            }
+            break;
+        }
+        let (take, end_of_line) = match chunk.iter().position(|&b| b == b'\n') {
+            Some(i) => (i, true),
+            None => (chunk.len(), false),
+        };
+        let room = MAX_FORWARDED_LINE.saturating_sub(line.len());
+        let keep = take.min(room);
+        if keep < take {
+            truncated = true;
+        }
+        line.extend_from_slice(&chunk[..keep]);
+        reader.consume(take + usize::from(end_of_line));
+        if end_of_line {
+            flush(&mut line, &mut truncated);
+        }
+    }
+}
+
+/// The `EMBED_WORKER_METRICS_PORT` the supervisor assigned to a worker, if any.
+fn metrics_port_from_env_extra(env_extra: &[(String, String)]) -> Option<u16> {
+    env_extra
+        .iter()
+        .find(|(k, _)| k == "EMBED_WORKER_METRICS_PORT")
+        .and_then(|(_, v)| v.trim().parse().ok())
+}
+
 /// Current wall-clock time as unix milliseconds.
 ///
 /// Used by [`WorkerSupervisor::record_success`] to stamp the last-success
@@ -465,6 +541,14 @@ impl WorkerSupervisor {
         // observable as a present-but-zero series, not absent (which
         // Prometheus operators read as "metric not wired").
         crate::metrics::worker_restart_touch(&supervisor.spec.model);
+        crate::metrics::worker_respawn_failure_touch(&supervisor.spec.model);
+        // Publish worker-to-port topology so an operator (or a rule) can map a
+        // scrape target to a model from the supervisor's own series.
+        crate::metrics::worker_info_set(
+            &supervisor.spec.model,
+            supervisor.spec.kind.as_str(),
+            metrics_port_from_env_extra(&supervisor.spec.env_extra),
+        );
         // Pre-touch the failure counter for every reason — see the function doc.
         crate::metrics::inference_failures_touch(&supervisor.spec.model);
         // Pre-touch RSS gauge to 0 — same rationale as restart counter:
@@ -545,26 +629,11 @@ impl WorkerSupervisor {
         // when the child closes its end of the pipe on exit.
         if let Some(child_stdout) = child.stdout.take() {
             let model_tag = format!("[{}] ", spec.model);
-            tokio::spawn(async move {
-                let reader = BufReader::new(child_stdout);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    // println! is fine here: each forwarded line is terminated by
-                    // the newline from the worker's tracing output. The supervisor
-                    // has a single stdout writer; no double-buffering concern.
-                    println!("{}{}", model_tag, line);
-                }
-            });
+            tokio::spawn(forward_lines(child_stdout, model_tag, |l| println!("{l}")));
         }
         if let Some(child_stderr) = child.stderr.take() {
             let model_tag = format!("[{}] ", spec.model);
-            tokio::spawn(async move {
-                let reader = BufReader::new(child_stderr);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    eprintln!("{}{}", model_tag, line);
-                }
-            });
+            tokio::spawn(forward_lines(child_stderr, model_tag, |l| eprintln!("{l}")));
         }
 
         // Poll up to socket_wait for socket, with early-exit if child dies first.
@@ -664,6 +733,11 @@ impl WorkerSupervisor {
                         break; // exit inner loop, back to outer wait()
                     }
                     Err(e) => {
+                        // A worker that cannot start (corrupt model, arena
+                        // registration failure, missing mount) never reaches the
+                        // success arm, so `embed_worker_restart_total` stays flat.
+                        // Count the failed attempt on its own series.
+                        crate::metrics::worker_respawn_failure_inc(&self.spec.model);
                         tracing::error!(
                             model = %self.spec.model,
                             error = ?e,
@@ -2338,6 +2412,238 @@ mod tests {
         assert!(
             !freshness_window_is_inert(Duration::from_secs(90), Duration::from_secs(15)),
             "the 90s default window with a 15s probe timeout is healthy"
+        );
+    }
+    // ── worker log forwarding + respawn-failure + topology gauges ───────────
+
+    const LISTEN_PY: &str = "import os,socket,time;s=socket.socket(socket.AF_UNIX);s.bind(os.environ['EMBED_WORKER_SOCKET']);s.listen(8);time.sleep(60)";
+
+    /// Write an executable `#!/bin/sh` worker stand-in into `dir`.
+    fn write_worker_script(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake_worker.sh");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn fake_spec(model: &str, dir: &std::path::Path, bin: std::path::PathBuf) -> SpawnSpec {
+        SpawnSpec {
+            model: model.into(),
+            kind: super::WorkerKind::Embed,
+            worker_bin: bin,
+            socket_dir: dir.to_path_buf(),
+            pool_size: 1,
+            intra_threads: 1,
+            env_extra: vec![],
+        }
+    }
+
+    /// Value of an exact rendered series line, e.g. `name{labels}`.
+    fn series(name_and_labels: &str) -> Option<f64> {
+        let needle = format!("{name_and_labels} ");
+        crate::metrics::test_prometheus_handle()
+            .render()
+            .lines()
+            .find_map(|l| l.strip_prefix(needle.as_str()))
+            .and_then(|v| v.trim().parse().ok())
+    }
+
+    /// `forward_lines` prefixes every line with the tag and stops at EOF.
+    #[tokio::test]
+    async fn forward_lines_prefixes_each_line() {
+        use tokio::io::AsyncWriteExt as _;
+        let (mut w, r) = tokio::io::duplex(1024);
+        w.write_all(b"worker starting\nmlock failed\n")
+            .await
+            .unwrap();
+        drop(w);
+        let got = std::sync::Mutex::new(Vec::<String>::new());
+        forward_lines(r, "[m] ".into(), |l| got.lock().unwrap().push(l.into())).await;
+        assert_eq!(
+            *got.lock().unwrap(),
+            vec![
+                "[m] worker starting".to_string(),
+                "[m] mlock failed".to_string()
+            ],
+            "every worker line must come out prefixed with the model tag"
+        );
+    }
+
+    /// End to end: a line a worker prints reaches the SUPERVISOR PROCESS's own
+    /// stdout (and a stderr line its stderr), prefixed `[<model>] `. That is the
+    /// stream `docker logs` reads. The test re-executes itself so the child
+    /// process's real fd 1 / fd 2 can be captured.
+    #[tokio::test]
+    async fn worker_output_reaches_supervisor_stdout_and_stderr() {
+        const MODEL: &str = "fwd-probe-model";
+        if std::env::var_os("OXE_FWD_PROBE").is_some() {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = write_worker_script(
+                dir.path(),
+                &format!(
+                    "echo hello-from-worker-stdout\necho hello-from-worker-stderr >&2\nexec python3 -c \"{LISTEN_PY}\""
+                ),
+            );
+            let _sup = WorkerSupervisor::launch(fake_spec(MODEL, dir.path(), bin))
+                .await
+                .expect("fake worker launches");
+            // Forwarders are fire-and-forget tasks; let them drain the pipe.
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "supervisor::handle::tests::worker_output_reaches_supervisor_stdout_and_stderr",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("OXE_FWD_PROBE", "1")
+            .output()
+            .expect("re-exec test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stdout.contains("[fwd-probe-model] hello-from-worker-stdout"),
+            "worker stdout line missing from supervisor stdout.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("[fwd-probe-model] hello-from-worker-stderr"),
+            "worker stderr line missing from supervisor stderr.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    /// A respawn that fails must be counted. The worker starts once, is
+    /// SIGKILLed, and every later start exits at once; `embed_worker_restart_total`
+    /// stays flat in that case, so the failure counter is the only signal.
+    #[tokio::test]
+    async fn failed_respawn_is_counted_on_its_own_series() {
+        // Install the recorder BEFORE launch emits (a late install misses it).
+        crate::metrics::test_prometheus_handle();
+        const MODEL: &str = "respawn-fail-model";
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("started-once");
+        let bin = write_worker_script(
+            dir.path(),
+            &format!(
+                "if [ -e {m} ]; then exit 1; fi\ntouch {m}\nexec python3 -c \"{LISTEN_PY}\"",
+                m = marker.display()
+            ),
+        );
+        let sup = WorkerSupervisor::launch(fake_spec(MODEL, dir.path(), bin))
+            .await
+            .expect("first start succeeds");
+        let failures = format!("embed_worker_respawn_failures_total{{model=\"{MODEL}\"}}");
+        let restarts = format!("embed_worker_restart_total{{model=\"{MODEL}\"}}");
+        assert_eq!(
+            series(&failures),
+            Some(0.0),
+            "launch must pre-touch the failure counter at 0"
+        );
+
+        let pid = sup.current_pid.load(std::sync::atomic::Ordering::Relaxed);
+        assert_ne!(pid, 0);
+        // SAFETY: plain kill(2) on the child pid this test just spawned.
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+
+        // First retry fires after INITIAL_BACKOFF (2 s); allow generous slack.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while series(&failures).unwrap_or(0.0) < 1.0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a failed respawn never incremented embed_worker_respawn_failures_total"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert_eq!(
+            series(&restarts),
+            Some(0.0),
+            "a failed respawn must not count as a restart"
+        );
+    }
+
+    /// `launch` publishes the worker-to-port mapping on the supervisor.
+    #[tokio::test]
+    async fn launch_publishes_worker_info() {
+        // Install the recorder BEFORE launch emits (a late install misses it).
+        crate::metrics::test_prometheus_handle();
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_worker_script(dir.path(), &format!("exec python3 -c \"{LISTEN_PY}\""));
+        let mut spec = fake_spec("info-model", dir.path(), bin);
+        spec.env_extra = vec![("EMBED_WORKER_METRICS_PORT".into(), "8204".into())];
+        let _sup = WorkerSupervisor::launch(spec).await.expect("launches");
+        assert_eq!(
+            series("embed_worker_info{model=\"info-model\",kind=\"embed\",metrics_port=\"8204\"}"),
+            Some(1.0)
+        );
+    }
+
+    /// One non-UTF-8 line must not end forwarding: it comes out lossy and the
+    /// next valid line still arrives. (`lines()` stopped at the bad line.)
+    #[tokio::test]
+    async fn forward_lines_survives_invalid_utf8() {
+        use tokio::io::AsyncWriteExt as _;
+        let (mut w, r) = tokio::io::duplex(1024);
+        w.write_all(b"before\nbad \xff\xfe bytes\r\nafter\n")
+            .await
+            .unwrap();
+        drop(w);
+        let got = std::sync::Mutex::new(Vec::<String>::new());
+        forward_lines(r, "[m] ".into(), |l| got.lock().unwrap().push(l.into())).await;
+        assert_eq!(
+            *got.lock().unwrap(),
+            vec![
+                "[m] before".to_string(),
+                "[m] bad \u{fffd}\u{fffd} bytes".to_string(),
+                "[m] after".to_string()
+            ],
+            "a valid line after invalid UTF-8 must still be forwarded"
+        );
+    }
+
+    /// An over-long line is cut at the cap and marked; the next line is intact;
+    /// a final line without a newline is still flushed at EOF.
+    #[tokio::test]
+    async fn forward_lines_caps_long_lines() {
+        use tokio::io::AsyncWriteExt as _;
+        let (mut w, r) = tokio::io::duplex(64 * 1024);
+        let long = vec![b'x'; MAX_FORWARDED_LINE * 3];
+        let writer = tokio::spawn(async move {
+            w.write_all(&long).await.unwrap();
+            w.write_all(b"\nnext\ntail").await.unwrap();
+        });
+        let got = std::sync::Mutex::new(Vec::<String>::new());
+        forward_lines(r, "[m] ".into(), |l| got.lock().unwrap().push(l.into())).await;
+        writer.await.unwrap();
+        let got = got.lock().unwrap();
+        assert_eq!(
+            got.len(),
+            3,
+            "{:?}",
+            got.iter().map(|l| l.len()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            got[0].len(),
+            "[m] ".len() + MAX_FORWARDED_LINE + " [truncated]".len(),
+            "long line must be capped and marked"
+        );
+        assert!(got[0].ends_with(" [truncated]"));
+        assert_eq!(got[1], "[m] next");
+        assert_eq!(got[2], "[m] tail");
+    }
+
+    #[test]
+    fn metrics_port_is_read_from_env_extra() {
+        let kv = |k: &str, v: &str| (k.to_string(), v.to_string());
+        assert_eq!(
+            metrics_port_from_env_extra(&[kv("X", "1"), kv("EMBED_WORKER_METRICS_PORT", "8204")]),
+            Some(8204)
+        );
+        assert_eq!(metrics_port_from_env_extra(&[]), None);
+        assert_eq!(
+            metrics_port_from_env_extra(&[kv("EMBED_WORKER_METRICS_PORT", "nope")]),
+            None
         );
     }
 }

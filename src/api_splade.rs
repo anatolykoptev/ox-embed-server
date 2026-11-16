@@ -106,14 +106,40 @@ fn resolve_splade_name(state: &AppState, req_model: Option<String>) -> Result<St
     }
 }
 
+/// Bounded `model` label for a sparse request, resolved the way
+/// [`resolve_splade_name`] resolves it but without failing: the configured name
+/// when it can be determined, `unknown` otherwise (client-supplied names must
+/// not mint series).
+fn splade_metric_model(state: &AppState, req_model: Option<&str>) -> String {
+    match req_model {
+        Some(name) => {
+            crate::metrics::bounded_model_label(name, |m| state.splades.contains_key(m)).to_string()
+        }
+        None if state.splades.len() == 1 => state
+            .splades
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| crate::metrics::UNKNOWN_MODEL_LABEL.to_string()),
+        None => crate::metrics::UNKNOWN_MODEL_LABEL.to_string(),
+    }
+}
+
 /// POST /embed_sparse.
+///
+/// Records `embed_requests_total` / `embed_request_duration_seconds` under the
+/// SPLADE model name, so the per-model error-rate and latency rules cover it
+/// like the dense models.
 pub async fn sparse_embeddings(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SparseEmbeddingsRequest>,
 ) -> Response {
+    let t0 = std::time::Instant::now();
+    let metric_model = splade_metric_model(&state, req.model.as_deref());
     // Shutdown gate — same 503 + retry-after pattern as `/v1/rerank`
-    // and `/v1/embeddings`.
+    // and `/v1/embeddings`. Counter only: no work started.
     if state.shutdown.is_cancelled() {
+        crate::metrics::count_request(&metric_model, "shutdown");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [("retry-after", "5")],
@@ -126,7 +152,18 @@ pub async fn sparse_embeddings(
         )
             .into_response();
     }
+    let texts = req.input.len();
+    let resp = sparse_embeddings_inner(&state, req).await;
+    crate::metrics::record_request(
+        &metric_model,
+        crate::metrics::request_status_for_http(resp.status().as_u16()),
+        t0.elapsed(),
+        texts,
+    );
+    resp
+}
 
+async fn sparse_embeddings_inner(state: &Arc<AppState>, req: SparseEmbeddingsRequest) -> Response {
     if req.input.is_empty() {
         return error_json("input must not be empty").into_response();
     }
@@ -138,7 +175,7 @@ pub async fn sparse_embeddings(
         return error_json("input texts must not be empty or whitespace-only").into_response();
     }
 
-    let model_name = match resolve_splade_name(&state, req.model) {
+    let model_name = match resolve_splade_name(state, req.model) {
         Ok(n) => n,
         Err(msg) => return error_json(msg).into_response(),
     };
@@ -349,6 +386,115 @@ mod tests {
             rerank_max_input_docs: 32,
             worker_pool: None,
             ready_probe_timeout_ms: 2000,
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Request series for SPLADE (#197): the handler recorded none, so splade
+    // errors and latency were invisible to every per-model rule.
+    // -----------------------------------------------------------------
+
+    fn sparse_requests(model: &str, status: &str) -> f64 {
+        let needle = format!("embed_requests_total{{model=\"{model}\",status=\"{status}\"}} ");
+        crate::metrics::test_prometheus_handle()
+            .render()
+            .lines()
+            .find_map(|l| l.strip_prefix(needle.as_str()))
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(0.0)
+    }
+
+    fn state_with_splade(name: &str, drain: bool) -> Arc<AppState> {
+        let mut st = empty_state();
+        st.splades.insert(
+            name.to_string(),
+            crate::types::SpladeEntry {
+                model: None,
+                batcher: None,
+            },
+        );
+        if drain {
+            st.shutdown.cancel();
+        }
+        Arc::new(st)
+    }
+
+    async fn call_sparse(state: Arc<AppState>, model: Option<&str>, input: Vec<&str>) -> Response {
+        sparse_embeddings(
+            State(state),
+            Json(SparseEmbeddingsRequest {
+                model: model.map(str::to_string),
+                input: input.into_iter().map(str::to_string).collect(),
+                top_k: None,
+                min_weight: None,
+            }),
+        )
+        .await
+    }
+
+    /// A finished request is counted under the SPLADE model name, with a
+    /// duration observation, and an unconfigured name collapses to `unknown`.
+    #[tokio::test]
+    async fn sparse_request_is_counted_and_label_is_bounded() {
+        let name = "splade-metric-model";
+        let before_ok_model = sparse_requests(name, "bad_request");
+        let before_unknown = sparse_requests("unknown", "bad_request");
+
+        // Empty input -> 400 from the handler body.
+        let r = call_sparse(state_with_splade(name, false), Some(name), vec![]).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(sparse_requests(name, "bad_request") - before_ok_model, 1.0);
+
+        // Same, single configured model selected implicitly.
+        let r = call_sparse(state_with_splade(name, false), None, vec![]).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(sparse_requests(name, "bad_request") - before_ok_model, 2.0);
+
+        // Unconfigured, client-supplied name.
+        let r = call_sparse(
+            state_with_splade(name, false),
+            Some("client-splade-alias-xyz"),
+            vec!["a"],
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert!(sparse_requests("unknown", "bad_request") - before_unknown >= 1.0);
+
+        let rendered = crate::metrics::test_prometheus_handle().render();
+        assert!(!rendered.contains("client-splade-alias-xyz"), "{rendered}");
+        assert!(
+            rendered.contains(&format!(
+                "embed_request_duration_seconds_count{{model=\"{name}\"}}"
+            )),
+            "splade requests must record embed_request_duration_seconds:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sparse_shutdown_503_is_counted() {
+        let name = "splade-drain-model";
+        let before = sparse_requests(name, "shutdown");
+        let r = call_sparse(state_with_splade(name, true), Some(name), vec!["a"]).await;
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(sparse_requests(name, "shutdown") - before, 1.0);
+    }
+
+    #[test]
+    fn splade_status_is_a_closed_set() {
+        for (code, want) in [
+            (StatusCode::OK, "ok"),
+            (StatusCode::BAD_REQUEST, "bad_request"),
+            (StatusCode::NOT_FOUND, "bad_request"),
+            (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+            (StatusCode::SERVICE_UNAVAILABLE, "worker_unavailable"),
+            (StatusCode::INTERNAL_SERVER_ERROR, "error"),
+            (StatusCode::BAD_GATEWAY, "error"),
+        ] {
+            assert_eq!(
+                crate::metrics::request_status_for_http(code.as_u16()),
+                want,
+                "{code}"
+            );
         }
     }
 

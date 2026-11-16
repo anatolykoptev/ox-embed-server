@@ -247,7 +247,7 @@ impl LoadedModel {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    embed_server::worker_log::init();
 
     let kind = std::env::var("EMBED_WORKER_KIND").unwrap_or_else(|_| "embed".into());
     let model_name = require_env("EMBED_WORKER_MODEL")?;
