@@ -317,9 +317,13 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
         let _listener = tokio::net::UnixListener::bind(&sock).expect("bind");
         let client = std::sync::Arc::new(
-            crate::ipc::client::WorkerClient::connect(sock.clone(), 1)
-                .await
-                .expect("connect"),
+            crate::ipc::client::WorkerClient::connect(
+                sock.clone(),
+                1,
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .expect("connect"),
         );
         pool.add(WorkerSupervisor::for_test(spec("up"), client))
             .await;
