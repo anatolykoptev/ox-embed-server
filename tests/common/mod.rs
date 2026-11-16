@@ -233,6 +233,9 @@ pub fn spawn_server(env: &Setup, tag: &str, server_bin: &str, worker_bin: &str) 
         .env("EMBED_MODELS", env.embed_spec())
         .env("EMBED_DEFAULT_MODEL", EMBED_NAME)
         .env(MEMORY_PATTERN_ENV.0, MEMORY_PATTERN_ENV.1)
+        // The response cache would answer a repeated text from a previous
+        // request, so a batch-independence check would never reach the worker.
+        .env("CACHE_MAX_ENTRIES", "0")
         .env("RERANKER_MODELS", env.rerank_spec())
         .env("SPLADE_MODELS", env.splade_spec())
         .env("ORT_DYLIB_PATH", &env.ort)
