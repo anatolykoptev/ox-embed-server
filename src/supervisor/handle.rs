@@ -277,6 +277,13 @@ pub struct WorkerSupervisor {
     /// Resolved once from `EMBED_WORKER_SOCKET_WAIT_SECS` at [`launch`] time;
     /// restart the container to pick up a changed value.
     socket_wait: Duration,
+    /// Whole-exchange deadline applied to every `WorkerClient` request.
+    ///
+    /// Resolved once per model at [`launch`] via
+    /// `config::resolve_ipc_timeout` (`EMBED_IPC_TIMEOUT_SECS[_<KEY>]`,
+    /// default `DEFAULT_IPC_TIMEOUT_SECS`) so every respawn's client gets
+    /// the same value captured at startup.
+    ipc_timeout: Duration,
     /// PID of the currently live worker child process.
     ///
     /// Updated atomically after every successful [`spawn_one`] and cleared to 0
@@ -419,11 +426,16 @@ impl WorkerSupervisor {
             crate::metrics::record_config_fallback("EMBED_WORKER_HEARTBEAT_FRESHNESS_WINDOW_SECS");
         }
 
+        // Per-model IPC request deadline — the same resolve-once-at-launch
+        // pattern as socket_wait so respawns keep the startup value.
+        let ipc_timeout = crate::config::resolve_ipc_timeout(&spec.model);
+
         let supervisor = Arc::new(Self {
             spec: spec.clone(),
             client_slot: Arc::new(RwLock::new(None)),
             restart_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             socket_wait,
+            ipc_timeout,
             current_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             heartbeat_interval,
             heartbeat_max_fails,
@@ -433,7 +445,12 @@ impl WorkerSupervisor {
         });
 
         // Initial spawn — fail loudly so the server startup loop can exit(1).
-        let (child, client) = Self::spawn_one(&supervisor.spec, supervisor.socket_wait).await?;
+        let (child, client) = Self::spawn_one(
+            &supervisor.spec,
+            supervisor.socket_wait,
+            supervisor.ipc_timeout,
+        )
+        .await?;
         *supervisor.client_slot.write().await = Some(client);
         // Store child PID so the RSS-poll loop can read /proc/<pid>/status.
         // child.id() returns None only if the process has already been awaited,
@@ -487,6 +504,7 @@ impl WorkerSupervisor {
     async fn spawn_one(
         spec: &SpawnSpec,
         socket_wait: Duration,
+        ipc_timeout: Duration,
     ) -> anyhow::Result<(Child, Arc<WorkerClient>)> {
         if let Err(e) = std::fs::create_dir_all(&spec.socket_dir) {
             tracing::warn!(dir = ?spec.socket_dir, error = %e, "create_dir_all failed; subsequent bind may fail");
@@ -573,7 +591,7 @@ impl WorkerSupervisor {
         }
 
         let client = Arc::new(
-            WorkerClient::connect(socket_path.clone(), spec.pool_size)
+            WorkerClient::connect(socket_path.clone(), spec.pool_size, ipc_timeout)
                 .await
                 .map_err(|e| anyhow::anyhow!("worker client connect failed: {e}"))?,
         );
@@ -630,7 +648,7 @@ impl WorkerSupervisor {
             // Respawn loop — each failed attempt advances backoff exactly once.
             loop {
                 tokio::time::sleep(backoff).await;
-                match Self::spawn_one(&self.spec, self.socket_wait).await {
+                match Self::spawn_one(&self.spec, self.socket_wait, self.ipc_timeout).await {
                     Ok((new_child, new_client)) => {
                         // Store new PID before handing child back to wait().
                         if let Some(pid) = new_child.id() {
@@ -997,6 +1015,7 @@ impl WorkerSupervisor {
             client_slot: Arc::new(RwLock::new(Some(client))),
             restart_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             socket_wait: Duration::from_secs(60),
+            ipc_timeout: Duration::from_secs(60),
             current_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             heartbeat_interval: Duration::ZERO,
             heartbeat_max_fails: 3,
@@ -1018,6 +1037,7 @@ impl WorkerSupervisor {
             client_slot: Arc::new(RwLock::new(None)),
             restart_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             socket_wait: Duration::from_secs(60),
+            ipc_timeout: Duration::from_secs(60),
             current_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             heartbeat_interval: Duration::ZERO,
             heartbeat_max_fails: 3,
@@ -1129,6 +1149,7 @@ mod tests {
             client_slot: Arc::new(RwLock::new(None)),
             restart_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             socket_wait: Duration::from_secs(60),
+            ipc_timeout: Duration::from_secs(60),
             current_pid: Arc::new(std::sync::atomic::AtomicU32::new(42)),
             heartbeat_interval: Duration::ZERO,
             heartbeat_max_fails: 3,
@@ -1427,7 +1448,7 @@ mod tests {
     ) -> Arc<WorkerSupervisor> {
         use crate::ipc::client::WorkerClient;
         let client = Arc::new(
-            WorkerClient::connect(mock.socket_path.clone(), 1)
+            WorkerClient::connect(mock.socket_path.clone(), 1, Duration::from_secs(60))
                 .await
                 .expect("connect to mock worker"),
         );
@@ -1444,6 +1465,7 @@ mod tests {
             client_slot: Arc::new(RwLock::new(Some(client))),
             restart_count: Arc::new(AtomicU64::new(0)),
             socket_wait: Duration::from_secs(60),
+            ipc_timeout: Duration::from_secs(60),
             current_pid: Arc::new(AtomicU32::new(pid)),
             heartbeat_interval,
             heartbeat_max_fails: 1,
@@ -1637,6 +1659,7 @@ mod tests {
             client_slot: Arc::new(RwLock::new(None)),
             restart_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             socket_wait: Duration::from_secs(60),
+            ipc_timeout: Duration::from_secs(60),
             current_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             heartbeat_interval: Duration::from_millis(50),
             heartbeat_max_fails: 1,
@@ -1704,9 +1727,13 @@ mod tests {
         let interval = Duration::from_secs(1);
         let window = interval * HEARTBEAT_FRESHNESS_WINDOW_INTERVAL_MULTIPLIER;
         let client = Arc::new(
-            crate::ipc::client::WorkerClient::connect(mock.socket_path.clone(), 1)
-                .await
-                .expect("connect to mock worker"),
+            crate::ipc::client::WorkerClient::connect(
+                mock.socket_path.clone(),
+                1,
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("connect to mock worker"),
         );
         let sup = Arc::new(WorkerSupervisor {
             spec: SpawnSpec {
@@ -1721,6 +1748,7 @@ mod tests {
             client_slot: Arc::new(RwLock::new(Some(client))),
             restart_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             socket_wait: Duration::from_secs(60),
+            ipc_timeout: Duration::from_secs(60),
             current_pid: Arc::new(std::sync::atomic::AtomicU32::new(child.id())),
             heartbeat_interval: interval,
             heartbeat_max_fails: 1,
@@ -1895,9 +1923,13 @@ mod tests {
         // fresh when the freshness check runs, so the suppression fires and
         // the test goes RED.
         let client = Arc::new(
-            crate::ipc::client::WorkerClient::connect(mock.socket_path.clone(), 1)
-                .await
-                .expect("connect to mock worker"),
+            crate::ipc::client::WorkerClient::connect(
+                mock.socket_path.clone(),
+                1,
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("connect to mock worker"),
         );
         let sup = Arc::new(WorkerSupervisor {
             spec: SpawnSpec {
@@ -1912,6 +1944,7 @@ mod tests {
             client_slot: Arc::new(RwLock::new(Some(client))),
             restart_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             socket_wait: Duration::from_secs(60),
+            ipc_timeout: Duration::from_secs(60),
             current_pid: Arc::new(std::sync::atomic::AtomicU32::new(child.id())),
             heartbeat_interval: Duration::from_secs(1),
             heartbeat_max_fails: 1,
@@ -1981,6 +2014,7 @@ mod tests {
             client_slot: Arc::new(RwLock::new(None)),
             restart_count: Arc::new(AtomicU64::new(0)),
             socket_wait: Duration::from_secs(60),
+            ipc_timeout: Duration::from_secs(60),
             current_pid: Arc::new(AtomicU32::new(0)),
             heartbeat_interval: Duration::ZERO,
             heartbeat_max_fails: 3,
