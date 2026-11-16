@@ -26,3 +26,5 @@ pub mod proc;
 
 // per-model waiter-queue configuration — accessible from integration tests.
 pub mod worker_waiters;
+// worker-process log filter (info default; `fmt::init()` alone filters at ERROR).
+pub mod worker_log;

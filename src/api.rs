@@ -37,8 +37,15 @@ pub async fn embeddings(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EmbedRequest>,
 ) -> impl IntoResponse {
-    // Reject new requests while draining.
+    // Reject new requests while draining. Counted (`status="shutdown"`) so the
+    // error-rate alert sees drain-time rejections; counter only, since a ~0 s
+    // observation would skew the latency histograms.
     if state.shutdown.is_cancelled() {
+        let requested = req.model.as_deref().unwrap_or(&state.default_model);
+        crate::metrics::count_request(
+            crate::metrics::bounded_model_label(requested, |m| state.models.contains_key(m)),
+            "shutdown",
+        );
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [("retry-after", "5")],
@@ -57,6 +64,12 @@ pub async fn embeddings(
     let mut texts_count: usize = 0;
 
     let model_name = req.model.unwrap_or_else(|| state.default_model.clone());
+    // `model_name` is caller input until the lookup below succeeds. Anything
+    // recorded before that uses the bounded label, so a client cannot mint
+    // series (a live `model="e5"` alias series already existed).
+    let metric_model =
+        crate::metrics::bounded_model_label(&model_name, |m| state.models.contains_key(m))
+            .to_string();
     let encoding_format = req.encoding_format.unwrap_or_default();
     let input_type = req.input_type.unwrap_or_default();
 
@@ -64,13 +77,13 @@ pub async fn embeddings(
     // before incurring any model-lookup or batcher cost.
     let texts = req.input.into_vec();
     if texts.is_empty() {
-        crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
+        crate::metrics::record_request(&metric_model, status, t0.elapsed(), texts_count);
         return error_json("input must not be empty").into_response();
     }
 
     // Always record the input array size — both accepted and rejected paths —
     // so operators can see the natural distribution and tune EMBED_MAX_INPUT_ARRAY.
-    crate::metrics::record_input_array_size(&model_name, texts.len());
+    crate::metrics::record_input_array_size(&metric_model, texts.len());
 
     // Server-side cap: reject oversized input arrays BEFORE the batcher.
     // B=100 × H=12 × S=512² × 4 = 1.258 GiB attention scratch per inference
@@ -86,8 +99,8 @@ pub async fn embeddings(
             model = %model_name,
             "input array exceeds cap; rejecting with 400"
         );
-        crate::metrics::record_input_array_rejected(&model_name, "size_cap");
-        crate::metrics::record_request(&model_name, status, t0.elapsed(), input_len);
+        crate::metrics::record_input_array_rejected(&metric_model, "size_cap");
+        crate::metrics::record_request(&metric_model, status, t0.elapsed(), input_len);
         return (
             StatusCode::BAD_REQUEST,
             Json(InputArrayTooLargeResponse {
@@ -109,7 +122,7 @@ pub async fn embeddings(
     let entry = match state.models.get(&model_name) {
         Some(e) => e,
         None => {
-            crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
+            crate::metrics::record_request(&metric_model, status, t0.elapsed(), texts_count);
             return error_json(format!("model '{model_name}' not found")).into_response();
         }
     };
@@ -981,6 +994,118 @@ mod tests {
             "embed_input_array_size histogram must appear in /metrics output \
              for both accepted and rejected requests"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // `model` label cardinality + drain-time 503 accounting (#197)
+    // ------------------------------------------------------------------
+
+    /// Current value of `embed_requests_total{model,status}` (0 when absent).
+    fn embed_requests(model: &str, status: &str) -> f64 {
+        let needle = format!("embed_requests_total{{model=\"{model}\",status=\"{status}\"}} ");
+        test_prom()
+            .render()
+            .lines()
+            .find_map(|l| l.strip_prefix(needle.as_str()))
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(0.0)
+    }
+
+    fn body_for(model: &str, n: usize) -> Request<Body> {
+        let inputs: Vec<String> = (0..n).map(|i| format!("t{i}")).collect();
+        Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"input": inputs, "model": model}).to_string(),
+            ))
+            .unwrap()
+    }
+
+    /// `make_state` with one configured model entry; `drain` cancels shutdown.
+    fn state_serving(model: &str, drain: bool) -> Arc<AppState> {
+        let mut st = Arc::try_unwrap(make_state(32)).unwrap_or_else(|_| unreachable!());
+        st.models.insert(
+            model.to_string(),
+            crate::types::ModelEntry {
+                model: None,
+                batcher: None,
+            },
+        );
+        if drain {
+            st.shutdown.cancel();
+        }
+        Arc::new(st)
+    }
+
+    /// A drain-time 503 was returned without any metric, so the error-rate
+    /// alert could not see it. It must count `status="shutdown"` under the
+    /// configured model's label.
+    #[tokio::test]
+    async fn shutdown_503_is_counted_under_the_configured_model() {
+        let model = "drain-known-model";
+        let before = embed_requests(model, "shutdown");
+        let resp = make_app(state_serving(model, true))
+            .oneshot(body_for(model, 1))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            embed_requests(model, "shutdown") - before,
+            1.0,
+            "drain-time 503 must increment embed_requests_total{{status=\"shutdown\"}}"
+        );
+    }
+
+    /// A caller-supplied model name that is not configured must never become a
+    /// label value, on the drain path or the lookup-failure path.
+    #[tokio::test]
+    async fn unconfigured_model_name_never_becomes_a_label() {
+        let drain_name = "client-alias-drain-xyz";
+        let miss_name = "client-alias-miss-xyz";
+        let unknown_shutdown = embed_requests("unknown", "shutdown");
+        let unknown_error = embed_requests("unknown", "error");
+
+        let r = make_app(state_serving("cfg-m", true))
+            .oneshot(body_for(drain_name, 1))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Not found (400) and over-cap (400, cap=32) both record before lookup.
+        for n in [1usize, 100] {
+            let r = make_app(state_serving("cfg-m", false))
+                .oneshot(body_for(miss_name, n))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        }
+
+        let rendered = test_prom().render();
+        for name in [drain_name, miss_name] {
+            assert!(
+                !rendered.contains(name),
+                "client-supplied model {name:?} leaked into a metric label:\n{rendered}"
+            );
+        }
+        // `>=`: other tests in this process may also land in the shared
+        // `unknown` bucket (an unconfigured `test-model`).
+        assert!(embed_requests("unknown", "shutdown") - unknown_shutdown >= 1.0);
+        assert!(embed_requests("unknown", "error") - unknown_error >= 2.0);
+    }
+
+    /// The bounded label must not erase the real name of a configured model.
+    #[tokio::test]
+    async fn configured_model_keeps_its_label_on_early_rejects() {
+        let model = "kept-label-model";
+        let before = embed_requests(model, "error");
+        let r = make_app(state_serving(model, false))
+            .oneshot(body_for(model, 100))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(embed_requests(model, "error") - before, 1.0);
     }
 
     // ------------------------------------------------------------------

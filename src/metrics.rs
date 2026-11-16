@@ -246,14 +246,42 @@ pub fn stamp_build_info(version: &str) {
     .set(1.0);
 }
 
-/// Record a completed request.
-pub fn record_request(model: &str, status: &str, duration: Duration, texts: usize) {
+/// `model` label value for a request naming a model this server does not
+/// serve. One bucket, so client-supplied names cannot mint series.
+pub const UNKNOWN_MODEL_LABEL: &str = "unknown";
+
+/// Map a client-supplied model name to a bounded metric label: the name itself
+/// when `is_configured` says the server serves it, [`UNKNOWN_MODEL_LABEL`]
+/// otherwise. Every `model` label written BEFORE the model lookup succeeds must
+/// go through this; after a successful lookup the name is already one of the
+/// configured set.
+pub fn bounded_model_label<'a>(
+    requested: &'a str,
+    is_configured: impl Fn(&str) -> bool,
+) -> &'a str {
+    if is_configured(requested) {
+        requested
+    } else {
+        UNKNOWN_MODEL_LABEL
+    }
+}
+
+/// Count one request outcome without touching the duration / size histograms.
+///
+/// For rejections that never started work (drain-time 503), where a ~0 s
+/// observation would only drag the latency quantiles down.
+pub fn count_request(model: &str, status: &str) {
     metrics::counter!(
         "embed_requests_total",
         "model" => model.to_string(),
         "status" => status.to_string()
     )
     .increment(1);
+}
+
+/// Record a completed request.
+pub fn record_request(model: &str, status: &str, duration: Duration, texts: usize) {
+    count_request(model, status);
     metrics::histogram!(
         "embed_request_duration_seconds",
         "model" => model.to_string()
@@ -1489,6 +1517,49 @@ pub fn worker_restart_inc(model: &str) {
         "model" => model.to_string()
     )
     .increment(1);
+}
+
+/// Count one FAILED supervisor respawn attempt (`spawn_one` returned `Err`).
+///
+/// `embed_worker_restart_total` moves only when a respawn succeeds, so a worker
+/// that cannot come back (corrupt model file, arena registration failure,
+/// missing mount) leaves it flat. Each failed attempt, one per backoff step
+/// (2 s doubling to a 60 s cap), increments this instead.
+pub fn worker_respawn_failure_inc(model: &str) {
+    metrics::counter!(
+        "embed_worker_respawn_failures_total",
+        "model" => model.to_string()
+    )
+    .increment(1);
+}
+
+/// Pre-touch [`worker_respawn_failure_inc`]'s series at 0 so "no failed
+/// respawns" is a present zero, not an absent series.
+pub fn worker_respawn_failure_touch(model: &str) {
+    metrics::counter!(
+        "embed_worker_respawn_failures_total",
+        "model" => model.to_string()
+    )
+    .absolute(0);
+}
+
+/// Publish `embed_worker_info{model,kind,metrics_port} 1` on the supervisor.
+///
+/// The worker-to-port assignment is positional (`EMBED_WORKER_METRICS_PORT_BASE`
+/// + spawn index), so a scrape target list kept by hand drifts when a model is
+/// added. This is the supervisor's own statement of which port serves which
+/// model: compare it with what Prometheus actually scrapes. `metrics_port` is
+/// `none` when worker metrics are disabled. Labels come from configured
+/// models, so cardinality is the number of workers.
+pub fn worker_info_set(model: &str, kind: &str, metrics_port: Option<u16>) {
+    let port = metrics_port.map_or_else(|| "none".to_string(), |p| p.to_string());
+    metrics::gauge!(
+        "embed_worker_info",
+        "model" => model.to_string(),
+        "kind" => kind.to_string(),
+        "metrics_port" => port
+    )
+    .set(1.0);
 }
 
 /// Pre-touch the worker-restart counter to 0 on supervisor startup.
