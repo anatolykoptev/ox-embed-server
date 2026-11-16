@@ -1271,6 +1271,105 @@ mod tests {
         );
     }
 
+    /// A worker on `sock` that records the `max_seq_len` of the Embed request
+    /// it last received and answers with one 2-d vector per text. No model.
+    fn spawn_recording_worker(sock: &std::path::Path) -> Arc<std::sync::atomic::AtomicU32> {
+        use crate::ipc::frame::{read_frame, write_frame};
+        use crate::ipc::protocol::{EmbedResponseOk, WorkerRequest, WorkerResponse};
+        let seen = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let listener = tokio::net::UnixListener::bind(sock).unwrap();
+        let rec = Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let rec = Arc::clone(&rec);
+                tokio::spawn(async move {
+                    // The connect probe (connect + drop) fails to decode: ignore it.
+                    let Ok(WorkerRequest::Embed(r)) =
+                        read_frame::<_, WorkerRequest>(&mut stream).await
+                    else {
+                        return;
+                    };
+                    rec.store(r.max_seq_len, std::sync::atomic::Ordering::Relaxed);
+                    let resp = WorkerResponse::Embed(EmbedResponseOk {
+                        request_id: r.request_id,
+                        vectors: vec![vec![0.5, 1.5]; r.texts.len()],
+                        dims: 2,
+                    });
+                    let _ = write_frame(&mut stream, &resp).await;
+                });
+            }
+        });
+        seen
+    }
+
+    /// The SUCCESS path through the worker pool, end to end: 200 with one
+    /// vector per input, the char/4 billing estimate in `usage`, and the same
+    /// estimate handed to the worker as `max_seq_len`. Every other test in
+    /// this module drives an error branch, so a handler that turned every
+    /// good answer into a 500 (the vector-count sanity check inverted) or
+    /// billed garbage went unnoticed.
+    ///
+    /// Found by cargo-mutants on `src/api.rs`: `/ 4.0` replaced by `% 4.0` or
+    /// `* 4.0` (both estimates) and `!= n_pending` replaced by `==` all
+    /// survived before this test.
+    #[tokio::test]
+    async fn embed_worker_success_returns_vectors_and_billing_estimate() {
+        let model = "success-model";
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("w.sock");
+        let seen = spawn_recording_worker(&sock);
+        let client = crate::ipc::client::WorkerClient::connect(sock, 1, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let pool = WorkerPool::with_dispatch_timeout(Duration::from_secs(5));
+        pool.add(WorkerSupervisor::for_test(
+            spec_for(model),
+            Arc::new(client),
+        ))
+        .await;
+
+        // 9 chars -> ceil(9 / 4) = 3 estimated tokens.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"input": ["abcdefghi"], "model": model}).to_string(),
+            ))
+            .unwrap();
+        let resp = make_app(state_with_pool(model, pool, HashMap::new()))
+            .oneshot(req)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a good worker answer is a 200"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["data"].as_array().map(Vec::len),
+            Some(1),
+            "one embedding per input: {json}"
+        );
+        assert_eq!(
+            json["data"][0]["embedding"].as_array().map(Vec::len),
+            Some(2),
+            "the worker's 2-d vector must be returned: {json}"
+        );
+        assert_eq!(json["usage"]["prompt_tokens"], 3, "char/4 estimate: {json}");
+        assert_eq!(json["usage"]["total_tokens"], 3, "char/4 estimate: {json}");
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "the worker must be told the estimated max sequence length"
+        );
+    }
+
     /// A dispatch timeout (worker respawning) is a 503 and was uncounted too.
     #[tokio::test]
     async fn embed_dispatch_timeout_is_counted() {

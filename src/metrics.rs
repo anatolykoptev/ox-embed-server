@@ -967,10 +967,10 @@ pub fn record_warmup_failed(model: &str, phase: &'static str) {
 /// Increment when an explicitly-set env var has an invalid value (zero,
 /// unparseable) and the system falls back to the default. Without this,
 /// operators can't detect config drift from typos (issue #101).
-pub fn record_config_fallback(env_var: &'static str) {
+pub fn record_config_fallback(env_var: &str) {
     metrics::counter!(
         "embed_config_fallback_total",
-        "env_var" => env_var
+        "env_var" => env_var.to_string()
     )
     .increment(1);
 }

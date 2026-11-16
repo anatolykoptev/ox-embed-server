@@ -40,13 +40,23 @@
 # Widening this list is the goal, not the exception: when a module gains
 # model-free coverage, add it here in the same PR.
 examine_globs = [
+    # HTTP handlers: status mapping, cache scatter and error classification
+    # live here, and their tests are model-free (they build `AppState` on a
+    # mock worker pool). All three compile into the bin target only, which
+    # `--bins` below runs.
+    "src/api.rs",
     "src/api_health.rs",
+    "src/api_rerank.rs",
+    "src/api_splade.rs",
     "src/batcher.rs",
     "src/cache.rs",
     "src/cache_flow.rs",
     "src/config.rs",
     "src/drain.rs",
     "src/evictable_pool.rs",
+    # IPC client: deadline / framing / error mapping against an in-process
+    # UDS peer, no model needed.
+    "src/ipc/client.rs",
     "src/ipc/frame.rs",
     "src/ipc/protocol.rs",
     "src/metrics.rs",

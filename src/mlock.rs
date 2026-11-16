@@ -205,13 +205,24 @@ fn try_mlock(buf: &[u8], path: &Path) -> bool {
 ///
 /// Default is enabled (`true`) — operators opt out rather than opt in.
 pub fn mlock_enabled() -> bool {
-    match std::env::var("EMBED_MLOCK_WEIGHTS").as_deref() {
-        Ok("0") | Ok("false") | Ok("False") | Ok("FALSE") => {
-            tracing::debug!("EMBED_MLOCK_WEIGHTS=0: mlock disabled");
-            false
-        }
-        _ => true,
+    // parsed-by: mlock_enabled_from
+    mlock_enabled_from(crate::env_parse::raw("EMBED_MLOCK_WEIGHTS").as_deref())
+}
+
+/// Pure half of [`mlock_enabled`]. An unrecognised value keeps mlock ON (the
+/// default) and is noted.
+fn mlock_enabled_from(raw: Option<&str>) -> bool {
+    let on = crate::env_parse::flag(
+        "EMBED_MLOCK_WEIGHTS",
+        raw,
+        true,
+        &["1", "true"],
+        &["0", "false"],
+    );
+    if !on {
+        tracing::debug!("EMBED_MLOCK_WEIGHTS=0: mlock disabled");
     }
+    on
 }
 
 #[cfg(test)]

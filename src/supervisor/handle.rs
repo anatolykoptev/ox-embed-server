@@ -23,7 +23,7 @@
 //! - Graceful shutdown via ControlMessage::Shutdown before kill_on_drop SIGKILL.
 
 use crate::ipc::client::WorkerClient;
-use crate::supervisor::util::resolve_duration_secs_env;
+use crate::supervisor::util::{resolve_duration_secs_env, resolve_worker_nice};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -261,6 +261,32 @@ pub struct SpawnSpec {
     pub env_extra: Vec<(String, String)>,
 }
 
+/// Lower the scheduling priority of the child to `nice` BEFORE it execs.
+///
+/// Must be a `pre_exec` hook, not a `setpriority(pid)` after `spawn`: the
+/// worker is `#[tokio::main]`, so by the time the parent could act the child
+/// already has runtime and ORT threads, and `setpriority(PRIO_PROCESS, pid)`
+/// moves only the main thread. A nice value set before `exec` is inherited by
+/// every thread the worker ever creates.
+///
+/// `0` installs nothing: the worker keeps the supervisor's priority.
+fn apply_nice(cmd: &mut Command, nice: i32) {
+    if nice == 0 {
+        return;
+    }
+    // SAFETY: the closure runs in the forked child before exec and calls only
+    // setpriority(2), which is async-signal-safe; it allocates nothing and
+    // takes no locks.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::setpriority(libc::PRIO_PROCESS as _, 0, nice) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 /// Actor that owns a single worker process and its UDS client.
 ///
 /// Callers query the live client via [`WorkerSupervisor::client`]; the field
@@ -350,44 +376,16 @@ impl WorkerSupervisor {
             Duration::from_secs(HEARTBEAT_INTERVAL_SECS),
             &format!("HEARTBEAT_INTERVAL_SECS ({HEARTBEAT_INTERVAL_SECS})"),
         );
-        let heartbeat_max_fails = match std::env::var("EMBED_WORKER_HEARTBEAT_MAX_FAILS") {
-            Ok(s) => match s.trim().parse::<u32>() {
-                Ok(0) => {
-                    tracing::warn!(
-                        "EMBED_WORKER_HEARTBEAT_MAX_FAILS=0 is invalid; defaulting to {HEARTBEAT_MAX_FAILS}"
-                    );
-                    HEARTBEAT_MAX_FAILS
-                }
-                Ok(v) => v,
-                Err(_) => {
-                    tracing::warn!(
-                        "EMBED_WORKER_HEARTBEAT_MAX_FAILS={s:?} is not a valid u32; defaulting to {HEARTBEAT_MAX_FAILS}"
-                    );
-                    HEARTBEAT_MAX_FAILS
-                }
-            },
-            Err(_) => HEARTBEAT_MAX_FAILS,
-        };
-        let heartbeat_probe_timeout = Duration::from_millis(
-            match std::env::var("EMBED_WORKER_HEARTBEAT_PROBE_TIMEOUT_MS") {
-                Ok(s) => match s.trim().parse::<u64>() {
-                    Ok(0) => {
-                        tracing::warn!(
-                            "EMBED_WORKER_HEARTBEAT_PROBE_TIMEOUT_MS=0 is invalid; defaulting to {HEARTBEAT_PROBE_TIMEOUT_MS}"
-                        );
-                        HEARTBEAT_PROBE_TIMEOUT_MS
-                    }
-                    Ok(v) => v,
-                    Err(_) => {
-                        tracing::warn!(
-                            "EMBED_WORKER_HEARTBEAT_PROBE_TIMEOUT_MS={s:?} is not a valid u64; defaulting to {HEARTBEAT_PROBE_TIMEOUT_MS}"
-                        );
-                        HEARTBEAT_PROBE_TIMEOUT_MS
-                    }
-                },
-                Err(_) => HEARTBEAT_PROBE_TIMEOUT_MS,
-            },
+        let heartbeat_max_fails = crate::env_parse::positive(
+            "EMBED_WORKER_HEARTBEAT_MAX_FAILS",
+            crate::env_parse::raw("EMBED_WORKER_HEARTBEAT_MAX_FAILS").as_deref(), // parsed-by: positive
+            HEARTBEAT_MAX_FAILS,
         );
+        let heartbeat_probe_timeout = Duration::from_millis(crate::env_parse::positive(
+            "EMBED_WORKER_HEARTBEAT_PROBE_TIMEOUT_MS",
+            crate::env_parse::raw("EMBED_WORKER_HEARTBEAT_PROBE_TIMEOUT_MS").as_deref(), // parsed-by: positive
+            HEARTBEAT_PROBE_TIMEOUT_MS,
+        ));
 
         // Freshness window — distinct from the probe interval. Default is
         // 3× the resolved interval so retuning the interval scales the window
@@ -525,6 +523,11 @@ impl WorkerSupervisor {
             .kill_on_drop(true);
         for (k, v) in &spec.env_extra {
             cmd.env(k, v);
+        }
+        let nice = resolve_worker_nice(&spec.model);
+        apply_nice(&mut cmd, nice);
+        if nice != 0 {
+            tracing::info!(model = %spec.model, nice, "worker scheduling priority lowered");
         }
         let mut child = cmd.spawn().map_err(|e| {
             tracing::error!(model = %spec.model, error = %e, "worker spawn failed");
@@ -2338,6 +2341,116 @@ mod tests {
         assert!(
             !freshness_window_is_inert(Duration::from_secs(90), Duration::from_secs(15)),
             "the 90s default window with a 15s probe timeout is healthy"
+        );
+    }
+
+    /// Field 19 (`nice`) of a `/proc/<pid>/stat` line. The `comm` field may
+    /// contain spaces, so count from the closing paren.
+    fn nice_from_stat(stat: &str) -> i32 {
+        let after = &stat[stat.rfind(')').expect("comm paren") + 2..];
+        // `after` starts at field 3 (state); nice is field 19.
+        after
+            .split_whitespace()
+            .nth(16)
+            .expect("nice field")
+            .parse()
+            .expect("nice is an integer")
+    }
+
+    fn own_nice() -> i32 {
+        nice_from_stat(&std::fs::read_to_string("/proc/self/stat").expect("read own stat"))
+    }
+
+    /// A nice value that differs from the test process's own, so the
+    /// assertion cannot pass by inheritance (CI and the build box both run
+    /// tests under `nice`).
+    fn distinct_nice() -> i32 {
+        if own_nice() >= 10 { 19 } else { 10 }
+    }
+
+    /// `apply_nice` must set the child's nice before exec. A `sleep` child is
+    /// enough: the hook is the only thing that can make it differ from ours.
+    ///
+    /// RED-proven: deleting the `cmd.pre_exec(..)` statement in `apply_nice`
+    /// leaves the child at our own nice and fails the assertion
+    /// "child nice must be ...".
+    #[tokio::test]
+    async fn apply_nice_sets_child_priority_before_exec() {
+        let want = distinct_nice();
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30").kill_on_drop(true);
+        apply_nice(&mut cmd, want);
+        let child = cmd.spawn().expect("spawn sleep");
+        let pid = child.id().expect("child pid");
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read child stat");
+        assert_eq!(
+            nice_from_stat(&stat),
+            want,
+            "child nice must be {want} (own nice {}): {stat}",
+            own_nice()
+        );
+    }
+
+    /// `apply_nice(_, 0)` installs no hook: the child keeps our priority.
+    #[tokio::test]
+    async fn apply_nice_zero_leaves_priority_unchanged() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30").kill_on_drop(true);
+        apply_nice(&mut cmd, 0);
+        let child = cmd.spawn().expect("spawn sleep");
+        let pid = child.id().expect("child pid");
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read child stat");
+        assert_eq!(nice_from_stat(&stat), own_nice(), "{stat}");
+    }
+
+    /// The SPAWN PATH: `spawn_one` must resolve `EMBED_WORKER_NICE_<MODEL>`
+    /// and apply it to the worker it launches. A fake worker records its own
+    /// `/proc/self/stat` and then never opens the socket, so `spawn_one`
+    /// returns Err after `socket_wait`; the recording is what is asserted.
+    ///
+    /// RED-proven: deleting the `apply_nice(&mut cmd, nice);` call in
+    /// `spawn_one` makes the recorded nice equal our own and fails with
+    /// "worker spawned by spawn_one must run at nice ...".
+    #[tokio::test]
+    #[serial]
+    async fn spawn_one_applies_worker_nice_from_env() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let want = distinct_nice();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("worker-stat.txt");
+        let script = dir.path().join("fake-worker.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncat /proc/$$/stat > \"$FAKE_WORKER_OUT\"\nexec sleep 30\n",
+        )
+        .expect("write script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod script");
+        let spec = SpawnSpec {
+            model: "nice-probe".into(),
+            kind: WorkerKind::Embed,
+            worker_bin: script,
+            socket_dir: dir.path().to_path_buf(),
+            pool_size: 1,
+            intra_threads: 1,
+            env_extra: vec![("FAKE_WORKER_OUT".into(), out.to_string_lossy().into_owned())],
+        };
+        let var = "EMBED_WORKER_NICE_NICE_PROBE";
+        unsafe { std::env::set_var(var, want.to_string()) };
+        let res = WorkerSupervisor::spawn_one(
+            &spec,
+            Duration::from_millis(1500),
+            Duration::from_secs(60),
+        )
+        .await;
+        unsafe { std::env::remove_var(var) };
+        assert!(res.is_err(), "the fake worker never opens a socket");
+        let stat = std::fs::read_to_string(&out).expect("fake worker recorded its stat");
+        assert_eq!(
+            nice_from_stat(&stat),
+            want,
+            "worker spawned by spawn_one must run at nice {want} (own nice {}): {stat}",
+            own_nice()
         );
     }
 }

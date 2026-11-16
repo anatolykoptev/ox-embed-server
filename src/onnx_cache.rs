@@ -80,6 +80,7 @@ impl CacheDir {
 
         // Per-model env takes precedence over global.
         if let Ok(raw) = std::env::var(&per_model_key) {
+            // env-raw: a path, no parse
             let trimmed = raw.trim();
             if !trimmed.is_empty() {
                 return Self::from_path(Path::new(trimmed));
@@ -103,7 +104,7 @@ impl CacheDir {
     /// For new call sites prefer `from_env_for_model` which adds per-model
     /// override support via `ONNX_OPT_CACHE_DIR_<MODEL_KEY_UPPER>`.
     pub fn from_env() -> Option<Self> {
-        let raw = std::env::var("ONNX_OPT_CACHE_DIR").ok()?;
+        let raw = std::env::var("ONNX_OPT_CACHE_DIR").ok()?; // env-raw: a path, no parse
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             return None;

@@ -380,13 +380,13 @@ impl Config {
     ///   The 7th segment is optional; omitting it defaults to `model_quantized.onnx`.
     /// - `EMBED_DEFAULT_MODEL`: default model name (default: first)
     pub fn from_env() -> Result<Self, String> {
-        let port = env::var("EMBED_PORT")
+        let port = env::var("EMBED_PORT") // env-strict: a bad port fails startup below
             .unwrap_or_else(|_| "8082".into())
             .parse::<u16>()
             .map_err(|e| format!("invalid EMBED_PORT: {e}"))?;
 
-        let models_str =
-            env::var("EMBED_MODELS").map_err(|_| "EMBED_MODELS env var is required")?;
+        let models_str = env::var("EMBED_MODELS") // env-strict: required, parse errors abort startup
+            .map_err(|_| "EMBED_MODELS env var is required")?;
 
         // Resolve global batch_max_seq and warmup_seq_len BEFORE parsing
         // models so per-model env overrides can fall back to them.
@@ -400,24 +400,20 @@ impl Config {
         // which is intentional — "max" and "unset" have the same effect on
         // models that haven't set a per-model override).
         let global_batch_max_seq_for_models =
-            parse_batch_max_seq(env::var("BATCH_MAX_SEQ").ok().as_deref());
-        let global_warmup_for_models: Option<usize> =
-            match env::var("EMBED_WARMUP_SEQ_LEN").ok().as_deref() {
-                None | Some("") => None, // unset → each model defaults to Some(max_len)
-                Some(raw) => {
-                    let t = raw.trim();
-                    if t.eq_ignore_ascii_case("max") {
-                        None // "max" keyword → all models get None (pad to max_len)
-                    } else {
-                        // Explicit number or garbage — parse_embed_warmup_seq_len
-                        // handles defaults/validation; we re-parse here to avoid
-                        // duplicating that logic. The returned Some(n) is then
-                        // used as the global fallback in parse_one_model.
-                        parse_embed_warmup_seq_len(Some(t))
-                    }
-                }
-            };
-
+            // parsed-by: parse_batch_max_seq
+            parse_batch_max_seq(crate::env_parse::raw("BATCH_MAX_SEQ").as_deref());
+        // Parsed ONCE: parse_embed_warmup_seq_len notes a bad value, and two
+        // parses of the same variable would count it twice.
+        // parsed-by: parse_embed_warmup_seq_len
+        let warmup_raw = crate::env_parse::raw("EMBED_WARMUP_SEQ_LEN");
+        let embed_warmup_seq_len = parse_embed_warmup_seq_len(warmup_raw.as_deref());
+        let global_warmup_for_models: Option<usize> = match warmup_raw.as_deref() {
+            // unset → each model defaults to Some(max_len)
+            None | Some("") => None,
+            // "max" → None (pad to max_len); a number or garbage → the parsed
+            // value, which parse_one_model uses as the global fallback.
+            Some(_) => embed_warmup_seq_len,
+        };
         let models = parse_models_with_globals(
             &models_str,
             global_batch_max_seq_for_models,
@@ -427,8 +423,8 @@ impl Config {
             return Err("EMBED_MODELS must define at least one model".into());
         }
 
-        let default_model =
-            env::var("EMBED_DEFAULT_MODEL").unwrap_or_else(|_| models[0].name.clone());
+        let default_model = env::var("EMBED_DEFAULT_MODEL") // env-strict: unknown name aborts startup below
+            .unwrap_or_else(|_| models[0].name.clone());
 
         if !models.iter().any(|m| m.name == default_model) {
             return Err(format!(
@@ -449,13 +445,16 @@ impl Config {
         // at the cost of ~10–20 % solo-inference latency. Operators on
         // dedicated-CPU hosts can override back to 4.
         let intra_threads = {
-            let raw = env::var("EMBED_INTRA_THREADS")
+            let raw = env::var("EMBED_INTRA_THREADS") // env-strict: garbage aborts startup
                 .unwrap_or_else(|_| "2".into())
                 .parse::<usize>()
                 .map_err(|e| format!("invalid EMBED_INTRA_THREADS: {e}"))?;
             if raw == 0 {
-                tracing::warn!(
-                    "EMBED_INTRA_THREADS=0 is not supported (would mean ORT auto-select, but our session pool expects an explicit count). Falling back to 2."
+                crate::env_parse::note_fallback(
+                    "EMBED_INTRA_THREADS",
+                    "0",
+                    "a positive integer (0 would mean ORT auto-select, but the session pool expects an explicit count)",
+                    &2,
                 );
                 2
             } else {
@@ -463,81 +462,100 @@ impl Config {
             }
         };
 
-        let embed_pool_size =
-            parse_embed_pool_size(env::var("EMBED_SESSION_POOL_SIZE").ok().as_deref(), None);
-
-        let reranker_pool_size =
-            parse_reranker_pool_size(env::var("RERANKER_SESSION_POOL_SIZE").ok().as_deref());
+        // parsed-by: parse_embed_pool_size
+        let embed_pool_size = parse_embed_pool_size(
+            crate::env_parse::raw("EMBED_SESSION_POOL_SIZE").as_deref(),
+            None,
+        );
+        // parsed-by: parse_reranker_pool_size
+        let reranker_pool_size = parse_reranker_pool_size(
+            crate::env_parse::raw("RERANKER_SESSION_POOL_SIZE").as_deref(),
+        );
 
         // `RERANKER_INTRA_THREADS` defaults to `intra_threads` so unset
         // means "share the embedder budget" (today's behaviour). Set
         // explicitly when raising pool_size to keep total reranker
         // threads under control without changing embedder threads.
-        let reranker_intra_threads = env::var("RERANKER_INTRA_THREADS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or(intra_threads);
-
-        let batching_enabled = env::var("BATCHING_ENABLED")
-            .ok()
-            .map(|s| s.eq_ignore_ascii_case("true") || s == "1")
-            .unwrap_or(false);
-
-        let batch_max = env::var("BATCH_MAX")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(32usize);
+        let reranker_intra_threads = crate::env_parse::positive(
+            "RERANKER_INTRA_THREADS",
+            crate::env_parse::raw("RERANKER_INTRA_THREADS").as_deref(), // parsed-by: positive
+            intra_threads,
+        );
+        let batching_enabled = crate::env_parse::flag(
+            "BATCHING_ENABLED",
+            crate::env_parse::raw("BATCHING_ENABLED").as_deref(), // parsed-by: flag
+            false,
+            &["true", "1"],
+            &["false", "0"],
+        );
+        let batch_max = crate::env_parse::any(
+            "BATCH_MAX",
+            crate::env_parse::raw("BATCH_MAX").as_deref(), // parsed-by: any
+            32usize,
+            "a non-negative integer",
+        );
 
         // Reranker-specific item cap. Defaults to 4× embed batch_max so a
         // single env (`BATCH_MAX=8`) can keep embed-side cache-thrash
         // mitigation while the reranker still coalesces 4 concurrent
         // multi-doc calls. Operators can override with RERANKER_BATCH_MAX
         // when they want a different ratio.
-        let reranker_batch_max = env::var("RERANKER_BATCH_MAX")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(batch_max.saturating_mul(4));
-
-        let batch_max_tokens = parse_batch_max_tokens(env::var("BATCH_MAX_TOKENS").ok().as_deref());
-
-        let batch_max_seq = parse_batch_max_seq(env::var("BATCH_MAX_SEQ").ok().as_deref());
-
-        let batch_wait_ms = env::var("BATCH_WAIT_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(10u64);
-
-        let max_queue_size = env::var("MAX_QUEUE_SIZE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256usize);
-
-        let drain_timeout_s = env::var("DRAIN_TIMEOUT_S")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(10u64);
+        let reranker_batch_max = crate::env_parse::any(
+            "RERANKER_BATCH_MAX",
+            crate::env_parse::raw("RERANKER_BATCH_MAX").as_deref(), // parsed-by: any
+            batch_max.saturating_mul(4),
+            "a non-negative integer",
+        );
+        // parsed-by: parse_batch_max_tokens
+        let batch_max_tokens =
+            parse_batch_max_tokens(crate::env_parse::raw("BATCH_MAX_TOKENS").as_deref());
+        let batch_max_seq = global_batch_max_seq_for_models; // parsed once, above
+        let batch_wait_ms = crate::env_parse::any(
+            "BATCH_WAIT_MS",
+            crate::env_parse::raw("BATCH_WAIT_MS").as_deref(), // parsed-by: any
+            10u64,
+            "a non-negative integer",
+        );
+        let max_queue_size = crate::env_parse::any(
+            "MAX_QUEUE_SIZE",
+            crate::env_parse::raw("MAX_QUEUE_SIZE").as_deref(), // parsed-by: any
+            256usize,
+            "a non-negative integer",
+        );
+        let drain_timeout_s = crate::env_parse::any(
+            "DRAIN_TIMEOUT_S",
+            crate::env_parse::raw("DRAIN_TIMEOUT_S").as_deref(), // parsed-by: any
+            10u64,
+            "a non-negative integer",
+        );
 
         // AUTO_TRUNCATE defaults to true (TEI-compat). Only the literal
         // string "false" (case-insensitive) disables it; anything else
         // keeps the safe default.
-        let auto_truncate = env::var("AUTO_TRUNCATE")
-            .ok()
-            .map(|s| !s.eq_ignore_ascii_case("false"))
-            .unwrap_or(true);
-
+        //
+        // `0` / `no` / a typo keep truncation ON (as before) but are now noted:
+        // only `false` turns it off.
+        let auto_truncate = crate::env_parse::flag(
+            "AUTO_TRUNCATE",
+            crate::env_parse::raw("AUTO_TRUNCATE").as_deref(), // parsed-by: flag
+            true,
+            &["true", "1"],
+            &["false"],
+        );
+        // parsed-by: parse_cache_max_entries
         let cache_max_entries =
-            parse_cache_max_entries(env::var("CACHE_MAX_ENTRIES").ok().as_deref());
-
-        let token_cache_max_entries =
-            parse_token_cache_max_entries(env::var("TOKEN_CACHE_MAX_ENTRIES").ok().as_deref());
+            parse_cache_max_entries(crate::env_parse::raw("CACHE_MAX_ENTRIES").as_deref());
+        // parsed-by: parse_token_cache_max_entries
+        let token_cache_max_entries = parse_token_cache_max_entries(
+            crate::env_parse::raw("TOKEN_CACHE_MAX_ENTRIES").as_deref(),
+        );
 
         // `RERANKER_MODELS` is optional: unset or empty → no rerankers,
         // server boots serving only `/v1/embeddings`. `/v1/rerank` with
         // any model name will 400. Errors here only on malformed entries
         // (bad integer fields, wrong colon count) — a strict
         // fail-at-boot contract matching `EMBED_MODELS`.
-        let rerankers = env::var("RERANKER_MODELS")
+        let rerankers = env::var("RERANKER_MODELS") // env-strict: malformed entries abort startup
             .ok()
             .map(|s| parse_rerankers(&s))
             .transpose()?
@@ -545,127 +563,77 @@ impl Config {
 
         // `SPLADE_MODELS` follows the same contract as `RERANKER_MODELS`:
         // unset/empty → no SPLADE endpoints; malformed → fail boot.
-        let splades = env::var("SPLADE_MODELS")
+        let splades = env::var("SPLADE_MODELS") // env-strict: malformed entries abort startup
             .ok()
             .map(|s| parse_splades(&s))
             .transpose()?
             .unwrap_or_default();
 
+        // parsed-by: parse_splade_pool_size
         let splade_pool_size =
-            parse_splade_pool_size(env::var("SPLADE_SESSION_POOL_SIZE").ok().as_deref());
+            parse_splade_pool_size(crate::env_parse::raw("SPLADE_SESSION_POOL_SIZE").as_deref());
 
         // SPLADE_INTRA_THREADS defaults to `intra_threads` (share embedder
         // budget when unset), same fallback as RERANKER_INTRA_THREADS.
-        let splade_intra_threads = env::var("SPLADE_INTRA_THREADS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or(intra_threads);
+        let splade_intra_threads = crate::env_parse::positive(
+            "SPLADE_INTRA_THREADS",
+            crate::env_parse::raw("SPLADE_INTRA_THREADS").as_deref(), // parsed-by: positive
+            intra_threads,
+        );
 
         // Per-kind warmup shape lists. Defaults are tuned to the prod
         // traffic shape we already know about (memdb's batch=5 fanout,
         // texts_per_req=8 embed default, single-text splade) — the
         // unset path MUST get the cold-start fix, hence non-empty
         // defaults rather than `[]` when the env var is absent.
+        // parsed-by: parse_warmup_batch_sizes
         let rerank_warmup_batch_sizes = parse_warmup_batch_sizes(
-            env::var("RERANK_WARMUP_BATCH_SIZES").ok().as_deref(),
+            "RERANK_WARMUP_BATCH_SIZES",
+            crate::env_parse::raw("RERANK_WARMUP_BATCH_SIZES").as_deref(),
             &[1, 5],
         );
+        // parsed-by: parse_warmup_batch_sizes
         let embed_warmup_batch_sizes = parse_warmup_batch_sizes(
-            env::var("EMBED_WARMUP_BATCH_SIZES").ok().as_deref(),
+            "EMBED_WARMUP_BATCH_SIZES",
+            crate::env_parse::raw("EMBED_WARMUP_BATCH_SIZES").as_deref(),
             &[1, 8],
         );
-        let splade_warmup_batch_sizes =
-            parse_warmup_batch_sizes(env::var("SPLADE_WARMUP_BATCH_SIZES").ok().as_deref(), &[1]);
-
-        let embed_warmup_seq_len =
-            parse_embed_warmup_seq_len(env::var("EMBED_WARMUP_SEQ_LEN").ok().as_deref());
-
-        let idle_evict_secs = match env::var("EMBED_IDLE_EVICT_SECS") {
-            Ok(raw) => match raw.trim().parse::<u64>() {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(
-                        value = %raw,
-                        error = %e,
-                        "EMBED_IDLE_EVICT_SECS parse failed; defaulting to 0 (eviction disabled)"
-                    );
-                    0
-                }
-            },
-            Err(_) => 0,
-        };
-
-        let embed_max_input_array = match env::var("EMBED_MAX_INPUT_ARRAY") {
-            Ok(raw) => match raw.trim().parse::<usize>() {
-                Ok(v) if v > 0 => v,
-                Ok(_) => {
-                    tracing::warn!(
-                        value = %raw,
-                        "EMBED_MAX_INPUT_ARRAY must be > 0; defaulting to 32"
-                    );
-                    32
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        value = %raw,
-                        error = %e,
-                        "EMBED_MAX_INPUT_ARRAY parse failed; defaulting to 32"
-                    );
-                    32
-                }
-            },
-            Err(_) => 32,
-        };
-
-        let rerank_max_input_docs = match env::var("RERANK_MAX_INPUT_DOCS") {
-            Ok(raw) => match raw.trim().parse::<usize>() {
-                Ok(v) if v > 0 => v,
-                Ok(_) => {
-                    tracing::warn!(
-                        value = %raw,
-                        "RERANK_MAX_INPUT_DOCS must be > 0; defaulting to 32"
-                    );
-                    32
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        value = %raw,
-                        error = %e,
-                        "RERANK_MAX_INPUT_DOCS parse failed; defaulting to 32"
-                    );
-                    32
-                }
-            },
-            Err(_) => 32,
-        };
-
+        // parsed-by: parse_warmup_batch_sizes
+        let splade_warmup_batch_sizes = parse_warmup_batch_sizes(
+            "SPLADE_WARMUP_BATCH_SIZES",
+            crate::env_parse::raw("SPLADE_WARMUP_BATCH_SIZES").as_deref(),
+            &[1],
+        );
+        let idle_evict_secs = crate::env_parse::any(
+            "EMBED_IDLE_EVICT_SECS",
+            crate::env_parse::raw("EMBED_IDLE_EVICT_SECS").as_deref(), // parsed-by: any
+            0u64,
+            "a non-negative integer (0 disables eviction)",
+        );
+        let embed_max_input_array = crate::env_parse::positive(
+            "EMBED_MAX_INPUT_ARRAY",
+            crate::env_parse::raw("EMBED_MAX_INPUT_ARRAY").as_deref(), // parsed-by: positive
+            32usize,
+        );
+        let rerank_max_input_docs = crate::env_parse::positive(
+            "RERANK_MAX_INPUT_DOCS",
+            crate::env_parse::raw("RERANK_MAX_INPUT_DOCS").as_deref(), // parsed-by: positive
+            32usize,
+        );
+        // parsed-by: parse_multi_process_flag
         let multi_process =
-            parse_multi_process_flag(env::var("EMBED_MULTI_PROCESS").as_deref().ok());
-        let worker_bin_path = env::var("EMBED_WORKER_BIN")
+            parse_multi_process_flag(crate::env_parse::raw("EMBED_MULTI_PROCESS").as_deref());
+        let worker_bin_path = env::var("EMBED_WORKER_BIN") // env-raw: a path, no parse
             .unwrap_or_else(|_| "/usr/local/bin/embed-worker".into())
             .into();
-        let worker_socket_dir = env::var("EMBED_WORKER_SOCKET_DIR")
+        let worker_socket_dir = env::var("EMBED_WORKER_SOCKET_DIR") // env-raw: a path, no parse
             .unwrap_or_else(|_| "/tmp/embed-workers".into())
             .into();
-
-        let ready_probe_timeout_ms = match env::var("EMBED_READY_PROBE_TIMEOUT_MS") {
-            Ok(s) => match s.trim().parse::<u64>() {
-                Ok(0) => {
-                    tracing::warn!("EMBED_READY_PROBE_TIMEOUT_MS=0 is invalid; defaulting to 2000");
-                    2000
-                }
-                Ok(v) => v,
-                Err(_) => {
-                    tracing::warn!(
-                        "EMBED_READY_PROBE_TIMEOUT_MS={s:?} is not a valid u64; defaulting to 2000"
-                    );
-                    2000
-                }
-            },
-            Err(_) => 2000,
-        };
-
+        let ready_probe_timeout_ms = crate::env_parse::positive(
+            "EMBED_READY_PROBE_TIMEOUT_MS",
+            crate::env_parse::raw("EMBED_READY_PROBE_TIMEOUT_MS").as_deref(), // parsed-by: positive
+            2000u64,
+        );
         Ok(Config {
             port,
             models,
@@ -710,10 +678,7 @@ impl Config {
 /// Exposed for testing; env lookup stays in `from_env`.
 fn parse_cache_max_entries(raw: Option<&str>) -> usize {
     const DEFAULT: usize = 10_000;
-    match raw {
-        None => DEFAULT,
-        Some(s) => s.trim().parse::<usize>().unwrap_or(DEFAULT),
-    }
+    crate::env_parse::any("CACHE_MAX_ENTRIES", raw, DEFAULT, "a non-negative integer")
 }
 
 /// Parse `TOKEN_CACHE_MAX_ENTRIES` env value.
@@ -731,10 +696,12 @@ fn parse_cache_max_entries(raw: Option<&str>) -> usize {
 /// Exposed for testing; env lookup stays in `from_env`.
 fn parse_token_cache_max_entries(raw: Option<&str>) -> usize {
     const DEFAULT: usize = 0; // disabled by default
-    match raw {
-        None => DEFAULT,
-        Some(s) => s.trim().parse::<usize>().unwrap_or(DEFAULT),
-    }
+    crate::env_parse::any(
+        "TOKEN_CACHE_MAX_ENTRIES",
+        raw,
+        DEFAULT,
+        "a non-negative integer",
+    )
 }
 
 /// Parse `BATCH_MAX_TOKENS` env value. Unset, empty, unparseable, or `0` →
@@ -743,18 +710,7 @@ fn parse_token_cache_max_entries(raw: Option<&str>) -> usize {
 /// with a warn rather than silently accepted. Exposed for testing; env
 /// lookup stays in `from_env`.
 fn parse_batch_max_tokens(raw: Option<&str>) -> usize {
-    const DEFAULT: usize = 16384;
-    match raw {
-        None => DEFAULT,
-        Some(s) => match s.trim().parse::<usize>() {
-            Ok(0) => {
-                tracing::warn!("BATCH_MAX_TOKENS=0 is invalid; falling back to default {DEFAULT}");
-                DEFAULT
-            }
-            Ok(n) => n,
-            Err(_) => DEFAULT,
-        },
-    }
+    crate::env_parse::positive("BATCH_MAX_TOKENS", raw, 16384usize)
 }
 
 /// Parse `BATCH_MAX_SEQ` env value.
@@ -768,18 +724,7 @@ fn parse_batch_max_tokens(raw: Option<&str>) -> usize {
 ///
 /// Exposed for testing; env lookup stays in `from_env`.
 fn parse_batch_max_seq(raw: Option<&str>) -> usize {
-    const DEFAULT: usize = 256;
-    match raw {
-        None => DEFAULT,
-        Some(s) => match s.trim().parse::<usize>() {
-            Ok(0) => {
-                tracing::warn!("BATCH_MAX_SEQ=0 is invalid; falling back to default {DEFAULT}");
-                DEFAULT
-            }
-            Ok(n) => n,
-            Err(_) => DEFAULT,
-        },
-    }
+    crate::env_parse::positive("BATCH_MAX_SEQ", raw, 256usize)
 }
 
 /// Parse `EMBED_WARMUP_SEQ_LEN` env value.
@@ -808,22 +753,11 @@ fn parse_embed_warmup_seq_len(raw: Option<&str>) -> Option<usize> {
             if trimmed.eq_ignore_ascii_case("max") {
                 return None;
             }
-            match trimmed.parse::<usize>() {
-                Ok(0) => {
-                    tracing::warn!(
-                        "EMBED_WARMUP_SEQ_LEN=0 is invalid; falling back to default {DEFAULT}"
-                    );
-                    Some(DEFAULT)
-                }
-                Ok(n) => Some(n),
-                Err(_) => {
-                    tracing::warn!(
-                        "EMBED_WARMUP_SEQ_LEN={trimmed:?} is not a valid usize; \
-                         falling back to default {DEFAULT}"
-                    );
-                    Some(DEFAULT)
-                }
-            }
+            Some(crate::env_parse::positive(
+                "EMBED_WARMUP_SEQ_LEN",
+                Some(trimmed),
+                DEFAULT,
+            ))
         }
     }
 }
@@ -843,17 +777,7 @@ fn parse_embed_warmup_seq_len(raw: Option<&str>) -> Option<usize> {
 fn parse_embed_pool_size(raw: Option<&str>, source_key: Option<&str>) -> usize {
     const DEFAULT: usize = 1;
     let key = source_key.unwrap_or("EMBED_SESSION_POOL_SIZE");
-    match raw {
-        None => DEFAULT,
-        Some(s) => match s.trim().parse::<usize>() {
-            Ok(0) => {
-                tracing::warn!("{key}=0 is invalid; falling back to default {DEFAULT}");
-                DEFAULT
-            }
-            Ok(n) => n,
-            Err(_) => DEFAULT,
-        },
-    }
+    crate::env_parse::positive(key, raw, DEFAULT)
 }
 
 /// Convert a model key (e.g. `"jina-code-v2"`) to the SCREAMING_SNAKE_CASE
@@ -903,7 +827,8 @@ pub(crate) fn resolve_embed_pool_size_for_model(
 fn pool_size_for_model(model_key: &str, global_raw: Option<&str>) -> (usize, Option<String>) {
     let suffix = model_env_key(model_key);
     let per_model_key = format!("EMBED_SESSION_POOL_SIZE_{suffix}");
-    if let Ok(raw) = env::var(&per_model_key) {
+    // parsed-by: parse_embed_pool_size
+    if let Some(raw) = crate::env_parse::raw(&per_model_key) {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
             let parsed = parse_embed_pool_size(Some(trimmed), Some(per_model_key.as_str()));
@@ -938,7 +863,8 @@ pub(crate) fn resolve_ipc_timeout(model_name: &str) -> std::time::Duration {
     let suffix = model_env_key(model_name);
     let per_model_key = format!("EMBED_IPC_TIMEOUT_SECS_{suffix}");
     for key in [per_model_key.as_str(), "EMBED_IPC_TIMEOUT_SECS"] {
-        let Ok(raw) = env::var(key) else {
+        // parsed-by: resolve_ipc_timeout
+        let Some(raw) = crate::env_parse::raw(key) else {
             continue;
         };
         match raw.trim().parse::<u64>() {
@@ -946,20 +872,12 @@ pub(crate) fn resolve_ipc_timeout(model_name: &str) -> std::time::Duration {
                 tracing::info!(model = %model_name, env = %key, secs = n, "IPC request deadline");
                 return std::time::Duration::from_secs(n);
             }
-            Ok(_) => {
-                tracing::warn!(
-                    env_key = %key,
-                    value = %raw,
-                    "{key}=0 is invalid; using the next fallback"
-                );
-            }
-            Err(_) => {
-                tracing::warn!(
-                    env_key = %key,
-                    value = %raw,
-                    "{key} is not a valid u64; using the next fallback"
-                );
-            }
+            _ => crate::env_parse::note_fallback(
+                key,
+                raw.trim(),
+                "a positive integer number of seconds",
+                &"the next fallback",
+            ),
         }
     }
     std::time::Duration::from_secs(DEFAULT_IPC_TIMEOUT_SECS)
@@ -1001,7 +919,8 @@ pub(crate) fn resolve_embed_concurrency_for_model(
     );
 
     // 1. Per-model override.
-    if let Ok(raw) = env::var(&per_model_key) {
+    // parsed-by: resolve_embed_concurrency_for_model
+    if let Some(raw) = crate::env_parse::raw(&per_model_key) {
         match raw.trim().parse::<usize>() {
             Ok(0) => {
                 tracing::info!(
@@ -1020,14 +939,12 @@ pub(crate) fn resolve_embed_concurrency_for_model(
                 );
                 return Some(n);
             }
-            Err(_) => {
-                tracing::warn!(
-                    model = %model_name,
-                    env = %per_model_key,
-                    value = %raw,
-                    "per-model embed concurrency cap is not a valid usize; using the next fallback"
-                );
-            }
+            Err(_) => crate::env_parse::note_fallback(
+                &per_model_key,
+                raw.trim(),
+                "a non-negative integer (0 disables the cap)",
+                &"the next fallback",
+            ),
         }
     }
 
@@ -1048,13 +965,12 @@ pub(crate) fn resolve_embed_concurrency_for_model(
                 );
                 return Some(n);
             }
-            Err(_) => {
-                tracing::warn!(
-                    env_key = "MAX_CONCURRENT_EMBED_REQUESTS",
-                    value = %raw,
-                    "MAX_CONCURRENT_EMBED_REQUESTS is not a valid usize; using the auto default"
-                );
-            }
+            Err(_) => crate::env_parse::note_fallback(
+                "MAX_CONCURRENT_EMBED_REQUESTS",
+                raw.trim(),
+                "a non-negative integer (0 disables the cap)",
+                &"the auto default (pool x intra x 8, floor 16)",
+            ),
         }
     }
 
@@ -1080,10 +996,13 @@ pub(crate) fn resolve_embed_concurrency_for_model(
 ///
 /// Extracted as a pure function so it can be unit-tested without env mutation.
 pub(crate) fn parse_multi_process_flag(raw: Option<&str>) -> bool {
-    match raw {
-        Some(v) => v == "1" || v.eq_ignore_ascii_case("true"),
-        None => false,
-    }
+    crate::env_parse::flag(
+        "EMBED_MULTI_PROCESS",
+        raw,
+        false,
+        &["1", "true"],
+        &["0", "false"],
+    )
 }
 
 /// Parse `EMBED_MEMORY_PATTERN_<MODEL_UPPER>` env value.
@@ -1096,22 +1015,8 @@ pub(crate) fn parse_multi_process_flag(raw: Option<&str>) -> bool {
 ///
 /// Exposed for testing and for reranker/splade loaders; env lookup stays
 /// in the caller.
-pub(crate) fn parse_memory_pattern(raw: Option<&str>) -> bool {
-    match raw {
-        None | Some("") => true,
-        Some(s) => match s.trim() {
-            "true" | "1" => true,
-            "false" | "0" => false,
-            other => {
-                tracing::warn!(
-                    raw = %other,
-                    "EMBED_MEMORY_PATTERN_* is not a valid bool (true|false|1|0); \
-                     falling back to default true"
-                );
-                true
-            }
-        },
-    }
+pub(crate) fn parse_memory_pattern(var: &str, raw: Option<&str>) -> bool {
+    crate::env_parse::flag(var, raw, true, &["true", "1"], &["false", "0"])
 }
 
 /// Parse `RERANKER_SESSION_POOL_SIZE` env value. Unset, empty, or
@@ -1121,20 +1026,7 @@ pub(crate) fn parse_memory_pattern(raw: Option<&str>) -> bool {
 /// "0 is invalid, fall back" stance as `BATCH_MAX_TOKENS=0`. Exposed for
 /// testing; env lookup stays in `from_env`.
 fn parse_reranker_pool_size(raw: Option<&str>) -> usize {
-    const DEFAULT: usize = 1;
-    match raw {
-        None => DEFAULT,
-        Some(s) => match s.trim().parse::<usize>() {
-            Ok(0) => {
-                tracing::warn!(
-                    "RERANKER_SESSION_POOL_SIZE=0 is invalid; falling back to default {DEFAULT}"
-                );
-                DEFAULT
-            }
-            Ok(n) => n,
-            Err(_) => DEFAULT,
-        },
-    }
+    crate::env_parse::positive("RERANKER_SESSION_POOL_SIZE", raw, 1usize)
 }
 
 /// Parse comma-separated model definitions.
@@ -1205,41 +1097,25 @@ fn parse_one_model(
     let key = model_env_key(&name);
 
     // Per-model batch_max_seq: BATCH_MAX_SEQ_<KEY>. Falls back to global.
-    let batch_max_seq = env::var(format!("BATCH_MAX_SEQ_{key}"))
-        .ok()
-        .and_then(|v| {
-            let trimmed = v.trim().to_string();
-            match trimmed.parse::<usize>() {
-                Ok(0) => {
-                    tracing::warn!(
-                        model = %name,
-                        "BATCH_MAX_SEQ_{key}=0 is invalid; using global {global_batch_max_seq}"
-                    );
-                    None
-                }
-                Ok(n) => {
-                    tracing::info!(
-                        model = %name,
-                        per_model_batch_max_seq = n,
-                        "per-model BATCH_MAX_SEQ override"
-                    );
-                    Some(n)
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        model = %name,
-                        raw = %trimmed,
-                        "BATCH_MAX_SEQ_{key} is not a valid usize; using global {global_batch_max_seq}"
-                    );
-                    None
-                }
-            }
-        })
-        .unwrap_or(global_batch_max_seq);
+    let bms_var = format!("BATCH_MAX_SEQ_{key}");
+    // Unusable (garbage or 0) → the global value, noted by `positive`.
+    let batch_max_seq =
+        crate::env_parse::raw(&bms_var) // parsed-by: positive
+            .map(|v| crate::env_parse::positive(&bms_var, Some(&v), global_batch_max_seq))
+            .unwrap_or(global_batch_max_seq);
+    if batch_max_seq != global_batch_max_seq {
+        tracing::info!(
+            model = %name,
+            per_model_batch_max_seq = batch_max_seq,
+            "per-model BATCH_MAX_SEQ override"
+        );
+    }
 
     // Per-model warmup_seq_len: EMBED_WARMUP_SEQ_LEN_<KEY>.
     // Precedence: per-model env > global_warmup_seq_len > Some(max_len).
-    let warmup_seq_len = if let Ok(raw) = env::var(format!("EMBED_WARMUP_SEQ_LEN_{key}")) {
+    let wsl_var = format!("EMBED_WARMUP_SEQ_LEN_{key}");
+    // parsed-by: parse_one_model
+    let warmup_seq_len = if let Some(raw) = crate::env_parse::raw(&wsl_var) {
         // Per-model override set.
         let trimmed = raw.trim();
         if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("max") {
@@ -1250,9 +1126,11 @@ fn parse_one_model(
             match trimmed.parse::<usize>() {
                 Ok(0) => {
                     let fallback = global_warmup_seq_len.unwrap_or(max_len);
-                    tracing::warn!(
-                        model = %name,
-                        "EMBED_WARMUP_SEQ_LEN_{key}=0 invalid; using {fallback}"
+                    crate::env_parse::note_fallback(
+                        &wsl_var,
+                        trimmed,
+                        "a positive integer or \"max\"",
+                        &fallback,
                     );
                     Some(fallback)
                 }
@@ -1266,10 +1144,11 @@ fn parse_one_model(
                 }
                 Err(_) => {
                     let fallback = global_warmup_seq_len.unwrap_or(max_len);
-                    tracing::warn!(
-                        model = %name,
-                        raw = %trimmed,
-                        "EMBED_WARMUP_SEQ_LEN_{key} is not a valid usize; using {fallback}"
+                    crate::env_parse::note_fallback(
+                        &wsl_var,
+                        trimmed,
+                        "a positive integer or \"max\"",
+                        &fallback,
                     );
                     Some(fallback)
                 }
@@ -1312,13 +1191,12 @@ fn parse_one_model(
     // Per-model memory_pattern: EMBED_MEMORY_PATTERN_<KEY>.
     // Default true (back-compat). Set to false for models with variable seq
     // shapes (e.g. jina-code-v2) to avoid BFCArena monotonic fill.
-    let memory_pattern = parse_memory_pattern(
-        env::var(format!("EMBED_MEMORY_PATTERN_{key}"))
-            .ok()
-            .as_deref(),
-    );
+    let mp_var = format!("EMBED_MEMORY_PATTERN_{key}");
+    // parsed-by: parse_memory_pattern
+    let memory_pattern = parse_memory_pattern(&mp_var, crate::env_parse::raw(&mp_var).as_deref());
     tracing::info!(model = %name, memory_pattern, "session config");
     let input_prefix = crate::input_prefix::InputPrefix::parse(
+        // env-strict: an unparseable value aborts startup (map_err below)
         env::var(format!("EMBED_INPUT_PREFIX_{key}"))
             .ok()
             .as_deref(),
@@ -1469,7 +1347,7 @@ fn parse_one_splade(entry: &str) -> Result<SpladeModelDef, String> {
 ///     production.
 ///
 /// Exposed for testing; env lookup stays in `from_env`.
-fn parse_warmup_batch_sizes(raw: Option<&str>, defaults: &[usize]) -> Vec<usize> {
+fn parse_warmup_batch_sizes(key: &str, raw: Option<&str>, defaults: &[usize]) -> Vec<usize> {
     let Some(s) = raw else {
         return defaults.to_vec();
     };
@@ -1514,11 +1392,11 @@ fn parse_warmup_batch_sizes(raw: Option<&str>, defaults: &[usize]) -> Vec<usize>
         // env-quoting artefact, not a configuration mistake).
         let trimmed_full = s.trim();
         if !trimmed_full.is_empty() && trimmed_full.chars().any(|c| c != ',') {
-            tracing::warn!(
-                raw = %s,
-                bad_tokens = ?bad_tokens,
-                defaults = ?defaults,
-                "*_WARMUP_BATCH_SIZES had no valid positive integers; falling back to defaults"
+            crate::env_parse::note_fallback(
+                key,
+                s,
+                "comma-separated positive integers",
+                &format!("{defaults:?}"),
             );
         }
         return defaults.to_vec();
@@ -1526,10 +1404,14 @@ fn parse_warmup_batch_sizes(raw: Option<&str>, defaults: &[usize]) -> Vec<usize>
 
     if !bad_tokens.is_empty() {
         tracing::warn!(
-            raw = %s,
             bad_tokens = ?bad_tokens,
-            kept = ?out,
-            "*_WARMUP_BATCH_SIZES had unparseable or zero entries; warming with the rest"
+            "{key} had unparseable or zero entries; warming with the valid ones"
+        );
+        crate::env_parse::note_fallback(
+            key,
+            s,
+            "comma-separated positive integers",
+            &format!("the valid entries {out:?}"),
         );
     }
 
@@ -1541,20 +1423,7 @@ fn parse_warmup_batch_sizes(raw: Option<&str>, defaults: &[usize]) -> Vec<usize>
 /// garbage → fall back. Kept as a separate function so the warn
 /// message names the right env var (operators grep for the literal).
 fn parse_splade_pool_size(raw: Option<&str>) -> usize {
-    const DEFAULT: usize = 1;
-    match raw {
-        None => DEFAULT,
-        Some(s) => match s.trim().parse::<usize>() {
-            Ok(0) => {
-                tracing::warn!(
-                    "SPLADE_SESSION_POOL_SIZE=0 is invalid; falling back to default {DEFAULT}"
-                );
-                DEFAULT
-            }
-            Ok(n) => n,
-            Err(_) => DEFAULT,
-        },
-    }
+    crate::env_parse::positive("SPLADE_SESSION_POOL_SIZE", raw, 1usize)
 }
 
 #[cfg(test)]
@@ -1946,33 +1815,57 @@ mod tests {
         // production traffic uses (1 + memdb's batch=5, or embed's
         // texts_per_req=8). Otherwise the feature is off-by-default and
         // the cold-path latency spike persists.
-        assert_eq!(parse_warmup_batch_sizes(None, &[1, 5]), vec![1, 5]);
-        assert_eq!(parse_warmup_batch_sizes(None, &[1]), vec![1]);
-        assert_eq!(parse_warmup_batch_sizes(None, &[1, 8]), vec![1, 8]);
+        assert_eq!(
+            parse_warmup_batch_sizes("T_WARMUP_BATCH_SIZES", None, &[1, 5]),
+            vec![1, 5]
+        );
+        assert_eq!(
+            parse_warmup_batch_sizes("T_WARMUP_BATCH_SIZES", None, &[1]),
+            vec![1]
+        );
+        assert_eq!(
+            parse_warmup_batch_sizes("T_WARMUP_BATCH_SIZES", None, &[1, 8]),
+            vec![1, 8]
+        );
     }
 
     #[test]
     fn warmup_batch_sizes_parses_csv_in_order() {
         // Order matters — operator picks "compile this first" by ordering
         // the list. We do not sort.
-        assert_eq!(parse_warmup_batch_sizes(Some("1,5"), &[1, 5]), vec![1, 5]);
-        assert_eq!(parse_warmup_batch_sizes(Some("5,1"), &[1, 5]), vec![5, 1]);
         assert_eq!(
-            parse_warmup_batch_sizes(Some("1,2,5,10"), &[1]),
+            parse_warmup_batch_sizes("T_WARMUP_BATCH_SIZES", Some("1,5"), &[1, 5]),
+            vec![1, 5]
+        );
+        assert_eq!(
+            parse_warmup_batch_sizes("T_WARMUP_BATCH_SIZES", Some("5,1"), &[1, 5]),
+            vec![5, 1]
+        );
+        assert_eq!(
+            parse_warmup_batch_sizes("T_WARMUP_BATCH_SIZES", Some("1,2,5,10"), &[1]),
             vec![1, 2, 5, 10]
         );
         // Whitespace tolerance — env quoting in compose files is fragile.
-        assert_eq!(parse_warmup_batch_sizes(Some("  1 , 5 "), &[1]), vec![1, 5]);
+        assert_eq!(
+            parse_warmup_batch_sizes("T_WARMUP_BATCH_SIZES", Some("  1 , 5 "), &[1]),
+            vec![1, 5]
+        );
     }
 
     #[test]
     fn warmup_batch_sizes_dedups_preserving_order() {
         // Duplicates collapse to first occurrence — keeps total warmup
         // time bounded when an operator pastes "1,5,1" by accident.
-        assert_eq!(parse_warmup_batch_sizes(Some("3,5,3"), &[1]), vec![3, 5]);
-        assert_eq!(parse_warmup_batch_sizes(Some("1,1,1"), &[1]), vec![1]);
         assert_eq!(
-            parse_warmup_batch_sizes(Some("1,5,1,5,8"), &[1]),
+            parse_warmup_batch_sizes("T_WARMUP_BATCH_SIZES", Some("3,5,3"), &[1]),
+            vec![3, 5]
+        );
+        assert_eq!(
+            parse_warmup_batch_sizes("T_WARMUP_BATCH_SIZES", Some("1,1,1"), &[1]),
+            vec![1]
+        );
+        assert_eq!(
+            parse_warmup_batch_sizes("T_WARMUP_BATCH_SIZES", Some("1,5,1,5,8"), &[1]),
             vec![1, 5, 8]
         );
     }
@@ -1982,10 +1875,16 @@ mod tests {
         // 0 would `% 0` panic in any per-batch dispatch loop. Negatives
         // can't parse as usize. Both get dropped without falling back —
         // the rest of the list is still useful.
-        assert_eq!(parse_warmup_batch_sizes(Some("0,1,5"), &[1]), vec![1, 5]);
-        assert_eq!(parse_warmup_batch_sizes(Some("1,-3,5"), &[1]), vec![1, 5]);
         assert_eq!(
-            parse_warmup_batch_sizes(Some("0"), &[1, 5]),
+            parse_warmup_batch_sizes("T_WARMUP_BATCH_SIZES", Some("0,1,5"), &[1]),
+            vec![1, 5]
+        );
+        assert_eq!(
+            parse_warmup_batch_sizes("T_WARMUP_BATCH_SIZES", Some("1,-3,5"), &[1]),
+            vec![1, 5]
+        );
+        assert_eq!(
+            parse_warmup_batch_sizes("T_WARMUP_BATCH_SIZES", Some("0"), &[1, 5]),
             vec![1, 5],
             "all-zero CSV must fall back to defaults, not return empty"
         );
@@ -1995,9 +1894,12 @@ mod tests {
     fn warmup_batch_sizes_skips_unparseable_keeps_valid() {
         // Single typo in the middle should not kill warmup for the other
         // shapes — drop the bad token, keep the rest.
-        assert_eq!(parse_warmup_batch_sizes(Some("1,nope,5"), &[1]), vec![1, 5]);
         assert_eq!(
-            parse_warmup_batch_sizes(Some("garbage"), &[1, 5]),
+            parse_warmup_batch_sizes("T_WARMUP_BATCH_SIZES", Some("1,nope,5"), &[1]),
+            vec![1, 5]
+        );
+        assert_eq!(
+            parse_warmup_batch_sizes("T_WARMUP_BATCH_SIZES", Some("garbage"), &[1, 5]),
             vec![1, 5],
             "all-garbage must fall back to defaults so prod still warms"
         );
@@ -2009,9 +1911,18 @@ mod tests {
         // defaults. An operator who unsets warmup has to write something
         // explicit ("the warmup feature has no documented disable knob"
         // — same stance as the reranker pool size's `0` rejection).
-        assert_eq!(parse_warmup_batch_sizes(Some(""), &[1, 5]), vec![1, 5]);
-        assert_eq!(parse_warmup_batch_sizes(Some("   "), &[1, 5]), vec![1, 5]);
-        assert_eq!(parse_warmup_batch_sizes(Some(",,"), &[1, 5]), vec![1, 5]);
+        assert_eq!(
+            parse_warmup_batch_sizes("T_WARMUP_BATCH_SIZES", Some(""), &[1, 5]),
+            vec![1, 5]
+        );
+        assert_eq!(
+            parse_warmup_batch_sizes("T_WARMUP_BATCH_SIZES", Some("   "), &[1, 5]),
+            vec![1, 5]
+        );
+        assert_eq!(
+            parse_warmup_batch_sizes("T_WARMUP_BATCH_SIZES", Some(",,"), &[1, 5]),
+            vec![1, 5]
+        );
     }
 
     // -----------------------------------------------------------------
@@ -2267,27 +2178,33 @@ mod tests {
     #[test]
     fn parse_per_model_memory_pattern_default_true() {
         // Unset → true (backwards-compatible default).
-        assert!(parse_memory_pattern(None));
-        assert!(parse_memory_pattern(Some("")));
+        assert!(parse_memory_pattern("EMBED_MEMORY_PATTERN_T", None));
+        assert!(parse_memory_pattern("EMBED_MEMORY_PATTERN_T", Some("")));
     }
 
     #[test]
     fn parse_per_model_memory_pattern_env_false() {
         // EMBED_MEMORY_PATTERN_JINA_CODE_V2=false → false for jina.
         // e5-large has no override → stays true.
-        assert!(!parse_memory_pattern(Some("false")));
-        assert!(!parse_memory_pattern(Some("0")));
+        assert!(!parse_memory_pattern(
+            "EMBED_MEMORY_PATTERN_T",
+            Some("false")
+        ));
+        assert!(!parse_memory_pattern("EMBED_MEMORY_PATTERN_T", Some("0")));
         // e5-large (no per-model env) defaults to true.
-        assert!(parse_memory_pattern(None));
+        assert!(parse_memory_pattern("EMBED_MEMORY_PATTERN_T", None));
     }
 
     #[test]
     fn parse_per_model_memory_pattern_invalid_value_defaults_true() {
         // Garbage → warn + default true (same fallback posture as other
         // bool knobs in this codebase).
-        assert!(parse_memory_pattern(Some("garbage")));
-        assert!(parse_memory_pattern(Some("nope")));
-        assert!(parse_memory_pattern(Some("2")));
+        assert!(parse_memory_pattern(
+            "EMBED_MEMORY_PATTERN_T",
+            Some("garbage")
+        ));
+        assert!(parse_memory_pattern("EMBED_MEMORY_PATTERN_T", Some("nope")));
+        assert!(parse_memory_pattern("EMBED_MEMORY_PATTERN_T", Some("2")));
     }
 
     #[test]
@@ -3016,5 +2933,117 @@ mod config_reachability {
                 describe_arg(arg)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod env_fallback_tests {
+    use super::*;
+
+    // ── Garbage is noted: one assertion per parse site ──────────────────────
+    //
+    // Each pure parser below used to fall back with at best a `warn!` and no
+    // counter; `embed_config_fallback_total` read 0 while a typo ran on the
+    // default (#151). The table pins, per parser, that garbage keeps the
+    // default AND increments the counter under the variable's own name.
+
+    fn counted(f: impl FnOnce()) -> String {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, f);
+        handle.render()
+    }
+
+    #[test]
+    fn every_parser_counts_garbage_and_keeps_its_default() {
+        type Case = (&'static str, Box<dyn Fn() -> String>, String);
+        let cases: Vec<Case> = vec![
+            (
+                "CACHE_MAX_ENTRIES",
+                Box::new(|| parse_cache_max_entries(Some("lots")).to_string()),
+                "10000".into(),
+            ),
+            (
+                "TOKEN_CACHE_MAX_ENTRIES",
+                Box::new(|| parse_token_cache_max_entries(Some("lots")).to_string()),
+                "0".into(),
+            ),
+            (
+                "BATCH_MAX_TOKENS",
+                Box::new(|| parse_batch_max_tokens(Some("x")).to_string()),
+                "16384".into(),
+            ),
+            (
+                "BATCH_MAX_SEQ",
+                Box::new(|| parse_batch_max_seq(Some("0")).to_string()),
+                "256".into(),
+            ),
+            (
+                "EMBED_WARMUP_SEQ_LEN",
+                Box::new(|| format!("{:?}", parse_embed_warmup_seq_len(Some("x")))),
+                "Some(128)".into(),
+            ),
+            (
+                "EMBED_SESSION_POOL_SIZE",
+                Box::new(|| parse_embed_pool_size(Some("x"), None).to_string()),
+                "1".into(),
+            ),
+            (
+                "RERANKER_SESSION_POOL_SIZE",
+                Box::new(|| parse_reranker_pool_size(Some("x")).to_string()),
+                "1".into(),
+            ),
+            (
+                "SPLADE_SESSION_POOL_SIZE",
+                Box::new(|| parse_splade_pool_size(Some("0")).to_string()),
+                "1".into(),
+            ),
+            (
+                "EMBED_WARMUP_BATCH_SIZES",
+                Box::new(|| {
+                    format!(
+                        "{:?}",
+                        parse_warmup_batch_sizes("EMBED_WARMUP_BATCH_SIZES", Some("x,y"), &[1, 8])
+                    )
+                }),
+                "[1, 8]".into(),
+            ),
+            (
+                "EMBED_MULTI_PROCESS",
+                Box::new(|| parse_multi_process_flag(Some("yes")).to_string()),
+                "false".into(),
+            ),
+            (
+                "EMBED_MEMORY_PATTERN_X",
+                Box::new(|| {
+                    parse_memory_pattern("EMBED_MEMORY_PATTERN_X", Some("maybe")).to_string()
+                }),
+                "true".into(),
+            ),
+        ];
+        for (key, run, want) in &cases {
+            let mut got = String::new();
+            let out = counted(|| got = run());
+            assert_eq!(&got, want, "{key}: garbage must keep the default");
+            assert!(
+                out.contains(&format!(
+                    "embed_config_fallback_total{{env_var=\"{key}\"}} 1"
+                )),
+                "{key}: a garbage value must be counted in embed_config_fallback_total:\n{out}"
+            );
+        }
+    }
+
+    /// The warmup-batch-size list keeps its valid neighbours of a bad token:
+    /// that partial fallback is noted too, not only the all-bad one.
+    #[test]
+    fn warmup_batch_sizes_partial_garbage_is_counted() {
+        let mut got = vec![];
+        let out = counted(|| got = parse_warmup_batch_sizes("W", Some("1,x,5"), &[2]));
+        assert_eq!(got, vec![1, 5]);
+        assert!(
+            out.contains("embed_config_fallback_total{env_var=\"W\"} 1"),
+            "{out}"
+        );
     }
 }

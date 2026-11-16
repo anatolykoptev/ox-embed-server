@@ -93,11 +93,7 @@ pub fn configure_truncation(
 /// `GraphOptimizationLevel`. Defaults to `Level3` (all optimizations) when
 /// the variable is unset or unparseable.
 fn parse_opt_level() -> GraphOptimizationLevel {
-    let raw = std::env::var("ORT_OPT_LEVEL")
-        .ok()
-        .and_then(|s| s.parse::<u8>().ok())
-        .unwrap_or(3);
-    match raw {
+    match crate::env_parse::ort_opt_level() {
         0 => GraphOptimizationLevel::Disable,
         1 => GraphOptimizationLevel::Level1,
         2 => GraphOptimizationLevel::Level2,
@@ -832,6 +828,7 @@ fn resolve_batch_invariant(model_key: &str) -> Result<bool, String> {
         "EMBED_BATCH_INVARIANT_{}",
         crate::config::model_env_key(model_key)
     );
+    // env-strict: an unparseable value is an error (parse_batch_invariant)
     let raw = std::env::var(&per_model)
         .ok()
         .or_else(|| std::env::var("EMBED_BATCH_INVARIANT").ok());
@@ -872,10 +869,15 @@ fn resolve_subbatch_ratio(model_key: &str) -> f32 {
         "EMBED_SUBBATCH_RATIO_{}",
         crate::config::model_env_key(model_key)
     );
-    let raw = std::env::var(&per_model)
-        .ok()
-        .or_else(|| std::env::var("EMBED_SUBBATCH_RATIO").ok());
-    parse_subbatch_ratio(raw.as_deref(), "EMBED_SUBBATCH_RATIO*")
+    // The per-model var wins; a set-but-garbage per-model value is noted under
+    // its own name rather than silently handing over to the global.
+    // parsed-by: parse_subbatch_ratio
+    if let Some(raw) = crate::env_parse::raw(&per_model) {
+        return parse_subbatch_ratio(Some(&raw), &per_model);
+    }
+    // parsed-by: parse_subbatch_ratio
+    let raw = crate::env_parse::raw("EMBED_SUBBATCH_RATIO");
+    parse_subbatch_ratio(raw.as_deref(), "EMBED_SUBBATCH_RATIO")
 }
 
 /// Pure half of [`resolve_subbatch_ratio`], split out so the fallback
@@ -886,11 +888,11 @@ pub(crate) fn parse_subbatch_ratio(raw: Option<&str>, var: &str) -> f32 {
         Some(s) => match s.trim().parse::<f32>() {
             Ok(v) if v.is_finite() && v >= 0.0 => v,
             _ => {
-                tracing::warn!(
-                    raw = %s,
+                crate::env_parse::note_fallback(
                     var,
-                    default = DEFAULT_SUBBATCH_RATIO,
-                    "sub-batch ratio is not a finite non-negative float; using default"
+                    s,
+                    "a finite non-negative float",
+                    &DEFAULT_SUBBATCH_RATIO,
                 );
                 DEFAULT_SUBBATCH_RATIO
             }
@@ -1448,7 +1450,8 @@ mod session_load_decision_tests {
 /// `EMBED_MEMORY_PATTERN_<MODEL>` convention.
 pub(crate) fn arena_shrink_enabled_for_model(model_name: &str, memory_pattern: bool) -> bool {
     let key = crate::config::model_env_key(model_name);
-    let env_val = std::env::var(format!("EMBED_ARENA_SHRINK_{key}")).ok();
+    // parsed-by: arena_shrink_enabled_for_model
+    let env_val = crate::env_parse::raw(&format!("EMBED_ARENA_SHRINK_{key}"));
     match env_val.as_deref() {
         Some("true") | Some("1") => {
             tracing::info!(
@@ -1470,10 +1473,11 @@ pub(crate) fn arena_shrink_enabled_for_model(model_name: &str, memory_pattern: b
             // Operator typo (e.g. "yes" / "on" / "enabled"). Mirror the
             // warn-on-failure pattern from `parse_memory_pattern` (config.rs)
             // so misconfiguration is visible rather than silently auto-gated.
-            tracing::warn!(
-                model = %model_name,
-                value = %other,
-                "EMBED_ARENA_SHRINK_{key} unrecognised value (expected true/false/1/0/auto/empty); falling back to auto-gate (memory_pattern={memory_pattern})"
+            crate::env_parse::note_fallback(
+                &format!("EMBED_ARENA_SHRINK_{key}"),
+                other,
+                "true/false/1/0/auto/empty",
+                &format!("auto-gate (shrink={})", !memory_pattern),
             );
             !memory_pattern
         }

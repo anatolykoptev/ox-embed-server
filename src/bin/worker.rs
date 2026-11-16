@@ -81,7 +81,7 @@ fn install_worker_metrics(model_name: &str) -> PrometheusHandle {
         .install_recorder()
         .expect("install Prometheus recorder in worker");
 
-    let port_str = std::env::var("EMBED_WORKER_METRICS_PORT").ok();
+    let port_str = std::env::var("EMBED_WORKER_METRICS_PORT").ok(); // env-strict: a bad value is noted in the Err arm below and disables the listener
     if let Some(raw) = port_str {
         match raw.trim().parse::<u16>() {
             Ok(port) => {
@@ -91,7 +91,7 @@ fn install_worker_metrics(model_name: &str) -> PrometheusHandle {
                 // scrape. Operator may set EMBED_WORKER_METRICS_BIND to
                 // "127.0.0.1" for host-only / single-process dev where
                 // exposure is undesired.
-                let bind = std::env::var("EMBED_WORKER_METRICS_BIND")
+                let bind = std::env::var("EMBED_WORKER_METRICS_BIND") // env-strict: a bad value is noted in the Err arm below
                     .unwrap_or_else(|_| "0.0.0.0".to_string());
                 let addr: std::net::SocketAddr = match format!("{}:{}", bind, port).parse() {
                     Ok(a) => a,
@@ -99,6 +99,12 @@ fn install_worker_metrics(model_name: &str) -> PrometheusHandle {
                         tracing::error!(
                             model = %model_name, port, bind = %bind, error = %e,
                             "EMBED_WORKER_METRICS_BIND invalid; falling back to 0.0.0.0"
+                        );
+                        embed_server::env_parse::note_fallback(
+                            "EMBED_WORKER_METRICS_BIND",
+                            &bind,
+                            "an IP address",
+                            &"0.0.0.0",
                         );
                         ([0u8, 0, 0, 0], port).into()
                     }
@@ -150,9 +156,11 @@ fn install_worker_metrics(model_name: &str) -> PrometheusHandle {
                 });
             }
             Err(_) => {
-                tracing::warn!(
-                    EMBED_WORKER_METRICS_PORT = %raw.trim(),
-                    "EMBED_WORKER_METRICS_PORT is not a valid port; metrics HTTP server disabled"
+                embed_server::env_parse::note_fallback(
+                    "EMBED_WORKER_METRICS_PORT",
+                    raw.trim(),
+                    "a TCP port 0..=65535",
+                    &"metrics HTTP server disabled",
                 );
             }
         }
@@ -223,6 +231,7 @@ fn register_arena_for_worker(model_name: &str) -> anyhow::Result<()> {
 
 fn require_env(var: &str) -> anyhow::Result<String> {
     std::env::var(var).map_err(|_e| {
+        // env-strict: missing aborts startup
         tracing::error!(var, "required environment variable missing");
         anyhow::anyhow!("required env var missing: {var}")
     })
@@ -249,13 +258,14 @@ impl LoadedModel {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let kind = std::env::var("EMBED_WORKER_KIND").unwrap_or_else(|_| "embed".into());
+    let kind = std::env::var("EMBED_WORKER_KIND") // env-strict: an unknown kind aborts startup below
+        .unwrap_or_else(|_| "embed".into());
     let model_name = require_env("EMBED_WORKER_MODEL")?;
     let socket_path: PathBuf = require_env("EMBED_WORKER_SOCKET")?.into();
-    let intra_threads: usize = std::env::var("EMBED_WORKER_INTRA_THREADS")
+    let intra_threads: usize = std::env::var("EMBED_WORKER_INTRA_THREADS") // env-strict: garbage aborts startup via `?`
         .unwrap_or_else(|_| INTRA_THREADS.to_string())
         .parse()?;
-    let pool_size: usize = std::env::var("EMBED_WORKER_POOL_SIZE")
+    let pool_size: usize = std::env::var("EMBED_WORKER_POOL_SIZE") // env-strict: garbage aborts startup via `?`
         .unwrap_or_else(|_| POOL_SIZE.to_string())
         .parse()?;
 

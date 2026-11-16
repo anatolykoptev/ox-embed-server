@@ -70,11 +70,7 @@ use crate::onnx_cache::{self, CacheDir, LoadPlan};
 /// Parse `ORT_OPT_LEVEL` the same way `EmbedModel` and `RerankerModel`
 /// do — single shared knob for the whole process.
 fn parse_opt_level() -> GraphOptimizationLevel {
-    let raw = std::env::var("ORT_OPT_LEVEL")
-        .ok()
-        .and_then(|s| s.parse::<u8>().ok())
-        .unwrap_or(3);
-    match raw {
+    match crate::env_parse::ort_opt_level() {
         0 => GraphOptimizationLevel::Disable,
         1 => GraphOptimizationLevel::Level1,
         2 => GraphOptimizationLevel::Level2,
@@ -141,11 +137,10 @@ impl SpladeModel {
         // precedence over the global ONNX_OPT_CACHE_DIR.
         let cache = CacheDir::from_env_for_model(name);
         let key = crate::config::model_env_key(name);
-        let memory_pattern = crate::config::parse_memory_pattern(
-            std::env::var(format!("EMBED_MEMORY_PATTERN_{key}"))
-                .ok()
-                .as_deref(),
-        );
+        let mp_var = format!("EMBED_MEMORY_PATTERN_{key}");
+        // parsed-by: parse_memory_pattern
+        let memory_pattern =
+            crate::config::parse_memory_pattern(&mp_var, crate::env_parse::raw(&mp_var).as_deref());
         tracing::info!(
             path = %onnx_path.display(),
             ?opt_level,

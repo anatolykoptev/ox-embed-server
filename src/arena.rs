@@ -178,6 +178,7 @@ pub fn init_arena_config_for_model(model_key: &str) -> ArenaCfg {
         let suffix = crate::config::model_env_key(model_key);
         let per_model_key = format!("EMBED_ARENA_MAX_MEM_BYTES_{suffix}");
         match std::env::var(&per_model_key) {
+            // env-strict: unparseable value panics in parse_bytes_with_suffix
             Ok(raw) => {
                 let trimmed = raw.trim();
                 // Use the same suffix-aware parser as the global path so
@@ -244,6 +245,7 @@ pub fn init_arena_config_for_model(model_key: &str) -> ArenaCfg {
 /// Panics if the variable is set but cannot be parsed.
 fn parse_usize_env(key: &str, default: usize) -> usize {
     match std::env::var(key) {
+        // env-strict: unparseable value panics in parse_bytes_with_suffix
         Ok(v) => parse_bytes_with_suffix(key, v.trim()),
         Err(_) => default,
     }
@@ -286,6 +288,7 @@ pub(crate) fn parse_bytes_with_suffix(env_key: &str, s: &str) -> usize {
 
 fn parse_i32_env(key: &str, default: i32) -> i32 {
     match std::env::var(key) {
+        // env-strict: unparseable value panics
         Ok(v) => v.trim().parse::<i32>().unwrap_or_else(|_| {
             panic!("{key} must be an integer, got {v:?}");
         }),
@@ -305,9 +308,19 @@ fn parse_i32_env(key: &str, default: i32) -> i32 {
 /// Shared by all three model kinds (embed, reranker, splade) so the
 /// env knob is consistent across the process.
 pub(crate) fn parse_intra_op_spinning() -> bool {
-    matches!(
-        std::env::var("ORT_INTRA_OP_SPINNING").as_deref(),
-        Ok("1") | Ok("true") | Ok("yes")
+    // parsed-by: parse_intra_op_spinning_from
+    parse_intra_op_spinning_from(crate::env_parse::raw("ORT_INTRA_OP_SPINNING").as_deref())
+}
+
+/// Pure half of [`parse_intra_op_spinning`]. Anything that is not a
+/// recognised boolean (`on`, `Yes`, a typo) is noted and keeps spinning off.
+fn parse_intra_op_spinning_from(raw: Option<&str>) -> bool {
+    crate::env_parse::flag(
+        "ORT_INTRA_OP_SPINNING",
+        raw,
+        false,
+        &["1", "true", "yes"],
+        &["0", "false", "no"],
     )
 }
 

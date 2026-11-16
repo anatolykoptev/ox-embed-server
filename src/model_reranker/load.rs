@@ -31,11 +31,7 @@ use crate::onnx_cache::{self, CacheDir, LoadPlan};
 /// a single server process has one ORT tuning knob, not one per model
 /// kind). Defaults to `Level3`.
 fn parse_opt_level() -> GraphOptimizationLevel {
-    let raw = std::env::var("ORT_OPT_LEVEL")
-        .ok()
-        .and_then(|s| s.parse::<u8>().ok())
-        .unwrap_or(3);
-    match raw {
+    match crate::env_parse::ort_opt_level() {
         0 => GraphOptimizationLevel::Disable,
         1 => GraphOptimizationLevel::Level1,
         2 => GraphOptimizationLevel::Level2,
@@ -102,11 +98,10 @@ impl RerankerModel {
         );
 
         let key = crate::config::model_env_key(name);
-        let memory_pattern = crate::config::parse_memory_pattern(
-            std::env::var(format!("EMBED_MEMORY_PATTERN_{key}"))
-                .ok()
-                .as_deref(),
-        );
+        let mp_var = format!("EMBED_MEMORY_PATTERN_{key}");
+        // parsed-by: parse_memory_pattern
+        let memory_pattern =
+            crate::config::parse_memory_pattern(&mp_var, crate::env_parse::raw(&mp_var).as_deref());
         tracing::info!(model = %name, memory_pattern, "reranker session config");
         let sessions = build_session_pool(
             name,
@@ -187,8 +182,9 @@ impl RerankerModel {
 /// as `embed_subbatch_ratio{model}` so an operator can read the kill switch's
 /// state off `/metrics` instead of inferring it from the env.
 pub(super) fn resolve_subbatch_ratio(name: &str) -> f32 {
+    // parsed-by: parse_subbatch_ratio
     let ratio = crate::model::parse_subbatch_ratio(
-        std::env::var("RERANKER_SUBBATCH_RATIO").ok().as_deref(),
+        crate::env_parse::raw("RERANKER_SUBBATCH_RATIO").as_deref(),
         "RERANKER_SUBBATCH_RATIO",
     );
     crate::metrics::set_subbatch_ratio(name, ratio);
