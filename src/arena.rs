@@ -113,7 +113,7 @@ pub fn assert_arena_registered_before_session() {
 /// better than a cgroup OOM-kill (whole container restarts, all in-flight
 /// requests fail). The default favours the former over the latter; the
 /// compose limit controls which actually occurs.
-const DEFAULT_MAX_MEM_BYTES: usize = 6 * 1024 * 1024 * 1024;
+pub const DEFAULT_MAX_MEM_BYTES: usize = 6 * 1024 * 1024 * 1024;
 
 /// Default initial chunk size: 1 MiB.
 const DEFAULT_INITIAL_CHUNK_BYTES: usize = 1024 * 1024;

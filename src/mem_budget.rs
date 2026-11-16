@@ -99,7 +99,7 @@ pub fn collect_ceilings(
                 // The worker would abort on the same value; count the default
                 // so the check still reports something.
                 tracing::warn!(error = %e, who, "arena ceiling unparsable; budget check assumes the default");
-                6 * GIB
+                crate::arena::DEFAULT_MAX_MEM_BYTES as u64
             }
         };
         out.push((who.to_string(), bytes));
@@ -313,5 +313,77 @@ mod tests {
             headroom_from(&env(&[("EMBED_MEMORY_HEADROOM_BYTES", "lots")])),
             DEFAULT_HEADROOM_BYTES
         );
+    }
+
+    /// `report` must publish the verdict to the gauges, not only log it.
+    #[test]
+    fn report_publishes_the_budget_gauges() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || report(&budget(15, 2, Some(16))));
+        let out = handle.render();
+        for want in [
+            format!("embed_arena_ceilings_sum_bytes {}", 15 * GIB),
+            format!("embed_memory_limit_bytes {}", 16 * GIB),
+            format!("embed_memory_budget_headroom_bytes {}", 2 * GIB),
+            "embed_memory_budget_exceeded 1".to_string(),
+        ] {
+            assert!(out.contains(&want), "missing `{want}` in:\n{out}");
+        }
+    }
+
+    /// The documented default headroom, pinned against an independent literal.
+    #[test]
+    fn default_headroom_is_three_gib() {
+        assert_eq!(DEFAULT_HEADROOM_BYTES, 3_221_225_472);
+    }
+
+    #[test]
+    fn ratio_is_none_for_a_zero_limit() {
+        let b = Budget {
+            ceilings: vec![("w".into(), GIB)],
+            headroom: GIB,
+            limit: Some(0),
+        };
+        assert_eq!(b.ratio(), None);
+    }
+
+    #[test]
+    fn mib_divides_by_exactly_a_mebibyte() {
+        assert_eq!(mib(0), 0);
+        assert_eq!(mib(5 * MIB + 1), 5);
+        assert_eq!(mib(3 * GIB), 3072);
+    }
+
+    #[test]
+    fn read_limit_reads_the_file_and_treats_max_or_missing_as_none() {
+        let dir = std::env::temp_dir().join(format!("mem-budget-limit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (num, max, absent) = (dir.join("num"), dir.join("max"), dir.join("absent"));
+        std::fs::write(&num, "17179869184\n").unwrap();
+        std::fs::write(&max, "max\n").unwrap();
+        assert_eq!(read_limit(&num), Some(17_179_869_184));
+        assert_eq!(read_limit(&max), None);
+        assert_eq!(read_limit(&absent), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The startup entry point must publish the verdict gauges. Only presence
+    /// is asserted: the values depend on the process env and the host cgroup.
+    #[test]
+    fn check_at_startup_publishes_the_budget_gauges() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            check_at_startup(&["m1".to_string(), "m2".to_string()], true)
+        });
+        let out = handle.render();
+        for name in [
+            "embed_arena_ceilings_sum_bytes",
+            "embed_memory_budget_headroom_bytes",
+            "embed_memory_budget_exceeded",
+        ] {
+            assert!(out.contains(name), "missing {name} in:\n{out}");
+        }
     }
 }

@@ -1850,7 +1850,8 @@ mod bucket_label_tests {
 
 /// Record the outcome of a `/ready` probe.
 ///
-/// `result` is one of `"ok"`, `"timeout"`, `"error"`, or `"shutdown"`.
+/// `result` is one of `"ok"`, `"timeout"`, `"error"`, `"shutdown"`, or
+/// `"workers_down"` (multi-process: at least one worker has no live connection).
 /// Operators alert on `rate(embed_ready_probe_total{result="timeout"}[5m]) > 0`
 /// to catch a wedged worker before downstream consumers notice.
 pub fn record_ready_probe(result: &str) {
@@ -1911,6 +1912,11 @@ pub fn ready_probe_touch() {
     metrics::counter!(
         "embed_ready_probe_total",
         "result" => "shutdown".to_string()
+    )
+    .absolute(0);
+    metrics::counter!(
+        "embed_ready_probe_total",
+        "result" => "workers_down".to_string()
     )
     .absolute(0);
 }
@@ -2299,6 +2305,54 @@ mod worker_recorder_tests {
         assert!(
             out.contains("embed_seq_pad_multiple{model=\"wr-other\"} 4"),
             "an explicit model label must win over the worker-wide one:\n{out}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod memory_budget_gauge_tests {
+    use super::{ready_probe_touch, set_memory_budget};
+    use metrics_exporter_prometheus::PrometheusBuilder;
+
+    fn render(f: impl FnOnce()) -> String {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, f);
+        handle.render()
+    }
+
+    /// Every gauge carries the value it was given, and the exceeded flag maps
+    /// to 1.
+    #[test]
+    fn set_memory_budget_publishes_all_gauges() {
+        let out = render(|| set_memory_budget(10, Some(16), 2, Some(0.75), true));
+        for want in [
+            "embed_arena_ceilings_sum_bytes 10",
+            "embed_memory_limit_bytes 16",
+            "embed_memory_budget_headroom_bytes 2",
+            "embed_memory_budget_ratio 0.75",
+            "embed_memory_budget_exceeded 1",
+        ] {
+            assert!(out.contains(want), "missing `{want}` in:\n{out}");
+        }
+    }
+
+    /// No readable limit: the limit gauge reads 0, the ratio gauge is left
+    /// unset (not a misleading 0), and a fitting budget reports exceeded=0.
+    #[test]
+    fn set_memory_budget_without_limit_leaves_ratio_unset() {
+        let out = render(|| set_memory_budget(10, None, 2, None, false));
+        assert!(out.contains("embed_memory_limit_bytes 0"), "{out}");
+        assert!(out.contains("embed_memory_budget_exceeded 0"), "{out}");
+        assert!(!out.contains("embed_memory_budget_ratio"), "{out}");
+    }
+
+    #[test]
+    fn ready_probe_touch_presents_workers_down_at_zero() {
+        let out = render(ready_probe_touch);
+        assert!(
+            out.contains("embed_ready_probe_total{result=\"workers_down\"} 0"),
+            "{out}"
         );
     }
 }
