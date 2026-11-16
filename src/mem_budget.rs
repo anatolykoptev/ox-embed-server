@@ -220,6 +220,24 @@ mod tests {
         assert_eq!(budget(1, 1, None).verdict(), Verdict::NoLimit);
     }
 
+    /// The ceilings alone fit under the limit; only the headroom pushes the
+    /// requirement over it. Pins that `required()` includes the headroom term,
+    /// which `production_layout_is_flagged` cannot (its ceilings already sum to
+    /// the whole limit).
+    #[test]
+    fn headroom_alone_can_exceed_the_limit() {
+        let b = budget(15, 2, Some(16));
+        assert!(
+            b.sum() < b.limit.unwrap(),
+            "fixture: ceilings must fit alone"
+        );
+        assert_eq!(
+            b.verdict(),
+            Verdict::Exceeded,
+            "ceilings sum to 15 GiB (< 16 GiB limit) but headroom of 2 GiB must be \
+             counted in required(), making it Exceeded"
+        );
+    }
     #[test]
     fn ratio_is_required_over_limit() {
         let r = budget(6, 2, Some(16)).ratio().unwrap();
