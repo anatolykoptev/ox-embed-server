@@ -58,7 +58,7 @@ async fn client_roundtrip_e5() {
     }
     assert!(socket.exists(), "worker socket missing");
 
-    let client = WorkerClient::connect(socket.clone(), 2)
+    let client = WorkerClient::connect(socket.clone(), 2, Duration::from_secs(60))
         .await
         .expect("connect to worker");
 

@@ -646,6 +646,29 @@ async fn main() {
         }
     };
 
+    // Per-model embed concurrency caps — the same load-shed pattern as the
+    // rerank semaphore above, keyed per model because pool/intra sizing is
+    // per-model. `resolve_embed_concurrency_for_model` honours
+    // MAX_CONCURRENT_EMBED_REQUESTS[_<MODEL_KEY>] (0 = uncapped) and
+    // otherwise sizes `pool × intra × 8` floor 16 — headroom above the
+    // steady-state concurrency the PriorityGate already admits, so the cap
+    // sheds only pathological bursts, not today's traffic.
+    let global_embed_cap_raw = std::env::var("MAX_CONCURRENT_EMBED_REQUESTS").ok();
+    let global_embed_pool_raw = std::env::var("EMBED_SESSION_POOL_SIZE").ok();
+    let embed_semaphores: HashMap<String, Arc<tokio::sync::Semaphore>> = cfg
+        .models
+        .iter()
+        .filter_map(|def| {
+            crate::config::resolve_embed_concurrency_for_model(
+                &def.name,
+                global_embed_cap_raw.as_deref(),
+                global_embed_pool_raw.as_deref(),
+                cfg.intra_threads,
+            )
+            .map(|n| (def.name.clone(), Arc::new(tokio::sync::Semaphore::new(n))))
+        })
+        .collect();
+
     // Spawn worker pool if multi-process mode is enabled.
     // All workers (embed + rerank + splade) launch in parallel via tokio::spawn —
     // each spawn awaits its UDS socket independently (cold model load ~5-15s per
@@ -841,6 +864,7 @@ async fn main() {
         cache,
         token_cache,
         rerank_semaphore,
+        embed_semaphores,
         embed_max_input_array: cfg.embed_max_input_array,
         rerank_max_input_docs: cfg.rerank_max_input_docs,
         worker_pool,
