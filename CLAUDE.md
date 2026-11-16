@@ -54,6 +54,10 @@ Padding / sub-batching (worker path):
 - Embedders pad each forward pass to the longest sequence rounded up to a multiple of 4 tokens when the model's `memory_pattern` is off (`pool::SEQ_PAD_MULTIPLE`), or of 16 when it is on (`pool::SEQ_PAD_MULTIPLE_PATTERN_ON`: ORT keeps one plan per distinct shape, so the shape count must stay bounded). Neither is a power of two any more. The live multiple is `embed_seq_pad_multiple{model}`. `EMBED_SUBBATCH_RATIO[_<MODEL>]` (default `2.0`, `<= 1.0` disables) splits a request into length-homogeneous passes.
 - `RERANKER_SUBBATCH_RATIO` (default `2.0`, `<= 1.0` disables) does the same for `/v1/rerank`: pairs whose lengths differ by more than the ratio run in separate forward passes. Scores are returned in input order. Observable as `embed_subbatch_groups{model}`.
 
+Vector semantics (both switches change the vectors a model returns, so both are per-model opt-ins, off by default):
+- `EMBED_INPUT_PREFIX_<MODEL>=e5` prepends `query: ` (`input_type=query`) or `passage: ` (default) before inference; a text that already starts with either prefix is left alone, so clients that prefix themselves keep working. Without it `input_type` only partitions the response cache. Turn it on only after every store built from this server has been re-embedded: vectors with and without the prefix are not comparable.
+- `EMBED_BATCH_INVARIANT_<MODEL>=1` (or the global `EMBED_BATCH_INVARIANT`) runs every text of a request in its own forward pass. The int8 graph takes each activation scale from the whole tensor, so by default a text's vector depends on the texts embedded with it (and the response cache keeps whichever vector came first). A lone text is unchanged by the switch; multi-text requests cost more, see `docs/benchmarks/2026-11-16-embed-batch-drift.md`.
+
 ## CI
 
 Two lanes, both on GitHub-hosted `ubuntu-24.04-arm` (public repo → free + unlimited, and arm64 is what production runs).
