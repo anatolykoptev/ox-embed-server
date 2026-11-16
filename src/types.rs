@@ -140,6 +140,16 @@ pub struct AppState {
     /// `None` = unlimited (legacy behaviour); set via
     /// `MAX_CONCURRENT_RERANK_REQUESTS`.
     pub rerank_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    /// Per-model concurrency caps for `/v1/embeddings` requests — the same
+    /// `try_acquire_permit` load-shed pattern as [`Self::rerank_semaphore`],
+    /// keyed by model name because pool/intra sizing is per-model.
+    /// A model absent from the map is uncapped. Sized by
+    /// `config::resolve_embed_concurrency_for_model`
+    /// (`MAX_CONCURRENT_EMBED_REQUESTS[_<MODEL_KEY>]`; auto default
+    /// `pool × intra × 8`, floor 16). The permit is held for the whole
+    /// post-lookup request lifetime, so over-cap requests fail fast with
+    /// 429 + `Retry-After: 1` instead of queueing on worker slots.
+    pub embed_semaphores: HashMap<String, Arc<tokio::sync::Semaphore>>,
     /// Maximum number of texts allowed in a single `/v1/embeddings` input
     /// array. Requests exceeding this are rejected with HTTP 400 before
     /// reaching the batcher. Configured via `EMBED_MAX_INPUT_ARRAY`

@@ -293,6 +293,7 @@ mod tests {
             cache: Arc::new(EmbeddingCache::new(0)),
             token_cache: Arc::new(TokenCache::new(0)),
             rerank_semaphore: None,
+            embed_semaphores: HashMap::new(),
             embed_max_input_array: 32,
             rerank_max_input_docs: 32,
             worker_pool: None,
@@ -413,7 +414,7 @@ mod tests {
 
         // Connect a real WorkerClient to the mock server.
         let client = Arc::new(
-            WorkerClient::connect(socket_path.clone(), 1)
+            WorkerClient::connect(socket_path.clone(), 1, Duration::from_secs(60))
                 .await
                 .expect("connect to mock server"),
         );
@@ -448,6 +449,7 @@ mod tests {
             cache: Arc::new(EmbeddingCache::new(0)),
             token_cache: Arc::new(TokenCache::new(0)),
             rerank_semaphore: None,
+            embed_semaphores: HashMap::new(),
             embed_max_input_array: 32,
             rerank_max_input_docs: 32,
             worker_pool: Some(pool),

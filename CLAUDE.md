@@ -33,6 +33,8 @@ Multi-process:
 - `EMBED_MULTI_PROCESS=1` — supervisor spawns workers. Set to `0` for monolith rollback.
 - `EMBED_WORKER_BIN=/usr/local/bin/embed-worker` — shipped in image.
 - `EMBED_WORKER_SOCKET_DIR=/tmp/embed-workers` — UDS socket directory.
+- `EMBED_IPC_TIMEOUT_SECS` (default `60`) — whole-IPC deadline per request (permit wait + connect + write + read). `EMBED_IPC_TIMEOUT_SECS_<MODEL>` overrides per model. A wedged worker fails with 503 + `Retry-After: 5` instead of hanging.
+- `MAX_CONCURRENT_EMBED_REQUESTS` — global `/v1/embeddings` concurrency cap; `MAX_CONCURRENT_EMBED_REQUESTS_<MODEL>` per-model; `0` disables. Unset → per-model `pool × intra × 8`, floor 16. Over cap → 429 + `Retry-After: 1`.
 
 Models (format `name:dir:dim:max_len:pad_id:has_tti[:model_file]`):
 - `EMBED_MODELS="multilingual-e5-large:/models:1024:256:1:false,jina-code-v2:/models-jina:768:512:0:false"`

@@ -7,6 +7,7 @@ mod batcher;
 mod cache;
 mod cache_flow;
 mod config;
+mod drain;
 mod evictable_pool;
 mod input_prefix;
 #[allow(dead_code)] // ipc items used by supervisor submodule; unused from main.rs directly
@@ -41,9 +42,14 @@ use crate::model_splade::SpladeModel;
 use crate::token_cache::TokenCache;
 use crate::types::{AppState, ModelEntry, RerankerEntry, SpladeEntry};
 
-/// Waits for SIGTERM or SIGINT, then cancels the token and sleeps for drain_timeout
-/// to allow in-flight HTTP requests to complete before axum closes the listener.
-async fn shutdown_signal(token: CancellationToken, drain_timeout: Duration) {
+/// Waits for SIGTERM or SIGINT, then cancels the token and waits for
+/// in-flight HTTP requests to complete — bounded by drain_timeout — before
+/// axum closes the listener.
+async fn shutdown_signal(
+    token: CancellationToken,
+    drain_timeout: Duration,
+    in_flight: drain::InFlight,
+) {
     let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
     let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
     tokio::select! {
@@ -51,15 +57,36 @@ async fn shutdown_signal(token: CancellationToken, drain_timeout: Duration) {
         _ = int.recv()  => tracing::info!("SIGINT received, starting graceful shutdown"),
     }
     token.cancel();
-    // Give in-flight HTTP requests drain_timeout to complete naturally.
-    // After this future returns, axum stops accepting new connections; when
-    // the last handler finishes, Arc<AppState> drops → batcher workers exit.
+    // Wait until in-flight HTTP requests complete, bounded by
+    // drain_timeout. After this future returns, axum stops accepting new
+    // connections; when the last handler finishes, Arc<AppState> drops →
+    // batcher workers exit.
+    drain_in_flight(&in_flight, drain_timeout).await;
+}
+
+/// Wait until the in-flight request count reaches zero or `timeout`
+/// elapses, whichever comes first. This is what makes a restart stay
+/// unavailable only as long as real work is outstanding: previously the
+/// drain slept the full timeout on every shutdown, busy or idle. Logs the
+/// live count at start and at end so the drain is attributable in logs.
+async fn drain_in_flight(in_flight: &drain::InFlight, timeout: Duration) {
     tracing::info!(
-        secs = drain_timeout.as_secs(),
+        in_flight = in_flight.count(),
+        secs = timeout.as_secs(),
         "draining in-flight requests"
     );
-    tokio::time::sleep(drain_timeout).await;
-    tracing::info!("drain complete");
+    if in_flight.wait_idle(timeout).await {
+        tracing::info!(
+            in_flight = in_flight.count(),
+            "drain complete — no requests in flight"
+        );
+    } else {
+        tracing::warn!(
+            in_flight = in_flight.count(),
+            secs = timeout.as_secs(),
+            "drain timeout elapsed with requests still in flight"
+        );
+    }
 }
 
 /// Cleanly join every model's batcher worker after axum's HTTP drain has
@@ -655,6 +682,29 @@ async fn main() {
         }
     };
 
+    // Per-model embed concurrency caps — the same load-shed pattern as the
+    // rerank semaphore above, keyed per model because pool/intra sizing is
+    // per-model. `resolve_embed_concurrency_for_model` honours
+    // MAX_CONCURRENT_EMBED_REQUESTS[_<MODEL_KEY>] (0 = uncapped) and
+    // otherwise sizes `pool × intra × 8` floor 16 — headroom above the
+    // steady-state concurrency the PriorityGate already admits, so the cap
+    // sheds only pathological bursts, not today's traffic.
+    let global_embed_cap_raw = std::env::var("MAX_CONCURRENT_EMBED_REQUESTS").ok();
+    let global_embed_pool_raw = std::env::var("EMBED_SESSION_POOL_SIZE").ok();
+    let embed_semaphores: HashMap<String, Arc<tokio::sync::Semaphore>> = cfg
+        .models
+        .iter()
+        .filter_map(|def| {
+            crate::config::resolve_embed_concurrency_for_model(
+                &def.name,
+                global_embed_cap_raw.as_deref(),
+                global_embed_pool_raw.as_deref(),
+                cfg.intra_threads,
+            )
+            .map(|n| (def.name.clone(), Arc::new(tokio::sync::Semaphore::new(n))))
+        })
+        .collect();
+
     // Spawn worker pool if multi-process mode is enabled.
     // All workers (embed + rerank + splade) launch in parallel via tokio::spawn —
     // each spawn awaits its UDS socket independently (cold model load ~5-15s per
@@ -850,6 +900,7 @@ async fn main() {
         cache,
         token_cache,
         rerank_semaphore,
+        embed_semaphores,
         embed_max_input_array: cfg.embed_max_input_array,
         rerank_max_input_docs: cfg.rerank_max_input_docs,
         worker_pool,
@@ -899,12 +950,21 @@ async fn main() {
     // (interactive first, bulk aged in). Absent header = interactive.
     let app = ipc::gate::with_priority_layer(app);
 
+    // In-flight request counter — the graceful shutdown waits on this
+    // (zero in-flight ⇒ the drain returns immediately instead of sleeping
+    // the full DRAIN_TIMEOUT_S). Outermost layer so every route counts.
+    let in_flight = drain::InFlight::new();
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        in_flight.clone(),
+        drain::track,
+    ));
+
     let addr = format!("0.0.0.0:{}", cfg.port);
     tracing::info!(addr = %addr, "embed-server listening");
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(shutdown_token, drain_timeout))
+        .with_graceful_shutdown(shutdown_signal(shutdown_token, drain_timeout, in_flight))
         .await
         .unwrap();
 
@@ -947,7 +1007,74 @@ fn worker_metrics_port(base: Option<u16>, index: u16) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::worker_metrics_port;
+    use super::{drain_in_flight, worker_metrics_port};
+    use crate::drain::InFlight;
+    use std::time::Duration;
+
+    // -----------------------------------------------------------------
+    // F4 — the drain must wait for real work, not the clock. These tests
+    // call the same `drain_in_flight` helper `shutdown_signal` uses;
+    // replacing its `wait_idle` with `sleep(drain_timeout)` makes the
+    // first two RED (each would wait the full configured bound).
+    // -----------------------------------------------------------------
+
+    /// Zero in-flight requests → the drain returns well under the bound,
+    /// not after the full drain_timeout.
+    #[tokio::test]
+    async fn drain_returns_immediately_when_idle() {
+        let tracker = InFlight::new();
+        let start = std::time::Instant::now();
+        drain_in_flight(&tracker, Duration::from_secs(30)).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "idle drain must return well under the timeout, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// One in-flight request → the drain waits for it and returns once it
+    /// completes, not at the configured bound.
+    #[tokio::test]
+    async fn drain_waits_for_in_flight_request_to_finish() {
+        let tracker = InFlight::new();
+        let guard = tracker.enter();
+        // Hold one request in flight for ~300ms — stands in for a handler.
+        let hold = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            drop(guard);
+        });
+        let start = std::time::Instant::now();
+        drain_in_flight(&tracker, Duration::from_secs(30)).await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "drain returned while a request was still in flight: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "drain must return soon after the request completes, not at the bound: {elapsed:?}"
+        );
+        hold.await.unwrap();
+    }
+
+    /// The bound still applies: a request that never finishes caps the
+    /// drain at the timeout rather than hanging forever.
+    #[tokio::test]
+    async fn drain_is_bounded_by_timeout() {
+        let tracker = InFlight::new();
+        let _guard = tracker.enter(); // held for the whole test
+        let start = std::time::Instant::now();
+        drain_in_flight(&tracker, Duration::from_millis(150)).await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(150),
+            "timeout bound must hold: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "timeout path must not overshoot by orders of magnitude: {elapsed:?}"
+        );
+    }
 
     #[test]
     fn worker_metrics_port_none_base_returns_none() {
