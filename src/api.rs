@@ -1410,11 +1410,13 @@ mod tests {
             vec!["query: hello"],
             "input_type=query must get the query prefix"
         );
-        let doc = texts_seen_by_worker(
+        // The worker sees the cache misses in hash-map order: compare sorted.
+        let mut doc = texts_seen_by_worker(
             InputPrefix::E5,
             serde_json::json!({"input": ["hello", "passage: kept"], "model": "prefix-model"}),
         )
         .await;
+        doc.sort();
         assert_eq!(
             doc,
             vec!["passage: hello", "passage: kept"],
