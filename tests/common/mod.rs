@@ -24,6 +24,11 @@ pub const RERANK_NAME: &str = "tiny-rerank";
 pub const SPLADE_NAME: &str = "tiny-splade";
 /// Token cap handed to every fixture model. The fixtures allow 128 positions.
 pub const MAX_LEN: usize = 64;
+/// Production runs every embed model with `memory_pattern` off (pad width a
+/// multiple of 4); the code default is on (multiple of 16), which would pad
+/// every probe text to the same width and hide padding bugs. The tests pin the
+/// production setting for the fixture model.
+pub const MEMORY_PATTERN_ENV: (&str, &str) = ("EMBED_MEMORY_PATTERN_TINY_EMBED", "false");
 
 /// RAII guard for a spawned child process bound to a UDS socket.
 /// On drop: kill child, wait for exit, remove socket file.
@@ -34,6 +39,12 @@ pub struct ChildGuard {
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         if let Some(mut c) = self.child.take() {
+            // SIGKILL on a supervisor does not reach the workers it spawned:
+            // they would be re-parented and outlive the test. Take its direct
+            // children first (a no-op for a bare worker).
+            let _ = Command::new("pkill")
+                .args(["-KILL", "-P", &c.id().to_string()])
+                .status();
             let _ = c.kill();
             let _ = c.wait();
         }
@@ -221,6 +232,7 @@ pub fn spawn_server(env: &Setup, tag: &str, server_bin: &str, worker_bin: &str) 
         .env("EMBED_PORT", port.to_string())
         .env("EMBED_MODELS", env.embed_spec())
         .env("EMBED_DEFAULT_MODEL", EMBED_NAME)
+        .env(MEMORY_PATTERN_ENV.0, MEMORY_PATTERN_ENV.1)
         .env("RERANKER_MODELS", env.rerank_spec())
         .env("SPLADE_MODELS", env.splade_spec())
         .env("ORT_DYLIB_PATH", &env.ort)

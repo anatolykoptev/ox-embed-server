@@ -12,10 +12,19 @@ use std::time::Duration;
 
 type Sparse = BTreeMap<u64, f64>;
 
-fn embed_sparse(client: &reqwest::blocking::Client, base: &str, input: &[&str]) -> Vec<Sparse> {
+fn embed_sparse(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    input: &[&str],
+    top_k: Option<usize>,
+) -> Vec<Sparse> {
+    let mut body = serde_json::json!({ "model": common::SPLADE_NAME, "input": input });
+    if let Some(k) = top_k {
+        body["top_k"] = k.into();
+    }
     let resp = client
         .post(format!("{base}/embed_sparse"))
-        .json(&serde_json::json!({ "model": common::SPLADE_NAME, "input": input }))
+        .json(&body)
         .send()
         .expect("POST /embed_sparse");
     assert!(
@@ -81,9 +90,36 @@ fn multi_process_splade_e2e() {
 
     let a = "onnx is an open format for machine learning models";
     let b = "paris is the capital of france";
-    let both = embed_sparse(&client, &server.base, &[a, b]);
-    let only_a = embed_sparse(&client, &server.base, &[a]);
-    let only_b = embed_sparse(&client, &server.base, &[b]);
+    let both = embed_sparse(&client, &server.base, &[a, b], None);
+    let only_a = embed_sparse(&client, &server.base, &[a], None);
+    let only_b = embed_sparse(&client, &server.base, &[b], None);
     assert_same("text a alone vs batched", &only_a[0], &both[0]);
     assert_same("text b alone vs batched", &only_b[0], &both[1]);
+
+    // The tokenizer must feed the model the actual text: two different texts
+    // cannot produce the same sparse vector.
+    assert_ne!(
+        only_a[0], only_b[0],
+        "different texts must give different sparse vectors"
+    );
+
+    // top_k keeps the heaviest terms: a prefix of the full vector by weight.
+    let k = 3;
+    let top = embed_sparse(&client, &server.base, &[a], Some(k));
+    assert_eq!(
+        top[0].len(),
+        k.min(only_a[0].len()),
+        "top_k must cap the terms"
+    );
+    let mut full: Vec<(&u64, &f64)> = only_a[0].iter().collect();
+    full.sort_by(|x, y| y.1.total_cmp(x.1));
+    for (id, w) in full.iter().take(k) {
+        let got = top[0]
+            .get(*id)
+            .unwrap_or_else(|| panic!("top_k dropped heavy term {id} (weight {w})"));
+        assert!(
+            (got - **w).abs() < 1e-4,
+            "top_k changed weight of term {id}"
+        );
+    }
 }

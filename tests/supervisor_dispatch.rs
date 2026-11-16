@@ -27,6 +27,10 @@ async fn pool_dispatches_to_spawned_worker() {
             ("EMBED_MODELS".into(), env.embed_spec()),
             ("ORT_DYLIB_PATH".into(), env.ort.display().to_string()),
             ("EMBED_DEFAULT_MODEL".into(), common::EMBED_NAME.into()),
+            (
+                common::MEMORY_PATTERN_ENV.0.into(),
+                common::MEMORY_PATTERN_ENV.1.into(),
+            ),
         ],
     };
     let supervisor = WorkerSupervisor::launch(spec)

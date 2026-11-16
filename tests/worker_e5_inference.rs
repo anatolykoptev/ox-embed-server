@@ -55,6 +55,7 @@ async fn worker_infers_e5_batch() {
         .env("EMBED_MODELS", env.embed_spec())
         .env("ORT_DYLIB_PATH", &env.ort)
         .env("EMBED_DEFAULT_MODEL", common::EMBED_NAME)
+        .env(common::MEMORY_PATTERN_ENV.0, common::MEMORY_PATTERN_ENV.1)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
