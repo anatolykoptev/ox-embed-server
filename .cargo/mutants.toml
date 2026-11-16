@@ -45,6 +45,7 @@ examine_globs = [
     "src/cache.rs",
     "src/cache_flow.rs",
     "src/config.rs",
+    "src/drain.rs",
     "src/evictable_pool.rs",
     "src/ipc/frame.rs",
     "src/ipc/protocol.rs",

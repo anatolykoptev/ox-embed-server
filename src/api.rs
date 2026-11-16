@@ -123,6 +123,36 @@ pub async fn embeddings(
     // many turn into cache hits vs. misses.
     texts_count = texts.len();
 
+    // Per-model embed concurrency cap — the same TEI `try_acquire_permit`
+    // load-shed pattern as `state.rerank_semaphore` (api_rerank.rs),
+    // applied per model so one saturated model cannot starve the others.
+    // A model absent from `embed_semaphores` is uncapped. The permit is
+    // held for the whole post-lookup request lifetime (cache + inference)
+    // and released on return; over-cap fails fast with 429 +
+    // `Retry-After: 1` rather than queueing on the worker-side gate.
+    let _permit = match state.embed_semaphores.get(&model_name) {
+        Some(sem) => match sem.clone().try_acquire_owned() {
+            Ok(p) => Some(p),
+            Err(_) => {
+                tracing::warn!(model = %model_name, "embed concurrency cap reached — returning 429");
+                status = "rate_limited";
+                crate::metrics::record_request(&model_name, status, t0.elapsed(), texts_count);
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [("retry-after", "1")],
+                    Json(ErrorResponse {
+                        error: ErrorDetail {
+                            message: "embed concurrency cap reached".to_string(),
+                            error_type: "rate_limited",
+                        },
+                    }),
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
+
     // -- Cache partition pass --
     //
     // Probe the response cache for each text and split into:
@@ -277,7 +307,12 @@ pub async fn embeddings(
                             [("retry-after", "5")],
                             Json(ErrorResponse {
                                 error: ErrorDetail {
-                                    message: "inference failed: worker respawning".to_string(),
+                                    message: if matches!(&e, crate::supervisor::pool::DispatchError::Ipc(io) if io.kind() == std::io::ErrorKind::TimedOut) {
+                                        "inference failed: worker did not answer in time"
+                                    } else {
+                                        "inference failed: worker respawning"
+                                    }
+                                    .to_string(),
                                     error_type: "worker_unavailable",
                                 },
                             }),
@@ -819,6 +854,7 @@ mod tests {
             cache: Arc::new(EmbeddingCache::new(0)),
             token_cache: Arc::new(TokenCache::new(0)),
             rerank_semaphore: None,
+            embed_semaphores: HashMap::new(),
             embed_max_input_array: cap,
             rerank_max_input_docs: 32,
             worker_pool: None,
@@ -994,6 +1030,7 @@ mod tests {
             cache: Arc::new(EmbeddingCache::new(0)),
             token_cache: Arc::new(crate::token_cache::TokenCache::new(0)),
             rerank_semaphore: None,
+            embed_semaphores: HashMap::new(),
             embed_max_input_array: 32,
             rerank_max_input_docs: 32,
             worker_pool: Some(Arc::new(pool)),
@@ -1118,6 +1155,18 @@ mod tests {
             .unwrap_or(0.0)
     }
 
+    /// Current value of `embed_requests_total{model,status}` (0 when the
+    /// series is absent).
+    fn request_count(model: &str, status: &str) -> f64 {
+        let needle = format!("embed_requests_total{{model=\"{model}\",status=\"{status}\"}} ");
+        test_prom()
+            .render()
+            .lines()
+            .find_map(|l| l.strip_prefix(needle.as_str()))
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(0.0)
+    }
+
     fn request_for(model: &str) -> Request<Body> {
         Request::builder()
             .method("POST")
@@ -1129,7 +1178,11 @@ mod tests {
             .unwrap()
     }
 
-    fn state_with_pool(model: &str, pool: WorkerPool) -> Arc<AppState> {
+    fn state_with_pool(
+        model: &str,
+        pool: WorkerPool,
+        embed_semaphores: HashMap<String, Arc<tokio::sync::Semaphore>>,
+    ) -> Arc<AppState> {
         Arc::new(AppState {
             models: HashMap::from([(
                 model.to_string(),
@@ -1146,6 +1199,7 @@ mod tests {
             cache: Arc::new(EmbeddingCache::new(0)),
             token_cache: Arc::new(crate::token_cache::TokenCache::new(0)),
             rerank_semaphore: None,
+            embed_semaphores,
             embed_max_input_array: 32,
             rerank_max_input_docs: 32,
             worker_pool: Some(Arc::new(pool)),
@@ -1177,9 +1231,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("w.sock");
         let listener = tokio::net::UnixListener::bind(&sock).unwrap();
-        let client = crate::ipc::client::WorkerClient::connect(sock.clone(), 1)
-            .await
-            .unwrap();
+        let client =
+            crate::ipc::client::WorkerClient::connect(sock.clone(), 1, Duration::from_secs(5))
+                .await
+                .unwrap();
         drop(listener);
         std::fs::remove_file(&sock).unwrap();
 
@@ -1191,7 +1246,7 @@ mod tests {
         .await;
         let before = failures(model, "worker_died");
 
-        let resp = make_app(state_with_pool(model, pool))
+        let resp = make_app(state_with_pool(model, pool, HashMap::new()))
             .oneshot(request_for(model))
             .await
             .unwrap();
@@ -1214,7 +1269,7 @@ mod tests {
             .await;
         let before = failures(model, "worker_unavailable");
 
-        let resp = make_app(state_with_pool(model, pool))
+        let resp = make_app(state_with_pool(model, pool, HashMap::new()))
             .oneshot(request_for(model))
             .await
             .unwrap();
@@ -1231,13 +1286,163 @@ mod tests {
         let pool = WorkerPool::with_dispatch_timeout(Duration::from_millis(1));
         let before = failures(model, "no_worker");
 
-        let resp = make_app(state_with_pool(model, pool))
+        let resp = make_app(state_with_pool(model, pool, HashMap::new()))
             .oneshot(request_for(model))
             .await
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(failures(model, "no_worker") - before, 1.0);
+    }
+
+    /// F1 — a worker that accepts the connection and never answers must
+    /// surface as a bounded, retryable 503 (not a hang): the per-request
+    /// IPC deadline in `WorkerClient::send_request` fires and flows through
+    /// `DispatchError::Ipc(TimedOut)` → `is_transient` → 503 +
+    /// `Retry-After: 5` + `worker_unavailable`, counted
+    /// `reason="ipc_timeout"`. Removing the `tokio::time::timeout` wrapper
+    /// in `send_request` makes this test RED — the request hangs until the
+    /// outer guard fires.
+    #[tokio::test]
+    async fn embed_wedged_worker_is_retryable_503_within_deadline() {
+        let model = "wedged-model";
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("w.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        tokio::spawn(async move {
+            // Accept and hold every connection open forever — the exact
+            // signature of a wedged worker (listener alive, never reads).
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let _stream = stream;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        let client = crate::ipc::client::WorkerClient::connect(sock, 1, Duration::from_millis(300))
+            .await
+            .unwrap();
+        let pool = WorkerPool::with_dispatch_timeout(Duration::from_secs(5));
+        pool.add(WorkerSupervisor::for_test(
+            spec_for(model),
+            Arc::new(client),
+        ))
+        .await;
+        let before = failures(model, "ipc_timeout");
+
+        // Outer guard far above the 300 ms IPC deadline: without the
+        // send_request deadline the request hangs until this fires.
+        let resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            make_app(state_with_pool(model, pool, HashMap::new())).oneshot(request_for(model)),
+        )
+        .await
+        .expect("request must return within the IPC deadline, not hang")
+        .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a wedged worker must surface as a retryable 503, not a hang or 500"
+        );
+        assert_eq!(resp.headers().get("retry-after").unwrap(), "5");
+        assert_eq!(
+            failures(model, "ipc_timeout") - before,
+            1.0,
+            "IPC deadline expiry must be counted as reason=\"ipc_timeout\""
+        );
+    }
+
+    /// F2 — a request over the per-model embed concurrency cap is shed
+    /// with 429 + `Retry-After: 1` and counted as `status="rate_limited"`
+    /// in `embed_requests_total` — the same contract as the rerank
+    /// semaphore. Weakening the cap check at its call site in `embeddings`
+    /// (e.g. to an impossible condition) makes this test RED.
+    #[tokio::test]
+    async fn embed_over_concurrency_cap_is_429_rate_limited() {
+        let model = "cap-model";
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        // Occupy the single permit so the request below is over the cap.
+        let _held = sem.clone().try_acquire_owned().unwrap();
+        let sems = HashMap::from([(model.to_string(), sem)]);
+        let pool = WorkerPool::with_dispatch_timeout(Duration::from_millis(1));
+        let before = request_count(model, "rate_limited");
+
+        let resp = make_app(state_with_pool(model, pool, sems))
+            .oneshot(request_for(model))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "over the per-model embed concurrency cap must be HTTP 429"
+        );
+        assert_eq!(resp.headers().get("retry-after").unwrap(), "1");
+        assert_eq!(
+            request_count(model, "rate_limited") - before,
+            1.0,
+            "an over-cap request must be counted as status=\"rate_limited\""
+        );
+    }
+
+    /// F3 — a worker that accepts and then closes the socket mid-request is
+    /// a transient `DispatchError::Ipc` (EOF inside `read_frame`): the
+    /// handler must answer 503 + `Retry-After` with
+    /// `status="worker_unavailable"`, not a 500. Mapping
+    /// `DispatchError::Ipc` back to 500 in `embeddings` makes this RED.
+    #[tokio::test]
+    async fn embed_ipc_mid_request_close_is_retryable_503() {
+        let model = "midclose-model";
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("w.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        tokio::spawn(async move {
+            // Accept, read the request frame so the client is parked in
+            // read_frame waiting for a response, then drop the connection.
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let _ =
+                        crate::ipc::frame::read_frame::<_, crate::ipc::protocol::WorkerRequest>(
+                            &mut stream,
+                        )
+                        .await;
+                });
+            }
+        });
+        let client = crate::ipc::client::WorkerClient::connect(sock, 1, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let pool = WorkerPool::with_dispatch_timeout(Duration::from_secs(5));
+        pool.add(WorkerSupervisor::for_test(
+            spec_for(model),
+            Arc::new(client),
+        ))
+        .await;
+        let before_died = failures(model, "worker_died");
+        let before_unavail = request_count(model, "worker_unavailable");
+
+        let resp = make_app(state_with_pool(model, pool, HashMap::new()))
+            .oneshot(request_for(model))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a worker closing the socket mid-request must surface as 503, not 500"
+        );
+        assert_eq!(resp.headers().get("retry-after").unwrap(), "5");
+        assert_eq!(
+            failures(model, "worker_died") - before_died,
+            1.0,
+            "a mid-request socket close must count as reason=\"worker_died\""
+        );
+        assert_eq!(
+            request_count(model, "worker_unavailable") - before_unavail,
+            1.0,
+            "a mid-request socket close must count as status=\"worker_unavailable\""
+        );
     }
 
     // ---- fake-worker tests: the worker answers, but wrongly ----
@@ -1250,16 +1455,19 @@ mod tests {
         reply: fn(u64) -> WorkerResponse,
     ) -> axum::response::Response {
         let dir = tempfile::tempdir().unwrap();
-        let client =
-            crate::ipc::client::test_support::fake_worker_client(dir.path().join("w.sock"), reply)
-                .await;
+        let client = crate::ipc::client::test_support::fake_worker_client(
+            dir.path().join("w.sock"),
+            reply,
+            Duration::from_secs(5),
+        )
+        .await;
         let pool = WorkerPool::with_dispatch_timeout(Duration::from_millis(50));
         pool.add(WorkerSupervisor::for_test(
             spec_for(model),
             Arc::new(client),
         ))
         .await;
-        make_app(state_with_pool(model, pool))
+        make_app(state_with_pool(model, pool, HashMap::new()))
             .oneshot(request_for(model))
             .await
             .unwrap()

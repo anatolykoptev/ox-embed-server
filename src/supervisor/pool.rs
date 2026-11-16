@@ -59,6 +59,11 @@ impl DispatchError {
             DispatchError::NoWorker { .. } => "no_worker",
             DispatchError::Timeout { .. } => "worker_unavailable",
             DispatchError::Ipc(e) if e.is_protocol_violation() => "ipc_protocol",
+            // The per-request IPC deadline fired (worker wedged or the
+            // connection saturated past `EMBED_IPC_TIMEOUT_SECS`): the
+            // worker may still be alive, so it needs its own label rather
+            // than `worker_died`. Still transient → 503.
+            DispatchError::Ipc(e) if e.kind() == std::io::ErrorKind::TimedOut => "ipc_timeout",
             DispatchError::Ipc(_) => "worker_died",
         }
     }
@@ -299,11 +304,19 @@ mod tests {
             assert_eq!(e.failure_reason(), "worker_died", "{kind:?}");
             assert!(e.is_transient(), "{kind:?}");
         }
+        // IPC deadline expiry: retryable like worker death, but the worker
+        // may still be alive — it needs its own bounded reason.
+        let ipc_timeout = DispatchError::Ipc(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        assert_eq!(ipc_timeout.failure_reason(), "ipc_timeout");
+        assert!(
+            ipc_timeout.is_transient(),
+            "an IPC deadline is retryable — the caller backs off, the worker respawns or recovers"
+        );
         assert_eq!(timeout.failure_reason(), "worker_unavailable");
         assert_eq!(none.failure_reason(), "no_worker");
         assert!(ipc.is_transient() && timeout.is_transient());
         assert!(!none.is_transient(), "a missing worker is a config error");
-        for e in [&ipc, &proto, &timeout, &none] {
+        for e in [&ipc, &proto, &ipc_timeout, &timeout, &none] {
             assert!(
                 crate::metrics::INFERENCE_FAILURE_REASONS.contains(&e.failure_reason()),
                 "reason must be pre-touched: {}",

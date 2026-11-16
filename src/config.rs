@@ -877,23 +877,190 @@ pub(crate) fn resolve_embed_pool_size_for_model(
     model_key: &str,
     global_raw: Option<&str>,
 ) -> usize {
+    let (size, per_model_key) = pool_size_for_model(model_key, global_raw);
+    if let Some(key) = per_model_key {
+        tracing::info!(
+            model = %model_key,
+            env = %key,
+            pool_size = size,
+            "per-model EMBED_SESSION_POOL_SIZE override"
+        );
+    }
+    size
+}
+
+/// Pool-size resolution without the override info line, for callers that
+/// only need the number (the concurrency-cap sizing) so the line is not
+/// logged twice per model. Returns the per-model env key when it applied.
+fn pool_size_for_model(model_key: &str, global_raw: Option<&str>) -> (usize, Option<String>) {
     let suffix = model_env_key(model_key);
     let per_model_key = format!("EMBED_SESSION_POOL_SIZE_{suffix}");
-    let per_model_raw = env::var(&per_model_key).ok();
-    if let Some(ref raw) = per_model_raw {
+    if let Ok(raw) = env::var(&per_model_key) {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
             let parsed = parse_embed_pool_size(Some(trimmed), Some(per_model_key.as_str()));
-            tracing::info!(
-                model = %model_key,
-                env = %per_model_key,
-                pool_size = parsed,
-                "per-model EMBED_SESSION_POOL_SIZE override"
-            );
-            return parsed;
+            return (parsed, Some(per_model_key));
         }
     }
-    parse_embed_pool_size(global_raw, None)
+    (parse_embed_pool_size(global_raw, None), None)
+}
+
+/// Default IPC deadline (UDS connect + write + read, started after the
+/// gate permit is granted — queueing is not bounded) applied per request
+/// by `WorkerClient::send_request`.
+///
+/// 60 s sits above the worst measured pass — e5 batches up to ~28 s,
+/// rerank up to 15 s, code-rank mean 5.2 s — so a healthy inference never
+/// trips it, while a wedged or saturated worker surfaces as a bounded,
+/// retryable failure (503 + Retry-After) instead of an infinite hang.
+pub const DEFAULT_IPC_TIMEOUT_SECS: u64 = 60;
+
+/// Resolve the per-model IPC request deadline in seconds.
+///
+/// Lookup order (same shape as `EMBED_MAX_WAITERS` / `EMBED_SESSION_POOL_SIZE`):
+///   1. `EMBED_IPC_TIMEOUT_SECS_<MODEL_KEY>` — per-model override.
+///   2. `EMBED_IPC_TIMEOUT_SECS` — global.
+///   3. [`DEFAULT_IPC_TIMEOUT_SECS`].
+///
+/// `0` or an unparseable value at either level warns and falls through to
+/// the next — a zero deadline would fail every request instantly, which is
+/// never the intent. Resolved once at `WorkerSupervisor::launch`; restart
+/// the container to change.
+pub(crate) fn resolve_ipc_timeout(model_name: &str) -> std::time::Duration {
+    let suffix = model_env_key(model_name);
+    let per_model_key = format!("EMBED_IPC_TIMEOUT_SECS_{suffix}");
+    for key in [per_model_key.as_str(), "EMBED_IPC_TIMEOUT_SECS"] {
+        let Ok(raw) = env::var(key) else {
+            continue;
+        };
+        match raw.trim().parse::<u64>() {
+            Ok(n) if n > 0 => {
+                tracing::info!(model = %model_name, env = %key, secs = n, "IPC request deadline");
+                return std::time::Duration::from_secs(n);
+            }
+            Ok(_) => {
+                tracing::warn!(
+                    env_key = %key,
+                    value = %raw,
+                    "{key}=0 is invalid; using the next fallback"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    env_key = %key,
+                    value = %raw,
+                    "{key} is not a valid u64; using the next fallback"
+                );
+            }
+        }
+    }
+    std::time::Duration::from_secs(DEFAULT_IPC_TIMEOUT_SECS)
+}
+
+/// Resolve the per-model `/v1/embeddings` concurrency cap — the number of
+/// in-flight requests one model may hold before the handler answers
+/// 429 + `Retry-After: 1`. Same TEI `try_acquire_permit` load-shed pattern
+/// as the rerank semaphore (`main.rs`); a missing map entry means uncapped.
+///
+/// Lookup order:
+///   1. `MAX_CONCURRENT_EMBED_REQUESTS_<MODEL_KEY>` — per-model override.
+///   2. `MAX_CONCURRENT_EMBED_REQUESTS` — global.
+///   3. Formula: `pool_size(model) × intra_threads × 8`, floor 16 — the
+///      same headroom rule the rerank cap uses: the permit is held across
+///      queue wait + inference, so capping at exactly `pool × intra` would
+///      reject under bursts the worker gate already admits.
+///
+/// `0` at either level disables the cap for that model (legacy unlimited
+/// behaviour). Unparseable warns and falls through.
+///
+/// `global_cap_raw` is the raw `MAX_CONCURRENT_EMBED_REQUESTS` value and
+/// `global_pool_raw` the raw `EMBED_SESSION_POOL_SIZE` value — pass them in
+/// once rather than re-reading env per model.
+// `config` is compiled into both the lib and the binary; the only caller
+// lives in the binary (main.rs), so the lib-target dead-code pass sees no
+// caller — suppress rather than delete, same as
+// `resolve_embed_pool_size_for_model` above.
+#[allow(dead_code)]
+pub(crate) fn resolve_embed_concurrency_for_model(
+    model_name: &str,
+    global_cap_raw: Option<&str>,
+    global_pool_raw: Option<&str>,
+    intra_threads: usize,
+) -> Option<usize> {
+    let per_model_key = format!(
+        "MAX_CONCURRENT_EMBED_REQUESTS_{}",
+        model_env_key(model_name)
+    );
+
+    // 1. Per-model override.
+    if let Ok(raw) = env::var(&per_model_key) {
+        match raw.trim().parse::<usize>() {
+            Ok(0) => {
+                tracing::info!(
+                    model = %model_name,
+                    env = %per_model_key,
+                    "embed concurrency cap disabled"
+                );
+                return None;
+            }
+            Ok(n) => {
+                tracing::info!(
+                    model = %model_name,
+                    env = %per_model_key,
+                    cap = n,
+                    "per-model embed concurrency cap"
+                );
+                return Some(n);
+            }
+            Err(_) => {
+                tracing::warn!(
+                    model = %model_name,
+                    env = %per_model_key,
+                    value = %raw,
+                    "per-model embed concurrency cap is not a valid usize; using the next fallback"
+                );
+            }
+        }
+    }
+
+    // 2. Global override.
+    if let Some(raw) = global_cap_raw {
+        match raw.trim().parse::<usize>() {
+            Ok(0) => {
+                tracing::info!(
+                    "embed concurrency cap disabled via MAX_CONCURRENT_EMBED_REQUESTS=0"
+                );
+                return None;
+            }
+            Ok(n) => {
+                tracing::info!(
+                    model = %model_name,
+                    cap = n,
+                    "global embed concurrency cap"
+                );
+                return Some(n);
+            }
+            Err(_) => {
+                tracing::warn!(
+                    env_key = "MAX_CONCURRENT_EMBED_REQUESTS",
+                    value = %raw,
+                    "MAX_CONCURRENT_EMBED_REQUESTS is not a valid usize; using the auto default"
+                );
+            }
+        }
+    }
+
+    // 3. Formula default — `pool × intra × 8`, floor 16.
+    let (pool, _) = pool_size_for_model(model_name, global_pool_raw);
+    let auto = pool.saturating_mul(intra_threads).saturating_mul(8).max(16);
+    tracing::info!(
+        model = %model_name,
+        cap = auto,
+        pool_size = pool,
+        intra_threads,
+        "embed concurrency cap (auto: pool × intra × 8, floor 16)"
+    );
+    Some(auto)
 }
 
 /// Parse `EMBED_MULTI_PROCESS` env value.
@@ -2274,6 +2441,176 @@ mod tests {
     fn ready_probe_timeout_garbage_falls_back() {
         assert_eq!(parse_ready_probe_timeout(Some("not-a-number")), 2000);
         assert_eq!(parse_ready_probe_timeout(Some("")), 2000);
+    }
+
+    // -----------------------------------------------------------------
+    // IPC request deadline — resolve_ipc_timeout(model).
+    //   - per-model EMBED_IPC_TIMEOUT_SECS_<KEY> beats global
+    //   - global beats the 60 s default
+    //   - 0 / garbage at any level falls through to the next
+    // -----------------------------------------------------------------
+
+    /// Snapshot + restore the two env vars the resolver reads. Every test
+    /// below must run under this or a parallel `cargo test` run bleeds one
+    /// test's override into another's "unset" expectation.
+    fn with_ipc_timeout_env<R>(
+        per_model: Option<(&str, &str)>,
+        global: Option<&str>,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        let per_key =
+            per_model.map(|(m, _)| format!("EMBED_IPC_TIMEOUT_SECS_{}", model_env_key(m)));
+        let per_val = per_model.map(|(_, v)| v);
+        let prev_per = per_key.as_ref().map(|k| (k.clone(), env::var(k).ok()));
+        let prev_global = env::var("EMBED_IPC_TIMEOUT_SECS").ok();
+        unsafe {
+            if let Some(k) = &per_key {
+                env::remove_var(k);
+            }
+            env::remove_var("EMBED_IPC_TIMEOUT_SECS");
+            if let (Some(k), Some(v)) = (&per_key, per_val) {
+                env::set_var(k, v);
+            }
+            if let Some(v) = global {
+                env::set_var("EMBED_IPC_TIMEOUT_SECS", v);
+            }
+        }
+        let r = f();
+        unsafe {
+            match prev_per {
+                Some((k, Some(v))) => env::set_var(&k, v),
+                Some((k, None)) => env::remove_var(&k),
+                None => {}
+            }
+            match prev_global {
+                Some(v) => env::set_var("EMBED_IPC_TIMEOUT_SECS", v),
+                None => env::remove_var("EMBED_IPC_TIMEOUT_SECS"),
+            }
+        }
+        r
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ipc_timeout_default_is_60s() {
+        let d = with_ipc_timeout_env(None, None, || resolve_ipc_timeout("any-model"));
+        assert_eq!(d.as_secs(), DEFAULT_IPC_TIMEOUT_SECS);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ipc_timeout_global_override() {
+        let d = with_ipc_timeout_env(None, Some("120"), || resolve_ipc_timeout("any-model"));
+        assert_eq!(d.as_secs(), 120);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ipc_timeout_per_model_beats_global() {
+        let d = with_ipc_timeout_env(Some(("jina-code-v2", "45")), Some("120"), || {
+            resolve_ipc_timeout("jina-code-v2")
+        });
+        assert_eq!(d.as_secs(), 45);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ipc_timeout_per_model_does_not_leak_to_other_models() {
+        let d = with_ipc_timeout_env(Some(("jina-code-v2", "45")), None, || {
+            resolve_ipc_timeout("multilingual-e5-large")
+        });
+        assert_eq!(d.as_secs(), DEFAULT_IPC_TIMEOUT_SECS);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ipc_timeout_zero_falls_through_to_default() {
+        // A 0 s deadline would fail every request instantly — invalid, not honoured.
+        let d = with_ipc_timeout_env(Some(("jina-code-v2", "0")), Some("0"), || {
+            resolve_ipc_timeout("jina-code-v2")
+        });
+        assert_eq!(d.as_secs(), DEFAULT_IPC_TIMEOUT_SECS);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ipc_timeout_garbage_falls_through_to_global() {
+        let d = with_ipc_timeout_env(Some(("jina-code-v2", "soon")), Some("90"), || {
+            resolve_ipc_timeout("jina-code-v2")
+        });
+        assert_eq!(d.as_secs(), 90);
+    }
+
+    // -----------------------------------------------------------------
+    // Per-model embed concurrency cap — resolve_embed_concurrency_for_model.
+    //   - per-model MAX_CONCURRENT_EMBED_REQUESTS_<KEY> beats global
+    //   - global beats the pool × intra × 8 (floor 16) formula
+    //   - 0 disables (None); garbage falls through
+    // -----------------------------------------------------------------
+
+    #[test]
+    #[serial_test::serial]
+    fn embed_concurrency_formula_default() {
+        // pool 2 × intra 2 × 8 = 32 — same headroom rule as the rerank cap.
+        unsafe { env::remove_var("MAX_CONCURRENT_EMBED_REQUESTS_TEST_MDL") };
+        let cap = resolve_embed_concurrency_for_model("test-mdl", None, Some("2"), 2);
+        assert_eq!(cap, Some(32));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn embed_concurrency_floor_is_16() {
+        unsafe { env::remove_var("MAX_CONCURRENT_EMBED_REQUESTS_TEST_MDL") };
+        let cap = resolve_embed_concurrency_for_model("test-mdl", None, Some("1"), 1);
+        assert_eq!(cap, Some(16));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn embed_concurrency_global_override() {
+        unsafe { env::remove_var("MAX_CONCURRENT_EMBED_REQUESTS_TEST_MDL") };
+        let cap = resolve_embed_concurrency_for_model("test-mdl", Some("64"), Some("2"), 2);
+        assert_eq!(cap, Some(64));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn embed_concurrency_global_zero_disables() {
+        unsafe { env::remove_var("MAX_CONCURRENT_EMBED_REQUESTS_TEST_MDL") };
+        let cap = resolve_embed_concurrency_for_model("test-mdl", Some("0"), Some("2"), 2);
+        assert_eq!(cap, None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn embed_concurrency_per_model_overrides_global() {
+        let prev = env::var("MAX_CONCURRENT_EMBED_REQUESTS_TEST_MDL").ok();
+        unsafe { env::set_var("MAX_CONCURRENT_EMBED_REQUESTS_TEST_MDL", "7") };
+        let cap = resolve_embed_concurrency_for_model("test-mdl", Some("64"), Some("2"), 2);
+        unsafe {
+            match prev {
+                Some(v) => env::set_var("MAX_CONCURRENT_EMBED_REQUESTS_TEST_MDL", v),
+                None => env::remove_var("MAX_CONCURRENT_EMBED_REQUESTS_TEST_MDL"),
+            }
+        }
+        assert_eq!(cap, Some(7));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn embed_concurrency_per_model_zero_disables_only_that_model() {
+        let prev = env::var("MAX_CONCURRENT_EMBED_REQUESTS_TEST_MDL").ok();
+        unsafe { env::set_var("MAX_CONCURRENT_EMBED_REQUESTS_TEST_MDL", "0") };
+        let cap = resolve_embed_concurrency_for_model("test-mdl", Some("64"), Some("2"), 2);
+        let other = resolve_embed_concurrency_for_model("other-mdl", Some("64"), Some("2"), 2);
+        unsafe {
+            match prev {
+                Some(v) => env::set_var("MAX_CONCURRENT_EMBED_REQUESTS_TEST_MDL", v),
+                None => env::remove_var("MAX_CONCURRENT_EMBED_REQUESTS_TEST_MDL"),
+            }
+        }
+        assert_eq!(cap, None, "per-model 0 disables that model");
+        assert_eq!(other, Some(64), "global cap still applies to other models");
     }
 }
 

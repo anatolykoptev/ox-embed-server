@@ -344,6 +344,7 @@ mod tests {
             cache: Arc::new(crate::cache::EmbeddingCache::new(0)),
             token_cache: Arc::new(crate::token_cache::TokenCache::new(0)),
             rerank_semaphore: None,
+            embed_semaphores: HashMap::new(),
             embed_max_input_array: 32,
             rerank_max_input_docs: 32,
             worker_pool: None,
