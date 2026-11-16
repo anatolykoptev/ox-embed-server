@@ -307,7 +307,12 @@ pub async fn embeddings(
                             [("retry-after", "5")],
                             Json(ErrorResponse {
                                 error: ErrorDetail {
-                                    message: "inference failed: worker respawning".to_string(),
+                                    message: if matches!(&e, crate::supervisor::pool::DispatchError::Ipc(io) if io.kind() == std::io::ErrorKind::TimedOut) {
+                                        "inference failed: worker did not answer in time"
+                                    } else {
+                                        "inference failed: worker respawning"
+                                    }
+                                    .to_string(),
                                     error_type: "worker_unavailable",
                                 },
                             }),

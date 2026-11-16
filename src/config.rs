@@ -877,27 +877,37 @@ pub(crate) fn resolve_embed_pool_size_for_model(
     model_key: &str,
     global_raw: Option<&str>,
 ) -> usize {
+    let (size, per_model_key) = pool_size_for_model(model_key, global_raw);
+    if let Some(key) = per_model_key {
+        tracing::info!(
+            model = %model_key,
+            env = %key,
+            pool_size = size,
+            "per-model EMBED_SESSION_POOL_SIZE override"
+        );
+    }
+    size
+}
+
+/// Pool-size resolution without the override info line, for callers that
+/// only need the number (the concurrency-cap sizing) so the line is not
+/// logged twice per model. Returns the per-model env key when it applied.
+fn pool_size_for_model(model_key: &str, global_raw: Option<&str>) -> (usize, Option<String>) {
     let suffix = model_env_key(model_key);
     let per_model_key = format!("EMBED_SESSION_POOL_SIZE_{suffix}");
-    let per_model_raw = env::var(&per_model_key).ok();
-    if let Some(ref raw) = per_model_raw {
+    if let Ok(raw) = env::var(&per_model_key) {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
             let parsed = parse_embed_pool_size(Some(trimmed), Some(per_model_key.as_str()));
-            tracing::info!(
-                model = %model_key,
-                env = %per_model_key,
-                pool_size = parsed,
-                "per-model EMBED_SESSION_POOL_SIZE override"
-            );
-            return parsed;
+            return (parsed, Some(per_model_key));
         }
     }
-    parse_embed_pool_size(global_raw, None)
+    (parse_embed_pool_size(global_raw, None), None)
 }
 
-/// Default whole-IPC deadline (permit wait + UDS connect + write + read)
-/// applied per request by `WorkerClient::send_request`.
+/// Default IPC deadline (UDS connect + write + read, started after the
+/// gate permit is granted — queueing is not bounded) applied per request
+/// by `WorkerClient::send_request`.
 ///
 /// 60 s sits above the worst measured pass — e5 batches up to ~28 s,
 /// rerank up to 15 s, code-rank mean 5.2 s — so a healthy inference never
@@ -1041,7 +1051,7 @@ pub(crate) fn resolve_embed_concurrency_for_model(
     }
 
     // 3. Formula default — `pool × intra × 8`, floor 16.
-    let pool = resolve_embed_pool_size_for_model(model_name, global_pool_raw);
+    let (pool, _) = pool_size_for_model(model_name, global_pool_raw);
     let auto = pool.saturating_mul(intra_threads).saturating_mul(8).max(16);
     tracing::info!(
         model = %model_name,

@@ -25,8 +25,9 @@ pub struct WorkerClient {
     /// Caps concurrent in-flight connections (capacity = `conns` arg to
     /// connect()) and admits interactive requests before bulk ones.
     gate: Arc<PriorityGate>,
-    /// Whole-exchange deadline for one request: permit wait + UDS connect +
-    /// frame write + response read. Resolved per model from
+    /// Deadline for one request's exchange: UDS connect + frame write +
+    /// response read, started AFTER the gate permit is granted (queueing is
+    /// not bounded by it). Resolved per model from
     /// `EMBED_IPC_TIMEOUT_SECS[_<MODEL_KEY>]` at `WorkerSupervisor::launch`
     /// (default `config::DEFAULT_IPC_TIMEOUT_SECS`). A wedged or saturated
     /// worker must surface as a bounded, retryable `TimedOut` error — not
@@ -75,15 +76,28 @@ impl WorkerClient {
         permit
     }
 
-    /// Send a request and receive a response over a fresh UDS connection,
-    /// bounded by `request_deadline` end-to-end (permit wait + connect +
-    /// write + read). On expiry the in-flight future is dropped — the fresh
-    /// per-request connection closes, the gate permit releases — and a
-    /// `TimedOut` I/O error surfaces as `DispatchError::Ipc` → 503 +
-    /// Retry-After (`is_transient` treats it as worker death). Without
-    /// this bound a wedged worker hangs every request queued behind it
-    /// until the HTTP caller gives up.
+    /// Send a request and receive a response over a fresh UDS connection.
+    ///
+    /// Queueing and the exchange are bounded separately. The gate wait is
+    /// left to the priority gate and the caller: under a reindex backlog a
+    /// request legitimately waits tens of seconds for a slot and still
+    /// succeeds, so a deadline that covered it would turn those slow
+    /// successes into 503s (and the worker, which only reads the socket
+    /// between requests, would keep running the abandoned request while
+    /// the freed slot admitted the next one). Once the slot is granted,
+    /// connect + write + read are bounded by `request_deadline`; on expiry
+    /// the in-flight future is dropped — the fresh per-request connection
+    /// closes, the permit releases — and a `TimedOut` I/O error surfaces as
+    /// `DispatchError::Ipc` → 503 + Retry-After. Without this bound a
+    /// wedged worker hangs the request until the HTTP caller gives up.
     async fn send_request(&self, req: WorkerRequest) -> std::io::Result<WorkerResponse> {
+        // Model + input count label the supervisor-wait metric.
+        let (model, n_inputs) = match &req {
+            WorkerRequest::Embed(r) => (r.model.clone(), r.texts.len()),
+            WorkerRequest::Rerank(r) => (r.model.clone(), r.documents.len()),
+            WorkerRequest::Splade(r) => (r.model.clone(), r.texts.len()),
+        };
+        let _permit = self.acquire_slot(&model, n_inputs).await;
         match tokio::time::timeout(self.request_deadline, self.exchange(req)).await {
             Ok(r) => r,
             Err(_elapsed) => Err(std::io::Error::new(
@@ -96,17 +110,11 @@ impl WorkerClient {
         }
     }
 
-    /// The bounded exchange [`send_request`] wraps: gate permit, fresh UDS
-    /// connection, frame write, response read + id check. The connection is
-    /// dropped when this future completes or is cancelled.
+    /// The bounded exchange [`send_request`] wraps, run while holding a
+    /// gate permit: fresh UDS connection, frame write, response read + id
+    /// check. The connection is dropped when this future completes or is
+    /// cancelled.
     async fn exchange(&self, req: WorkerRequest) -> std::io::Result<WorkerResponse> {
-        // Model + input count label the supervisor-wait metric.
-        let (model, n_inputs) = match &req {
-            WorkerRequest::Embed(r) => (r.model.clone(), r.texts.len()),
-            WorkerRequest::Rerank(r) => (r.model.clone(), r.documents.len()),
-            WorkerRequest::Splade(r) => (r.model.clone(), r.texts.len()),
-        };
-        let _permit = self.acquire_slot(&model, n_inputs).await;
         let req_id = req.request_id();
         let mut stream = UnixStream::connect(&self.socket_path).await?;
         write_frame(&mut stream, &req).await?;
@@ -440,6 +448,29 @@ mod tests {
             ),
             Some(0.0),
             "waiters gauge leaked on cancel:\n{rendered}"
+        );
+    }
+
+    /// A long gate wait must NOT consume the exchange deadline: the deadline
+    /// starts once the slot is granted. Hold the only slot for longer than
+    /// the (short) deadline, release it, and the request must still succeed.
+    #[tokio::test]
+    async fn long_gate_wait_does_not_expire_the_exchange_deadline() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let sock = dir.path().join("w.sock");
+        let _srv = spawn_echo_worker(&sock);
+        let client = WorkerClient::connect(sock, 1, std::time::Duration::from_millis(150))
+            .await
+            .expect("connect");
+        let held = client.gate.acquire(Priority::Interactive).await;
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            drop(held);
+        });
+        let r = client.dispatch_embed("m".into(), vec!["t".into()], 8).await;
+        assert!(
+            r.is_ok(),
+            "gate wait longer than the exchange deadline must not time out: {r:?}"
         );
     }
 
