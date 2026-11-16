@@ -23,7 +23,7 @@
 //! - Graceful shutdown via ControlMessage::Shutdown before kill_on_drop SIGKILL.
 
 use crate::ipc::client::WorkerClient;
-use crate::supervisor::util::{resolve_duration_secs_env, resolve_worker_nice};
+use crate::supervisor::util::{resolve_duration_secs_env, resolve_worker_nice, worker_nice_var};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -261,6 +261,31 @@ pub struct SpawnSpec {
     pub env_extra: Vec<(String, String)>,
 }
 
+/// This process's own nice value (`getpriority(PRIO_PROCESS, 0)`).
+fn own_priority() -> i32 {
+    // getpriority returns -1 both for nice -1 and for an error: clear errno
+    // first and look at it afterwards. Any failure reads as 0 (no clamp).
+    // SAFETY: plain libc calls; `__errno_location` is the thread's errno slot.
+    unsafe {
+        *libc::__errno_location() = 0;
+        let p = libc::getpriority(libc::PRIO_PROCESS as _, 0);
+        if p == -1 && *libc::__errno_location() != 0 {
+            0
+        } else {
+            p
+        }
+    }
+}
+
+/// The nice value a child may actually be given: `setpriority(2)` is
+/// absolute, and moving a process to a nice value LOWER than its current one
+/// (a higher priority) needs CAP_SYS_NICE. A request below our own nice
+/// (e.g. 5 under a supervisor at 10) would fail the child's `pre_exec` with
+/// EACCES and the model would never come up, so it is raised to our own.
+fn effective_nice(target: i32, current: i32) -> i32 {
+    target.max(current)
+}
+
 /// Lower the scheduling priority of the child to `nice` BEFORE it execs.
 ///
 /// Must be a `pre_exec` hook, not a `setpriority(pid)` after `spawn`: the
@@ -269,14 +294,28 @@ pub struct SpawnSpec {
 /// moves only the main thread. A nice value set before `exec` is inherited by
 /// every thread the worker ever creates.
 ///
-/// `0` installs nothing: the worker keeps the supervisor's priority.
-fn apply_nice(cmd: &mut Command, nice: i32) {
-    if nice == 0 {
+/// `0` installs nothing: the worker keeps the supervisor's priority. A value
+/// below our own nice is clamped to it in the PARENT, before fork (counted
+/// under `var` in `embed_config_fallback_total`), so the hook never asks for a
+/// privileged raise.
+fn apply_nice(cmd: &mut Command, requested: i32, var: &str) {
+    if requested == 0 {
         return;
     }
+    let nice = effective_nice(requested, own_priority());
+    if nice != requested {
+        crate::env_parse::note_fallback(
+            var,
+            &requested.to_string(),
+            "an integer not below the supervisor's own nice (a higher priority than the \
+             supervisor needs CAP_SYS_NICE)",
+            &nice,
+        );
+    }
     // SAFETY: the closure runs in the forked child before exec and calls only
-    // setpriority(2), which is async-signal-safe; it allocates nothing and
-    // takes no locks.
+    // setpriority(2) (a raw syscall wrapper) and, on failure, reads errno; it
+    // allocates nothing and takes no locks. The value was clamped to at least
+    // our own nice above, so the call needs no privilege.
     unsafe {
         cmd.pre_exec(move || {
             if libc::setpriority(libc::PRIO_PROCESS as _, 0, nice) == -1 {
@@ -525,7 +564,7 @@ impl WorkerSupervisor {
             cmd.env(k, v);
         }
         let nice = resolve_worker_nice(&spec.model);
-        apply_nice(&mut cmd, nice);
+        apply_nice(&mut cmd, nice, &worker_nice_var(&spec.model));
         if nice != 0 {
             tracing::info!(model = %spec.model, nice, "worker scheduling priority lowered");
         }
@@ -2379,7 +2418,7 @@ mod tests {
         let want = distinct_nice();
         let mut cmd = Command::new("sleep");
         cmd.arg("30").kill_on_drop(true);
-        apply_nice(&mut cmd, want);
+        apply_nice(&mut cmd, want, "EMBED_WORKER_NICE_TEST");
         let child = cmd.spawn().expect("spawn sleep");
         let pid = child.id().expect("child pid");
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read child stat");
@@ -2391,12 +2430,47 @@ mod tests {
         );
     }
 
+    /// A target BELOW our own nice (0 < target < own) is not a privileged
+    /// raise: `apply_nice` clamps it to our own value in the parent, so the
+    /// spawn succeeds and the child runs at `max(target, own)`. Unclamped,
+    /// the child's `setpriority` fails with EACCES and the spawn errors (the
+    /// build box runs tests at nice 10, so target 5 reproduces it).
+    ///
+    /// RED-proven: making `effective_nice` return `target` fails with
+    /// "spawn must succeed" (EACCES) on a box running tests under nice.
+    #[tokio::test]
+    async fn apply_nice_clamps_target_below_own_priority() {
+        let own = own_nice();
+        let target = if own >= 2 { own - 1 } else { 5 };
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30").kill_on_drop(true);
+        apply_nice(&mut cmd, target, "EMBED_WORKER_NICE_TEST");
+        let child = cmd
+            .spawn()
+            .expect("spawn must succeed: a request below our own nice is clamped, not EACCES");
+        let pid = child.id().expect("child pid");
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read child stat");
+        assert_eq!(
+            nice_from_stat(&stat),
+            target.max(own),
+            "child nice must be max(target {target}, own {own}): {stat}"
+        );
+    }
+
+    #[test]
+    fn effective_nice_never_asks_for_a_raise() {
+        assert_eq!(effective_nice(5, 10), 10);
+        assert_eq!(effective_nice(10, 10), 10);
+        assert_eq!(effective_nice(15, 10), 15);
+        assert_eq!(effective_nice(7, 0), 7);
+    }
+
     /// `apply_nice(_, 0)` installs no hook: the child keeps our priority.
     #[tokio::test]
     async fn apply_nice_zero_leaves_priority_unchanged() {
         let mut cmd = Command::new("sleep");
         cmd.arg("30").kill_on_drop(true);
-        apply_nice(&mut cmd, 0);
+        apply_nice(&mut cmd, 0, "EMBED_WORKER_NICE_TEST");
         let child = cmd.spawn().expect("spawn sleep");
         let pid = child.id().expect("child pid");
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read child stat");

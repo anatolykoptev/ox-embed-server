@@ -344,14 +344,65 @@ mod tests {
         v
     }
 
-    /// Every line of `path` up to its trailing test module (the first
-    /// column-0 `#[cfg(test)]`; every file here keeps its tests last).
+    /// Net `{` minus `}` on `line`, ignoring string / char literals and
+    /// trailing `//` comments.
+    fn brace_delta(line: &str) -> i32 {
+        let c: Vec<char> = line.chars().collect();
+        let (mut i, mut d) = (0, 0);
+        while i < c.len() {
+            match c[i] {
+                '/' if c.get(i + 1) == Some(&'/') => break,
+                '"' => {
+                    i += 1;
+                    while i < c.len() && c[i] != '"' {
+                        if c[i] == '\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                }
+                '\'' => {
+                    // 'x' or '\x' is a char literal; `'a` is a lifetime.
+                    if c.get(i + 2) == Some(&'\'') {
+                        i += 2;
+                    } else if c.get(i + 1) == Some(&'\\') && c.get(i + 3) == Some(&'\'') {
+                        i += 3;
+                    }
+                }
+                '{' => d += 1,
+                '}' => d -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        d
+    }
+
+    /// Every line of `path` except the `#[cfg(test)]` items themselves
+    /// (attribute through the closing brace, or the `;` of a bodiless item),
+    /// at any position in the file. Code after a test module is production
+    /// code and is scanned.
     fn lines_of(path: &Path) -> Vec<String> {
         let text = std::fs::read_to_string(path).expect("read source");
-        text.lines()
-            .take_while(|l| *l != "#[cfg(test)]")
-            .map(str::to_string)
-            .collect()
+        let mut out = Vec::new();
+        let (mut skipping, mut depth, mut opened) = (false, 0i32, false);
+        for line in text.lines() {
+            if !skipping && line.trim() == "#[cfg(test)]" {
+                (skipping, depth, opened) = (true, 0, false);
+                continue;
+            }
+            if skipping {
+                let code = line.split("//").next().unwrap_or("");
+                depth += brace_delta(line);
+                opened |= code.contains('{');
+                if (opened && depth <= 0) || (!opened && code.trim_end().ends_with(';')) {
+                    skipping = false;
+                }
+                continue;
+            }
+            out.push(line.to_string());
+        }
+        out
     }
 
     /// `lines_of`, minus files that are test code or this module itself
@@ -443,14 +494,40 @@ mod tests {
                 .any(|c| notes_fallback(c, depth - 1))
     }
 
-    /// A marker may sit on the read's line, or on a comment line above it
-    /// (3 lines) or just below it (rustfmt moves trailing comments inward).
-    fn marker_near<'a>(lines: &'a [String], i: usize, marker: &str) -> Option<&'a str> {
-        let lo = i.saturating_sub(3);
-        let hi = (i + 2).min(lines.len() - 1);
-        (lo..=hi)
-            .filter_map(|j| lines[j].split(marker).nth(1))
-            .next()
+    /// Which of `reads` (line indices) are accounted for by a `marker`
+    /// comment. A marker belongs to ONE read: the nearest within `reach_above` lines
+    /// above .. `reach_below` lines below it (same line first, then the read below the
+    /// marker, then the one above), so a marker cannot vouch for a neighbour.
+    /// Returns, per read, the text after the marker.
+    fn claim_markers<'a>(
+        lines: &'a [String],
+        reads: &[usize],
+        marker: &str,
+        reach_above: usize,
+        reach_below: usize,
+    ) -> Vec<Option<&'a str>> {
+        let mut claimed: Vec<Option<&str>> = vec![None; reads.len()];
+        for (m, line) in lines.iter().enumerate() {
+            let Some(text) = line.split(marker).nth(1) else {
+                continue;
+            };
+            // Candidate reads: r in [m - reach_above .. m + reach_below],
+            // nearest first; a read below the marker beats one above.
+            let mut best: Option<(usize, usize)> = None; // (cost, read index)
+            for (k, &r) in reads.iter().enumerate() {
+                if claimed[k].is_some() || r + reach_above < m || r > m + reach_below {
+                    continue;
+                }
+                let cost = if r >= m { (r - m) * 2 } else { (m - r) * 2 + 1 };
+                if best.is_none_or(|(c, _)| cost < c) {
+                    best = Some((cost, k));
+                }
+            }
+            if let Some((_, k)) = best {
+                claimed[k] = Some(text);
+            }
+        }
+        claimed
     }
 
     /// The parse sites are enumerated from the code: any `std::env::var` read
@@ -464,34 +541,64 @@ mod tests {
         let mut raw_reads = 0usize;
         for path in src_files() {
             let lines = production_lines(&path);
+            let mut direct_at = Vec::new();
+            let mut raw_at = Vec::new();
             for (i, line) in lines.iter().enumerate() {
                 let code = line.split("//").next().unwrap_or("");
                 let loc = format!("{}:{}", path.display(), i + 1);
+                // `use std::env::var as getenv;` / `use std::env::{var, ..}`
+                // would hide every later read from the `env::var(` search.
+                let t = code.trim_start();
+                if t.starts_with("use ")
+                    && t.contains("env")
+                    && t.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .any(|w| w == "var" || w == "var_os")
+                {
+                    problems.push(format!(
+                        "{loc}: imports env::var / var_os by name; call it as env::var(..) \
+                         so the read is visible to this scan"
+                    ));
+                }
                 if code.contains("env::var(") || code.contains("env::var_os(") {
-                    direct += 1;
-                    if marker_near(&lines, i, "// env-strict:").is_none()
-                        && marker_near(&lines, i, "// env-raw:").is_none()
-                    {
-                        problems.push(format!(
-                            "{loc}: raw env read without `// env-strict:` / `// env-raw:` \
-                             marker; route it through crate::env_parse"
-                        ));
-                    }
+                    direct_at.push(i);
                 }
                 if code.contains("env_parse::raw(") {
-                    raw_reads += 1;
-                    match marker_near(&lines, i, "// parsed-by:") {
-                        None => problems.push(format!(
-                            "{loc}: env_parse::raw without `// parsed-by: <fn>`"
-                        )),
-                        Some(p) => {
-                            let p = p.trim();
-                            if fn_body(p).is_none() {
-                                problems.push(format!("{loc}: parsed-by fn `{p}` not found"));
-                            } else if !notes_fallback(p, 3) {
-                                problems
-                                    .push(format!("{loc}: parser `{p}` never notes a fallback"));
-                            }
+                    raw_at.push(i);
+                }
+            }
+            direct += direct_at.len();
+            raw_reads += raw_at.len();
+            // A marker is the read's own: same line, the line above, or the
+            // line below (rustfmt moves a trailing comment inside the
+            // statement).
+            let strict = claim_markers(&lines, &direct_at, "// env-strict:", 1, 1);
+            let raw = claim_markers(&lines, &direct_at, "// env-raw:", 1, 1);
+            for (k, &i) in direct_at.iter().enumerate() {
+                if strict[k].is_none() && raw[k].is_none() {
+                    problems.push(format!(
+                        "{}:{}: raw env read without its own `// env-strict:` / `// env-raw:` \
+                         marker (same line, or the line directly above); route it through \
+                         crate::env_parse",
+                        path.display(),
+                        i + 1
+                    ));
+                }
+            }
+            // `parsed-by` sits above a multi-line statement whose raw read can
+            // be a few lines down.
+            let parsers = claim_markers(&lines, &raw_at, "// parsed-by:", 3, 4);
+            for (k, &i) in raw_at.iter().enumerate() {
+                let loc = format!("{}:{}", path.display(), i + 1);
+                match parsers[k] {
+                    None => problems.push(format!(
+                        "{loc}: env_parse::raw without its own `// parsed-by: <fn>`"
+                    )),
+                    Some(p) => {
+                        let p = p.trim();
+                        if fn_body(p).is_none() {
+                            problems.push(format!("{loc}: parsed-by fn `{p}` not found"));
+                        } else if !notes_fallback(p, 3) {
+                            problems.push(format!("{loc}: parser `{p}` never notes a fallback"));
                         }
                     }
                 }

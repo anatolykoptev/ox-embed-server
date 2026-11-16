@@ -120,7 +120,7 @@ Environment variables (parsed in `src/config.rs`):
 | `EMBED_VERSION` | `dev` | Stamped into `embed_build_info`. |
 | `AUTO_TRUNCATE` | `true` | TEI-compat. Only literal `false` (case-insensitive) disables; `0`/`no`/`off`/empty leave it enabled. |
 
-A value that cannot be used (garbage, `0` where zero is meaningless, out of range) never stops the server: the default is used, one `warn` line names the variable and the value, and `embed_config_fallback_total{env_var}` is incremented. A set per-model variable whose suffix matches no loaded model (typo, lower case, `-` instead of `_`) is reported the same way at startup. Alert on `increase(embed_config_fallback_total[1h]) > 0`.
+A value that cannot be used (garbage, `0` where zero is meaningless, out of range) does not stop the server for the tuning knobs: the default is used, one `warn` line names the variable and the value, and `embed_config_fallback_total{env_var}` is incremented. A few knobs are strict and refuse to start instead (`EMBED_PORT`, `EMBED_MODELS`, `EMBED_INTRA_THREADS`, `EMBED_DEFAULT_MODEL`, `RERANKER_MODELS`, `SPLADE_MODELS`, `EMBED_ARENA_*`, `BATCH_LENGTH_RATIO_THRESHOLD`, `EMBED_BATCH_INVARIANT*`, `EMBED_INPUT_PREFIX_<KEY>`, and the worker's `EMBED_WORKER_{KIND,INTRA_THREADS,POOL_SIZE}`). A set per-model variable whose suffix matches no loaded model (typo, lower case, `-` instead of `_`) is reported the same way at startup. Alert on `embed_config_fallback_total > 0`: a series is created by its first increment, so it is born at 1 and `increase(...)` never sees a step.
 
 Current production `EMBED_MODELS`:
 

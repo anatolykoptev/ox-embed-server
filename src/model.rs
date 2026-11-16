@@ -831,6 +831,7 @@ fn resolve_batch_invariant(model_key: &str) -> Result<bool, String> {
     // env-strict: an unparseable value is an error (parse_batch_invariant)
     let raw = std::env::var(&per_model)
         .ok()
+        // env-strict: same parse_batch_invariant error for the global
         .or_else(|| std::env::var("EMBED_BATCH_INVARIANT").ok());
     parse_batch_invariant(raw.as_deref()).map_err(|e| format!("model '{model_key}': {e}"))
 }
@@ -864,7 +865,7 @@ pub(crate) fn plan_request(lens: &[usize], ratio: f32, batch_invariant: bool) ->
 /// the same typo-guard posture the other knobs in this crate take, because a
 /// silent 0.0 here would disable the split and look identical to "off by
 /// choice" on the dashboard.
-fn resolve_subbatch_ratio(model_key: &str) -> f32 {
+pub(crate) fn resolve_subbatch_ratio(model_key: &str) -> f32 {
     let per_model = format!(
         "EMBED_SUBBATCH_RATIO_{}",
         crate::config::model_env_key(model_key)
@@ -872,7 +873,7 @@ fn resolve_subbatch_ratio(model_key: &str) -> f32 {
     // The per-model var wins; a set-but-garbage per-model value is noted under
     // its own name rather than silently handing over to the global.
     // parsed-by: parse_subbatch_ratio
-    if let Some(raw) = crate::env_parse::raw(&per_model) {
+    if let Some(raw) = crate::env_parse::raw(&per_model).filter(|r| !r.trim().is_empty()) {
         return parse_subbatch_ratio(Some(&raw), &per_model);
     }
     // parsed-by: parse_subbatch_ratio
@@ -883,8 +884,8 @@ fn resolve_subbatch_ratio(model_key: &str) -> f32 {
 /// Pure half of [`resolve_subbatch_ratio`], split out so the fallback
 /// behaviour is testable without mutating process env.
 pub(crate) fn parse_subbatch_ratio(raw: Option<&str>, var: &str) -> f32 {
-    match raw {
-        None | Some("") => DEFAULT_SUBBATCH_RATIO,
+    match raw.filter(|s| !s.trim().is_empty()) {
+        None => DEFAULT_SUBBATCH_RATIO,
         Some(s) => match s.trim().parse::<f32>() {
             Ok(v) if v.is_finite() && v >= 0.0 => v,
             _ => {

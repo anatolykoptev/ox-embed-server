@@ -44,7 +44,8 @@ pub fn resolve_max_waiters_for_model(pool_size: usize, model_name: &str) -> usiz
 
     // 1. Per-model override.
     // parsed-by: resolve_max_waiters_for_model
-    if let Some(raw) = crate::env_parse::raw(&per_model_var) {
+    // A blank value is unset, not a typo.
+    if let Some(raw) = crate::env_parse::raw(&per_model_var).filter(|r| !r.trim().is_empty()) {
         match raw.trim().parse::<usize>() {
             Ok(n) if n > 0 => {
                 tracing::info!(
@@ -70,7 +71,7 @@ pub fn resolve_max_waiters_for_model(pool_size: usize, model_name: &str) -> usiz
 
     // 2. Global override.
     // parsed-by: resolve_max_waiters_for_model
-    match crate::env_parse::raw("EMBED_MAX_WAITERS") {
+    match crate::env_parse::raw("EMBED_MAX_WAITERS").filter(|r| !r.trim().is_empty()) {
         None => formula_default(),
         Some(raw) => match raw.trim().parse::<usize>() {
             Ok(n) if n > 0 => n,
@@ -200,5 +201,35 @@ mod tests {
         }
 
         assert_eq!(val, 200);
+    }
+
+    /// A blank per-model or global value is unset (the formula applies) and
+    /// is not counted as garbage.
+    #[test]
+    #[serial]
+    fn blank_values_are_unset_not_garbage() {
+        unsafe {
+            std::env::set_var("EMBED_MAX_WAITERS_BLANK_MODEL", "  ");
+            std::env::set_var("EMBED_MAX_WAITERS", " ");
+        }
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let mut got = 0;
+        metrics::with_local_recorder(&recorder, || {
+            got = resolve_max_waiters_for_model(1, "blank-model");
+        });
+        unsafe {
+            std::env::remove_var("EMBED_MAX_WAITERS_BLANK_MODEL");
+            std::env::remove_var("EMBED_MAX_WAITERS");
+        }
+        assert_eq!(
+            got,
+            WAITERS_POOL_MULTIPLIER.max(WAITERS_FLOOR),
+            "formula applies"
+        );
+        assert!(
+            !handle.render().contains("embed_config_fallback_total"),
+            "blank values must not be counted as garbage"
+        );
     }
 }

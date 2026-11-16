@@ -864,7 +864,8 @@ pub(crate) fn resolve_ipc_timeout(model_name: &str) -> std::time::Duration {
     let per_model_key = format!("EMBED_IPC_TIMEOUT_SECS_{suffix}");
     for key in [per_model_key.as_str(), "EMBED_IPC_TIMEOUT_SECS"] {
         // parsed-by: resolve_ipc_timeout
-        let Some(raw) = crate::env_parse::raw(key) else {
+        // A blank value is unset, not a typo.
+        let Some(raw) = crate::env_parse::raw(key).filter(|r| !r.trim().is_empty()) else {
             continue;
         };
         match raw.trim().parse::<u64>() {
@@ -920,7 +921,8 @@ pub(crate) fn resolve_embed_concurrency_for_model(
 
     // 1. Per-model override.
     // parsed-by: resolve_embed_concurrency_for_model
-    if let Some(raw) = crate::env_parse::raw(&per_model_key) {
+    // A blank value is unset, not a typo.
+    if let Some(raw) = crate::env_parse::raw(&per_model_key).filter(|r| !r.trim().is_empty()) {
         match raw.trim().parse::<usize>() {
             Ok(0) => {
                 tracing::info!(
@@ -949,7 +951,7 @@ pub(crate) fn resolve_embed_concurrency_for_model(
     }
 
     // 2. Global override.
-    if let Some(raw) = global_cap_raw {
+    if let Some(raw) = global_cap_raw.filter(|r| !r.trim().is_empty()) {
         match raw.trim().parse::<usize>() {
             Ok(0) => {
                 tracing::info!(
@@ -3044,6 +3046,46 @@ mod env_fallback_tests {
         assert!(
             out.contains("embed_config_fallback_total{env_var=\"W\"} 1"),
             "{out}"
+        );
+    }
+
+    /// A blank value (empty line in an env file, `KEY=" "`) means unset: the
+    /// hand-rolled resolvers must not count it as a typo, and a blank
+    /// per-model value must fall through to the global exactly like unset.
+    #[test]
+    #[serial_test::serial]
+    fn blank_values_are_unset_not_garbage() {
+        const PM_IPC: &str = "EMBED_IPC_TIMEOUT_SECS_BLANK_MODEL";
+        const PM_CAP: &str = "MAX_CONCURRENT_EMBED_REQUESTS_BLANK_MODEL";
+        const PM_RATIO: &str = "EMBED_SUBBATCH_RATIO_BLANK_MODEL";
+        for v in [PM_IPC, PM_CAP, PM_RATIO] {
+            unsafe { std::env::set_var(v, "  ") };
+        }
+        unsafe { std::env::set_var("EMBED_IPC_TIMEOUT_SECS", " ") };
+        let mut got = None;
+        let out = counted(|| {
+            got = Some((
+                resolve_ipc_timeout("blank-model"),
+                resolve_embed_concurrency_for_model("blank-model", Some("  "), None, 2),
+                crate::model::parse_subbatch_ratio(Some("  "), "T"),
+                crate::model::resolve_subbatch_ratio("blank-model"),
+            ));
+        });
+        for v in [PM_IPC, PM_CAP, PM_RATIO] {
+            unsafe { std::env::remove_var(v) };
+        }
+        unsafe { std::env::remove_var("EMBED_IPC_TIMEOUT_SECS") };
+        let (ipc, cap, ratio, ratio_env) = got.unwrap();
+        assert_eq!(
+            ipc,
+            std::time::Duration::from_secs(DEFAULT_IPC_TIMEOUT_SECS)
+        );
+        assert_eq!(cap, Some(16), "blank cap vars fall to the auto formula");
+        assert_eq!(ratio, crate::model::DEFAULT_SUBBATCH_RATIO);
+        assert_eq!(ratio_env, crate::model::DEFAULT_SUBBATCH_RATIO);
+        assert!(
+            !out.contains("embed_config_fallback_total"),
+            "blank values must not be counted as garbage:\n{out}"
         );
     }
 }

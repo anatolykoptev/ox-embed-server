@@ -34,6 +34,11 @@ pub(crate) fn resolve_duration_secs_env(
     }
 }
 
+/// Name of the per-model nice variable for `model`.
+pub(crate) fn worker_nice_var(model: &str) -> String {
+    format!("EMBED_WORKER_NICE_{}", crate::config::model_env_key(model))
+}
+
 /// Nice value for the worker of `model`, from `EMBED_WORKER_NICE_<MODEL_KEY>`
 /// (key = `config::model_env_key`, e.g. `EMBED_WORKER_NICE_JINA_CODE_V2`).
 ///
@@ -42,7 +47,7 @@ pub(crate) fn resolve_duration_secs_env(
 /// inherits the supervisor's priority, as before); negative, above 19 or
 /// non-numeric → noted and `0`.
 pub(crate) fn resolve_worker_nice(model: &str) -> i32 {
-    let var = format!("EMBED_WORKER_NICE_{}", crate::config::model_env_key(model));
+    let var = worker_nice_var(model);
     // parsed-by: resolve_worker_nice
     let raw = crate::env_parse::raw(&var);
     crate::env_parse::parse_or(
