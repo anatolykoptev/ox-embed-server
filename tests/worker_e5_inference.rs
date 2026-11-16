@@ -12,6 +12,7 @@ mod common;
 use common::ChildGuard;
 use embed_server::ipc::frame::{read_frame, write_frame};
 use embed_server::ipc::protocol::{EmbedRequest, WorkerRequest, WorkerResponse};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -58,6 +59,7 @@ async fn worker_infers_e5_batch() {
         .env(common::MEMORY_PATTERN_ENV.0, common::MEMORY_PATTERN_ENV.1)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
+        .process_group(0)
         .spawn()
         .expect("spawn worker binary");
     let _guard = ChildGuard {

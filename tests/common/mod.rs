@@ -12,6 +12,7 @@
 //! runtime on CI is a broken pipeline, not a reason to pass.
 #![allow(dead_code)]
 use std::net::TcpListener;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -30,6 +31,10 @@ pub const MAX_LEN: usize = 64;
 /// production setting for the fixture model.
 pub const MEMORY_PATTERN_ENV: (&str, &str) = ("EMBED_MEMORY_PATTERN_TINY_EMBED", "false");
 
+unsafe extern "C" {
+    fn killpg(pgrp: i32, sig: i32) -> i32;
+}
+
 /// RAII guard for a spawned child process bound to a UDS socket.
 /// On drop: kill child, wait for exit, remove socket file.
 pub struct ChildGuard {
@@ -39,12 +44,13 @@ pub struct ChildGuard {
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         if let Some(mut c) = self.child.take() {
-            // SIGKILL on a supervisor does not reach the workers it spawned:
-            // they would be re-parented and outlive the test. Take its direct
-            // children first (a no-op for a bare worker).
-            let _ = Command::new("pkill")
-                .args(["-KILL", "-P", &c.id().to_string()])
-                .status();
+            // The child leads its own process group (callers spawn with `process_group(0)`), so one
+            // killpg takes the supervisor and every worker it spawned; SIGKILL on
+            // the supervisor alone would orphan them.
+            // SAFETY: plain syscall on a pid we spawned.
+            unsafe {
+                killpg(c.id() as i32, 9);
+            }
             let _ = c.kill();
             let _ = c.wait();
         }
@@ -208,6 +214,8 @@ pub const PROBE_BATCHES: &[&[usize]] = &[
 /// and removes the socket directory.
 pub struct Server {
     pub base: String,
+    /// First of the ports the workers serve `/metrics` on (one per worker).
+    pub worker_metrics_base: u16,
     _guard: ChildGuard,
     socket_dir: PathBuf,
 }
@@ -222,6 +230,7 @@ impl Drop for Server {
 /// to become healthy. `tag` keeps the socket directory unique per test binary.
 pub fn spawn_server(env: &Setup, tag: &str, server_bin: &str, worker_bin: &str) -> Server {
     let port = free_port();
+    let worker_metrics_base = free_port().min(65_000);
     let socket_dir = std::env::temp_dir().join(format!("embed-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&socket_dir);
     std::fs::create_dir_all(&socket_dir).expect("create socket dir");
@@ -236,6 +245,10 @@ pub fn spawn_server(env: &Setup, tag: &str, server_bin: &str, worker_bin: &str) 
         // The response cache would answer a repeated text from a previous
         // request, so a batch-independence check would never reach the worker.
         .env("CACHE_MAX_ENTRIES", "0")
+        .env(
+            "EMBED_WORKER_METRICS_PORT_BASE",
+            worker_metrics_base.to_string(),
+        )
         .env("RERANKER_MODELS", env.rerank_spec())
         .env("SPLADE_MODELS", env.splade_spec())
         .env("ORT_DYLIB_PATH", &env.ort)
@@ -244,6 +257,7 @@ pub fn spawn_server(env: &Setup, tag: &str, server_bin: &str, worker_bin: &str) 
         .env("BATCHING_ENABLED", "false")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
+        .process_group(0)
         .spawn()
         .expect("spawn embed-server");
     let guard = ChildGuard {
@@ -254,7 +268,38 @@ pub fn spawn_server(env: &Setup, tag: &str, server_bin: &str, worker_bin: &str) 
     wait_healthy(&base, Duration::from_secs(90));
     Server {
         base,
+        worker_metrics_base,
         _guard: guard,
         socket_dir,
+    }
+}
+
+impl Server {
+    /// Value of the first series starting with `needle` (e.g.
+    /// `embed_seq_pad_multiple{model="tiny-embed"} `) on any worker's `/metrics`.
+    /// Panics when no worker exposes it: a missing series means the config the
+    /// test pinned did not reach the worker.
+    pub fn worker_series(&self, needle: &str) -> f64 {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("build reqwest client");
+        for off in 0..8u16 {
+            let url = format!(
+                "http://127.0.0.1:{}/metrics",
+                self.worker_metrics_base + off
+            );
+            let Ok(body) = client.get(url).send().and_then(|r| r.text()) else {
+                continue;
+            };
+            if let Some(v) = body
+                .lines()
+                .find_map(|l| l.strip_prefix(needle))
+                .and_then(|rest| rest.trim().parse::<f64>().ok())
+            {
+                return v;
+            }
+        }
+        panic!("no worker /metrics exposes {needle:?}");
     }
 }

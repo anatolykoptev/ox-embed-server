@@ -22,15 +22,18 @@ esac
 
 dest="${1:-target/ort}"
 mkdir -p "$dest"
+# The tarball is what gets cached and what the pin covers: verify it on EVERY
+# run, cache hit or not, then extract. A poisoned cache entry fails here.
+tgz="$dest/onnxruntime-linux-${ORT_ARCH}-${ORT_VER}.tgz"
 lib="$dest/libonnxruntime-${ORT_VER}.so"
-if [ ! -s "$lib" ]; then
-  tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT
+if [ ! -s "$tgz" ]; then
   url="https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VER}/onnxruntime-linux-${ORT_ARCH}-${ORT_VER}.tgz"
-  curl -sSfL --retry 3 -o "$tmp/ort.tgz" "$url" >&2
-  echo "${ORT_SHA256}  $tmp/ort.tgz" | sha256sum -c - >&2
-  tar -xzf "$tmp/ort.tgz" -C "$tmp"
-  # `libonnxruntime.so` is a symlink chain; copy the real file.
-  cp -L "$tmp/onnxruntime-linux-${ORT_ARCH}-${ORT_VER}/lib/libonnxruntime.so" "$lib"
+  curl -sSfL --retry 3 -o "$tgz" "$url" >&2
 fi
+echo "${ORT_SHA256}  $tgz" | sha256sum -c - >&2 || { rm -f "$tgz" "$lib"; exit 1; }
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+tar -xzf "$tgz" -C "$tmp"
+# `libonnxruntime.so` is a symlink chain; copy the real file.
+cp -L "$tmp/onnxruntime-linux-${ORT_ARCH}-${ORT_VER}/lib/libonnxruntime.so" "$lib"
 echo "$(cd "$dest" && pwd)/$(basename "$lib")"

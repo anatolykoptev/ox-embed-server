@@ -10,6 +10,8 @@ real tokenizer, real padding and sub-batching) without a multi-gigabyte model.
 | `rerank/` | `model_quantized.onnx` | `input_ids`, `attention_mask`                 | `logits [b,1]`                  | `RERANKER_MODELS`              |
 | `splade/` | `model.onnx`           | `input_ids`, `attention_mask`                 | `logits [b,s,vocab]` (MLM head) | `SPLADE_MODELS`                |
 
+All three graphs are fp32. `rerank/model_quantized.onnx` is named for the loader's fixed filename; it is NOT quantised, so no int8 rounding drift can hide a regression.
+
 Each directory has a `tokenizer.json` (WordPiece, ~100 pieces, `[CLS] ... [SEP]`).
 
 ## What they are not

@@ -44,6 +44,17 @@ fn multi_process_embed_e2e() {
         .build()
         .expect("build reqwest client");
 
+    // The probe texts only exercise padding if the embed model runs with the
+    // pinned production rule (pad multiple 4). A wrong env name would silently
+    // fall back to memory_pattern=on (16) and hide the padding mutants.
+    assert_eq!(
+        server.worker_series(&format!(
+            "embed_seq_pad_multiple{{model=\"{}\"}} ",
+            common::EMBED_NAME
+        )),
+        4.0,
+        "pinned memory_pattern=off did not reach the embed worker"
+    );
     let texts = common::probe_texts();
     let solo: Vec<Vec<f32>> = texts
         .iter()
