@@ -21,16 +21,16 @@ on:
     # Nightly: the cheap lanes (advisories + full suite). ~15 min.
     - cron: "0 3 * * *"
     # Weekly: the full mutation sweep. Deliberately NOT nightly — measured on
-    # krolik, one mutant costs 150-360s of rebuild plus its test run, and the
-    # in-scope set is ~700 mutants. That is ~20 machine-hours per sweep even
-    # sharded. Per-PR `--in-diff` is what protects new code every day; this
-    # lane exists to measure and ratchet the standing debt, which does not
-    # move fast enough to be worth 20 machine-hours a night.
+    # the GitHub arm64 runners (2026-11-16, model-backed files in scope), the
+    # in-scope set is 1781 mutants: ~9 machine-hours per sweep across 16 shards,
+    # 31-36 minutes of wall clock each. Per-PR `--in-diff` is what protects new
+    # code every day; this lane exists to measure and ratchet the standing
+    # debt, which does not move fast enough to be worth 9 machine-hours a night.
     - cron: "0 4 * * 0" # Sundays 04:00 UTC
   workflow_dispatch:
     inputs:
       full_mutants:
-        description: "Also run the ~20 machine-hour mutation sweep (default: cheap lanes only)"
+        description: "Also run the ~9 machine-hour mutation sweep (default: cheap lanes only)"
         type: boolean
         default: false
 
@@ -71,18 +71,18 @@ jobs:
 
   full-mutants:
     # Weekly cron, or a manual dispatch that explicitly asks for it: a plain
-    # dispatch must stay cheap, since the sweep costs ~20 machine-hours.
+    # dispatch must stay cheap, since the sweep costs ~9 machine-hours.
     # `github.event.schedule` carries the cron expression that fired, which is
     # the only way to bind a job to one of several schedules.
     if: (github.event_name == 'workflow_dispatch' && inputs.full_mutants) || github.event.schedule == '0 4 * * 0'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 300
     strategy:
-      # 16 shards, sized from measurement rather than taste: ~700 in-scope
-      # mutants at ~90s each on a 4-core ARM runner is ~17 machine-hours, so a
-      # 4-way split would be ~4h per shard and brush the 6h job ceiling with no
-      # margin. 16 puts each shard at ~45 mutants (~70 min) plus the ~15 min
-      # unmutated baseline build that every shard pays.
+      # 16 shards, sized from measurement rather than taste: 1781 in-scope
+      # mutants measured at ~9 machine-hours in total, so a 4-way split would be
+      # ~2.3h per shard. 16 puts each shard at ~110 mutants and 31-36 minutes
+      # wall clock including the unmutated baseline build every shard pays,
+      # against `timeout-minutes: 300`.
       #
       # cargo-mutants partitions the list deterministically, so the union of
       # the shards is exactly the full set — no mutant is dropped, none tested
@@ -101,6 +101,16 @@ jobs:
         with:
           key: mutants-${{ matrix.shard }}
 
+      # model.rs, model_splade.rs, model_reranker/*, arena.rs, onnx_cache.rs and
+      # bin/worker.rs are in the mutation scope; their tests need the pinned
+      # ONNX Runtime (see preflight.yml, which carries the same two steps).
+      - name: Cache ONNX Runtime
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ort
+          key: ort-${{ runner.arch }}-${{ hashFiles('scripts/fetch-ort.sh') }}
+      - name: Fetch ONNX Runtime
+        run: echo "ORT_DYLIB_PATH=$(scripts/fetch-ort.sh "$HOME/.cache/ort")" >> "$GITHUB_ENV"
       - name: Install cargo-nextest
         run: |
           curl -sSfL "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/cargo-nextest-${NEXTEST_VERSION}-aarch64-unknown-linux-gnu.tar.gz" \
@@ -196,7 +206,7 @@ jobs:
           # The bootstrap branch that accepted the literal string 'unset' is
           # gone: it existed only so the FIRST sweep could measure a number
           # there was no honest way to know in advance, and that sweep has run
-          # (882 mutants, 278 caught, 604 missed). Leaving a never-enforce path
+          # (882 mutants, 278 caught, 604 missed; since re-measured with the model-backed files in scope: 1781 mutants, 1198 caught, 417 missed, 130 unviable, 36 timeout). Leaving a never-enforce path
           # in a gate is how a gate stops being one, so a non-numeric baseline
           # is now a hard error rather than a silent pass.
           baseline=$(tr -d '[:space:]' < .cargo/mutants-baseline.txt)
@@ -252,6 +262,17 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
 
+      # The model-backed integration tests need the pinned ONNX Runtime and
+      # fail (not skip) under CI=true without it; same steps as preflight.yml.
+      - name: Cache ONNX Runtime
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ort
+          key: ort-${{ runner.arch }}-${{ hashFiles('scripts/fetch-ort.sh') }}
+      - name: Fetch ONNX Runtime
+        run: echo "ORT_DYLIB_PATH=$(scripts/fetch-ort.sh "$HOME/.cache/ort")" >> "$GITHUB_ENV"
+      - name: Verify test fixtures
+        run: (cd tests/fixtures/tiny && sha256sum --check --strict SHA256SUMS)
       - name: Install cargo-nextest
         run: |
           curl -sSfL "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/cargo-nextest-${NEXTEST_VERSION}-aarch64-unknown-linux-gnu.tar.gz" \

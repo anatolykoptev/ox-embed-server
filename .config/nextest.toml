@@ -20,4 +20,17 @@ failure-output = "immediate-final"
 status-level = "pass"
 final-status-level = "slow"
 slow-timeout = { period = "30s", terminate-after = 4, grace-period = "10s" }
-retries = 1
+# No retries: a test that fails once and passes on the rerun is a flaky test, and
+# `retries = 1` reported it green. Fix or quarantine a flake, do not retry it.
+retries = 0
+
+# The tests that spawn the supervisor/worker binaries run one at a time
+# (CLAUDE.md: multi-process worker test parallelism is single-threaded). Each
+# picks its own free port and socket dir, but they share the box's cores and
+# the fixture startup timing.
+[test-groups]
+e2e-processes = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary(multi_process_e2e) | binary(multi_process_rerank_e2e) | binary(multi_process_splade_e2e) | binary(worker_e5_inference) | binary(worker_client_roundtrip) | binary(supervisor_dispatch)'
+test-group = 'e2e-processes'

@@ -988,9 +988,8 @@ mod tests {
                     async move { bc.embed_tokens(tok(&[i])).await },
                 ));
             }
-            // Give the scheduler a moment so all 9 sends have landed
-            // and the producer-side depth gauge settles at 8.
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Wait (bounded) until all 9 sends have landed and the depth is 8.
+            wait_for_depth(&b, 8).await;
             // Safety net: if the gate logic regresses, fail fast
             // instead of hanging the test runner (#123).
             let overflow = tokio::time::timeout(Duration::from_secs(5), b.embed_tokens(tok(&[99])))
@@ -1878,6 +1877,20 @@ mod tests {
     // E2: queue-depth gauge, 80% backpressure gate, batch-wait histogram
     // -----------------------------------------------------------------
 
+    /// Wait until the producer-side queue depth (`max_queue - sender.capacity()`,
+    /// the same figure the 80% gate reads) reaches `want`. Bounded poll on the
+    /// observable state instead of a fixed sleep, so a slow host cannot make the
+    /// test race the producers.
+    async fn wait_for_depth(b: &DynamicBatcher, want: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while b.max_queue.saturating_sub(b.sender.capacity()) < want {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "queue depth never reached {want}"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn queue_depth_gauge_is_emitted() {
         let handle = test_prometheus_handle();
@@ -1945,7 +1958,7 @@ mod tests {
                 async move { bc.embed_tokens(tok(&[i])).await },
             ));
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        wait_for_depth(&b, 8).await;
         // Safety net: if the gate logic regresses, fail fast
         // instead of hanging the test runner (#123).
         let rejected = tokio::time::timeout(Duration::from_secs(5), b.embed_tokens(tok(&[99])))

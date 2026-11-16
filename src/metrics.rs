@@ -1249,6 +1249,10 @@ pub const INFERENCE_FAILURE_REASONS: &[&str] = &[
     // A live worker broke the IPC contract (response id or cardinality
     // mismatch): deterministic, not retryable.
     "ipc_protocol",
+    // The per-request IPC deadline expired (wedged worker or saturated
+    // connection): retryable, but the worker may still be alive, so it is
+    // labelled separately from `worker_died`.
+    "ipc_timeout",
 ];
 
 /// Pre-touch `embed_inference_failures_total` at 0 for every reason.

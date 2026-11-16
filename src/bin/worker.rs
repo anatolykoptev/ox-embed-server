@@ -181,6 +181,20 @@ fn install_worker_metrics(model_name: &str) -> PrometheusHandle {
 /// restart counter). The `embed_arena_registration_failed_total` counter
 /// is still pre-touched to 0 at startup so its presence in a worker
 /// scrape confirms the metric is wired.
+/// True when the peer has already closed its end of `stream`. A
+/// non-blocking readiness check (no data is consumed): the caller sends one
+/// request frame and then only waits, so read-closed means it is gone.
+async fn peer_closed(stream: &tokio::net::UnixStream) -> bool {
+    matches!(
+        tokio::time::timeout(
+            std::time::Duration::ZERO,
+            stream.ready(tokio::io::Interest::READABLE),
+        )
+        .await,
+        Ok(Ok(ready)) if ready.is_read_closed()
+    )
+}
+
 fn handle_arena_registration(result: Result<(), String>) -> anyhow::Result<()> {
     match result {
         Ok(()) => {
@@ -422,6 +436,18 @@ async fn main() -> anyhow::Result<()> {
                     }
                 };
 
+                // The caller may have given up while this request queued for
+                // the permit (its IPC deadline fired and the per-request
+                // connection closed). Running it would burn the worker on an
+                // orphan while the next request is admitted behind it.
+                if peer_closed(&stream).await {
+                    tracing::warn!(
+                        queued_ms = queue_wait_start.elapsed().as_millis() as u64,
+                        "caller disconnected while queued — dropping request without inference"
+                    );
+                    break;
+                }
+
                 // All model inference is sync/CPU-bound (ONNX). Run on the
                 // blocking pool so the async runtime thread is not stalled.
                 let req_id = req.request_id();
@@ -528,6 +554,20 @@ mod tests {
         WAITERS_FLOOR, WAITERS_POOL_MULTIPLIER, resolve_max_waiters_for_model,
     };
     use serial_test::serial;
+
+    #[tokio::test]
+    async fn peer_closed_detects_dropped_caller_and_ignores_live_one() {
+        let (server, client) = tokio::net::UnixStream::pair().unwrap();
+        assert!(
+            !super::peer_closed(&server).await,
+            "a live peer must not read as closed"
+        );
+        drop(client);
+        assert!(
+            super::peer_closed(&server).await,
+            "a dropped peer must read as closed"
+        );
+    }
 
     // All tests in this module mutate EMBED_MAX_WAITERS via
     // std::env::set_var / remove_var, which is process-global state.

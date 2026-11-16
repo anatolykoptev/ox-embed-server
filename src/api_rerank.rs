@@ -1078,6 +1078,7 @@ mod tests {
             cache: Arc::new(EmbeddingCache::new(0)),
             token_cache: Arc::new(TokenCache::new(0)),
             rerank_semaphore: None,
+            embed_semaphores: HashMap::new(),
             embed_max_input_array: 32,
             rerank_max_input_docs: cap,
             worker_pool: None,
@@ -1250,6 +1251,7 @@ mod tests {
             cache: Arc::new(EmbeddingCache::new(0)),
             token_cache: Arc::new(TokenCache::new(0)),
             rerank_semaphore: None,
+            embed_semaphores: HashMap::new(),
             embed_max_input_array: 32,
             rerank_max_input_docs: 32,
             worker_pool: Some(Arc::new(pool)),
@@ -1341,9 +1343,12 @@ mod tests {
         reply: fn(u64) -> crate::ipc::protocol::WorkerResponse,
     ) -> axum::response::Response {
         let dir = tempfile::tempdir().unwrap();
-        let client =
-            crate::ipc::client::test_support::fake_worker_client(dir.path().join("w.sock"), reply)
-                .await;
+        let client = crate::ipc::client::test_support::fake_worker_client(
+            dir.path().join("w.sock"),
+            reply,
+            std::time::Duration::from_secs(60),
+        )
+        .await;
         let spec = SpawnSpec {
             model: model.to_string(),
             kind: WorkerKind::Rerank,

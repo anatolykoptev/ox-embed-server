@@ -33,6 +33,8 @@ Multi-process:
 - `EMBED_MULTI_PROCESS=1` — supervisor spawns workers. Set to `0` for monolith rollback.
 - `EMBED_WORKER_BIN=/usr/local/bin/embed-worker` — shipped in image.
 - `EMBED_WORKER_SOCKET_DIR=/tmp/embed-workers` — UDS socket directory.
+- `EMBED_IPC_TIMEOUT_SECS` (default `60`) — whole-IPC deadline per request (permit wait + connect + write + read). `EMBED_IPC_TIMEOUT_SECS_<MODEL>` overrides per model. A wedged worker fails with 503 + `Retry-After: 5` instead of hanging.
+- `MAX_CONCURRENT_EMBED_REQUESTS` — global `/v1/embeddings` concurrency cap; `MAX_CONCURRENT_EMBED_REQUESTS_<MODEL>` per-model; `0` disables. Unset → per-model `pool × intra × 8`, floor 16. Over cap → 429 + `Retry-After: 1`.
 
 Models (format `name:dir:dim:max_len:pad_id:has_tti[:model_file]`):
 - `EMBED_MODELS="multilingual-e5-large:/models:1024:256:1:false,jina-code-v2:/models-jina:768:512:0:false"`
@@ -53,6 +55,10 @@ Batcher:
 Padding / sub-batching (worker path):
 - Embedders pad each forward pass to the longest sequence rounded up to a multiple of 4 tokens when the model's `memory_pattern` is off (`pool::SEQ_PAD_MULTIPLE`), or of 16 when it is on (`pool::SEQ_PAD_MULTIPLE_PATTERN_ON`: ORT keeps one plan per distinct shape, so the shape count must stay bounded). Neither is a power of two any more. The live multiple is `embed_seq_pad_multiple{model}`. `EMBED_SUBBATCH_RATIO[_<MODEL>]` (default `2.0`, `<= 1.0` disables) splits a request into length-homogeneous passes.
 - `RERANKER_SUBBATCH_RATIO` (default `2.0`, `<= 1.0` disables) does the same for `/v1/rerank`: pairs whose lengths differ by more than the ratio run in separate forward passes. Scores are returned in input order. Observable as `embed_subbatch_groups{model}`.
+
+Vector semantics (both switches change the vectors a model returns, so both are per-model opt-ins, off by default):
+- `EMBED_INPUT_PREFIX_<MODEL>=e5` prepends `query: ` (`input_type=query`) or `passage: ` (default) before inference; a text that already starts with either prefix is left alone, so clients that prefix themselves keep working. Without it `input_type` only partitions the response cache. Turn it on only after every store built from this server has been re-embedded: vectors with and without the prefix are not comparable.
+- `EMBED_BATCH_INVARIANT_<MODEL>=1` (or the global `EMBED_BATCH_INVARIANT`) runs every text of a request in its own forward pass. The int8 graph takes each activation scale from the whole tensor, so by default a text's vector depends on the texts embedded with it (and the response cache keeps whichever vector came first). A lone text is unchanged by the switch; multi-text requests cost more, see `docs/benchmarks/2026-11-16-embed-batch-drift.md`.
 
 ## CI
 
@@ -88,7 +94,7 @@ Scope, test tool and timeouts live in **`.cargo/mutants.toml`** — one file, re
 
 `.cargo/mutants-baseline.txt` is the ratchet: the weekly sweep fails if the missed count rises above it, and tells you to lower it when it falls. Raising it requires a justification in the same PR. A non-numeric value is a hard error, not a pass.
 
-**The recorded baseline is 604 missed of 882 — and that number is an ARTIFACT, not a measurement of this codebase.** It was measured while `additional_cargo_test_args` said `--lib` without `--bins`. `src/main.rs` declares six modules that `src/lib.rs` does not expose (`api_health`, `batcher`, `cache`, `cache_flow`, `token_cache`, `types`), so their tests compile into the `bin/embed-server` target — 366 tests that the gate never invoked, against the 144 it did. Six of the sixteen files in `examine_globs` are in that bucket, and their mutants were all reported MISSED for a mechanical reason.
+**The baseline is now 417 missed of 1781 (sweep of 2026-11-16 with the model-backed files in scope; the earlier 604 of 882 was an ARTIFACT of a missing `--bins`, not a measurement of this codebase).** It was measured while `additional_cargo_test_args` said `--lib` without `--bins`. `src/main.rs` declares six modules that `src/lib.rs` does not expose (`api_health`, `batcher`, `cache`, `cache_flow`, `token_cache`, `types`), so their tests compile into the `bin/embed-server` target — 366 tests that the gate never invoked, against the 144 it did. Six of the sixteen files in `examine_globs` are in that bucket, and their mutants were all reported MISSED for a mechanical reason.
 
 `--bins` was added once the effect was visible: two tests that assert a gauge's value failed to kill the mutant that deletes that gauge. Until the next weekly sweep re-measures, **604 is a valid upper bound but a loose one** — adding tests can only lower the true count, so the ratchet cannot fire falsely, but it will not catch a small regression either. Lower the file to whatever the next sweep reports; do not compare against 604 as if it described the code.
 
@@ -105,5 +111,7 @@ release-please on push to `main`. Conventional commits → auto PR + tag. Do not
 - `ort-sys` downloads the ORT binary on first compile (~30 s cold).
 - Batcher `carry: Option<Item>` — items overflowing `BATCH_MAX` defer to next batch. Tracked as `embed_carry_events_total`.
 - Multi-process worker test parallelism: **`--test-threads=1` mandatory** for `cargo nextest run --test multi_process_*` — each test spawns its own embed-server with full model set, parallel OOMs.
+- Model-backed tests (`multi_process_*_e2e`, `worker_e5_inference`, `worker_client_roundtrip`, `supervisor_dispatch`, `model::pad_call_site_tests`) run on the tiny fixtures in `tests/fixtures/tiny` (random weights: assert shape, determinism, batch independence, never relevance). Needs `ORT_DYLIB_PATH="$(scripts/fetch-ort.sh)"`. Missing runtime/fixture: SKIP locally, **panic when `CI=true`**. `EMBED_TEST_FIXTURES=<dir>` redirects the fixture root. Regenerate with `scripts/gen_test_fixtures.py`.
+- A cargo wrapper that shares ONE target dir across all worktrees of a repo (as on the shared build host), and cargo's mtime fingerprints do not tell worktrees apart: a build or test run can silently use another worktree's artifacts. Set `CARGO_TARGET_DIR` to a private dir when the result must be about YOUR tree.
 - Worker child process must call `arena::register_shared_cpu_arena()` before any `Session::builder()` — supervisor's registration doesn't carry across fork. (Handled in `src/bin/worker.rs`.)
 - Per-request UDS conn (not persistent pool) — see `docs/architecture/multi-process.md` for cancel-safety rationale.
