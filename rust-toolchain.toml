@@ -1,0 +1,7 @@
+# Single source of truth for the Rust toolchain: CI (rustup reads this file),
+# local builds, and the Dockerfile builder image tag. scripts/check-toolchain-pin.sh
+# fails CI when the Dockerfile `rust:<ver>-slim` tag disagrees with `channel`.
+[toolchain]
+channel = "1.100.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

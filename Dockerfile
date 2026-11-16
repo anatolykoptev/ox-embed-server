@@ -1,6 +1,8 @@
 # syntax=docker/dockerfile:1.4
 # --- Build stage ---
-FROM rust:1.93-slim AS builder
+# rust:1.100.0-slim (multi-arch index). Keep in sync with rust-toolchain.toml;
+# scripts/check-toolchain-pin.sh enforces it in CI.
+FROM rust:1.100.0-slim@sha256:e9d95b74296f7126a83ae3d041aeaba1ff4c478f13abc5cc034fcf7c131c3d4a AS builder
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends pkg-config libssl-dev curl && \
@@ -60,7 +62,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     sccache --show-stats || true
 
 # --- Runtime stage ---
-FROM debian:trixie-slim
+# debian:trixie-slim (multi-arch index)
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates curl && \

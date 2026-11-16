@@ -271,9 +271,11 @@ jobs:
           # unreachable and the step would silently mutate nothing.
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - name: Install pinned Rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Toolchain pin consistency (Dockerfile vs rust-toolchain.toml)
+        run: scripts/check-toolchain-pin.sh
 
       - uses: Swatinem/rust-cache@v2
 
@@ -462,7 +464,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned Rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
 
       - name: Install cargo-deny
         run: |
