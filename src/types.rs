@@ -29,6 +29,8 @@ pub struct ModelEntry {
     /// is handled exclusively by the worker pool in that case.
     pub model: Option<Arc<EmbedModel>>,
     pub batcher: Option<Arc<DynamicBatcher>>,
+    /// Instruction prefix applied to inputs before inference (off by default).
+    pub input_prefix: crate::input_prefix::InputPrefix,
 }
 
 impl ModelEntry {
@@ -175,11 +177,11 @@ pub enum EncodingFormat {
     Base64,
 }
 
-/// Document vs. query distinction for asymmetric embedding models
-/// (Voyage-style). Our current symmetric models (e5/gte/bge-m3) treat
-/// this as a no-op at inference time but it is **included in the cache
-/// key** so that future asymmetric-model deploys don't cause cache
-/// pollution between document and query vectors.
+/// Document vs. query distinction for asymmetric embedding models.
+/// It reaches inference only for a model with `EMBED_INPUT_PREFIX_<MODEL>`
+/// set (e5: `query: ` / `passage: `); for every other model it changes
+/// nothing but the **cache key**, which keeps document and query vectors
+/// apart.
 #[derive(Deserialize, Debug, Clone, Copy, Default, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum InputType {
@@ -196,9 +198,9 @@ pub struct EmbedRequest {
     /// Defaults to `float` (JSON array). Use `base64` for bulk ingest
     /// paths to reduce HTTP payload by ~33%.
     pub encoding_format: Option<EncodingFormat>,
-    /// Document or query input type. Currently a no-op for our symmetric
-    /// models but accepted and included in the cache key for future
-    /// asymmetric model support. Defaults to `document`.
+    /// Document or query input type. Selects the `query: ` / `passage: `
+    /// prefix for a model with `EMBED_INPUT_PREFIX_<MODEL>` set; otherwise
+    /// it only partitions the cache. Defaults to `document`.
     pub input_type: Option<InputType>,
 }
 
@@ -304,6 +306,7 @@ mod tests {
         let entry = ModelEntry {
             model: None,
             batcher: None,
+            input_prefix: Default::default(),
         };
         assert!(
             entry.model.is_none(),
@@ -348,6 +351,7 @@ mod tests {
         let entry = ModelEntry {
             model: None,
             batcher: None,
+            input_prefix: Default::default(),
         };
         let _ = entry.require_model();
     }

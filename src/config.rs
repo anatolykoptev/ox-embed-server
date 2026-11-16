@@ -62,6 +62,14 @@ pub struct ModelDef {
     /// (uppercase name, `-`→`_`). Example: `EMBED_MEMORY_PATTERN_JINA_CODE_V2=false`.
     /// Invalid values fall back to `true` with a warn.
     pub memory_pattern: bool,
+    /// Instruction-prefix scheme applied to `/v1/embeddings` inputs before
+    /// inference (`query: ` / `passage: ` for e5 models).
+    ///
+    /// Defaults to off: turning it on changes every vector the model returns,
+    /// so every store built from this server's vectors must be rebuilt first.
+    /// Set per model via `EMBED_INPUT_PREFIX_<MODEL_UPPER>=e5` (uppercase
+    /// name, `-`→`_`). An unknown value fails config parsing.
+    pub input_prefix: crate::input_prefix::InputPrefix,
 }
 
 /// Definition of a single cross-encoder reranker to load.
@@ -1143,6 +1151,13 @@ fn parse_one_model(
             .as_deref(),
     );
     tracing::info!(model = %name, memory_pattern, "session config");
+    let input_prefix = crate::input_prefix::InputPrefix::parse(
+        env::var(format!("EMBED_INPUT_PREFIX_{key}"))
+            .ok()
+            .as_deref(),
+    )
+    .map_err(|e| format!("model '{name}': EMBED_INPUT_PREFIX_{key}: {e}"))?;
+    tracing::info!(model = %name, ?input_prefix, "input prefix");
 
     // Optional 7th segment: ONNX filename inside `dir`.
     // Absent → "model_quantized.onnx" (back-compat default).
@@ -1182,6 +1197,7 @@ fn parse_one_model(
         batch_max_seq,
         warmup_seq_len,
         memory_pattern,
+        input_prefix,
     })
 }
 
@@ -1862,6 +1878,7 @@ mod tests {
             batch_max_seq,
             warmup_seq_len,
             memory_pattern: per_model_memory_pattern,
+            input_prefix: Default::default(),
         }
     }
 
@@ -2068,6 +2085,17 @@ mod tests {
     // False: disable memory_pattern for models with variable seq shapes
     // (jina-code-v2) where BFCArena fills monotonically under the plan.
     // -----------------------------------------------------------------
+
+    // Prefixing changes every vector, so it must be opt-in per model.
+    #[test]
+    fn parse_models_input_prefix_defaults_off() {
+        let defs = parse_models("e5-no-prefix-env:/m:1024:256:1:false").unwrap();
+        assert_eq!(
+            defs[0].input_prefix,
+            crate::input_prefix::InputPrefix::Off,
+            "a model without EMBED_INPUT_PREFIX_<MODEL> must not be prefixed"
+        );
+    }
 
     #[test]
     fn parse_per_model_memory_pattern_default_true() {

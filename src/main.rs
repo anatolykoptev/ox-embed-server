@@ -8,6 +8,7 @@ mod cache;
 mod cache_flow;
 mod config;
 mod evictable_pool;
+mod input_prefix;
 #[allow(dead_code)] // ipc items used by supervisor submodule; unused from main.rs directly
 mod ipc;
 mod metrics;
@@ -377,11 +378,18 @@ async fn main() {
             } else {
                 None
             };
+            let input_prefix = cfg
+                .models
+                .iter()
+                .find(|d| d.name == name)
+                .map(|d| d.input_prefix)
+                .unwrap_or_default();
             model_entries.insert(
                 name,
                 ModelEntry {
                     model: Some(model_arc),
                     batcher,
+                    input_prefix,
                 },
             );
         }
@@ -399,6 +407,7 @@ async fn main() {
                 ModelEntry {
                     model: None,
                     batcher: None,
+                    input_prefix: def.input_prefix,
                 },
             );
         }
