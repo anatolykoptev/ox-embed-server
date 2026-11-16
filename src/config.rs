@@ -1164,7 +1164,7 @@ fn parse_models_with_globals(
 /// Parse models with default globals. Used in tests and as a
 /// convenience wrapper.
 #[allow(dead_code)]
-fn parse_models(s: &str) -> Result<Vec<ModelDef>, String> {
+pub(crate) fn parse_models(s: &str) -> Result<Vec<ModelDef>, String> {
     // Use defaults here; `from_env` calls `parse_models_with_globals`
     // directly with the resolved globals.
     parse_models_with_globals(s, parse_batch_max_seq(None), None)

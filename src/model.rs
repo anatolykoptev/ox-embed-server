@@ -2207,12 +2207,46 @@ impl StandaloneSplade {
     }
 }
 
-/// Call-site check for the embedder's pad width. Needs a real model, so it
-/// SKIPS without `EMBED_MODELS` (as do the other model-backed tests here).
+/// Call-site check for the embedder's pad width. Runs a real ONNX Runtime
+/// session on the tiny committed fixture (`tests/fixtures/tiny/embed`), so it
+/// needs `ORT_DYLIB_PATH`; off CI it SKIPS without one, on CI (`CI=true`) a
+/// missing runtime or fixture fails the test.
 #[cfg(test)]
 mod pad_call_site_tests {
     use super::EmbedModel;
     use crate::pool::{round_up_to_multiple, seq_pad_multiple};
+
+    /// The tiny embed fixture as a parsed model definition, or `None` (after a
+    /// SKIP line) off CI when the runtime or fixture is unavailable.
+    fn tiny_embed_def() -> Option<crate::config::ModelDef> {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny/embed");
+        let ort = std::env::var("ORT_DYLIB_PATH").unwrap_or_default();
+        let why = if !std::path::Path::new(&ort).is_file() {
+            Some(format!("ORT_DYLIB_PATH not set or missing (got {ort:?})"))
+        } else if !dir.join("model.onnx").is_file() {
+            Some(format!(
+                "fixture {} missing",
+                dir.join("model.onnx").display()
+            ))
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            assert!(
+                std::env::var("CI").map_or(true, |v| v != "true"),
+                "CI=true and the pad call-site inputs are unavailable: {why}"
+            );
+            eprintln!("SKIP pad call-site test: {why}");
+            return None;
+        }
+        let spec = format!("tiny-embed-pad:{}:32:64:0:true:model.onnx", dir.display());
+        Some(
+            crate::config::parse_models(&spec)
+                .expect("parse fixture spec")
+                .remove(0),
+        )
+    }
 
     /// The tensor `embed_tokens` builds must be as wide as the model's own pad
     /// rule says — multiple of 4 with `memory_pattern` off, multiple of 16 with
@@ -2223,21 +2257,13 @@ mod pad_call_site_tests {
     /// each loads the model with the flag flipped on the parsed definition.
     #[test]
     fn embed_tokens_pads_by_the_models_memory_pattern_rule() {
-        let Ok(mut cfg) = crate::config::Config::from_env() else {
-            eprintln!("SKIP pad call-site test: config not loadable (EMBED_MODELS unset?)");
+        let Some(mut def) = tiny_embed_def() else {
             return;
         };
-        if cfg.models.is_empty() {
-            eprintln!("SKIP pad call-site test: no EMBED_MODELS entry");
-            return;
-        }
         // Tests call `load` directly, bypassing main.rs, so do the worker's
         // init: ORT runtime first, then the shared arena (idempotent).
         let _ = ort::init().commit();
-        if crate::arena::register_shared_cpu_arena_for_model(&cfg.models[0].name).is_err() {
-            eprintln!("SKIP pad call-site test: arena registration failed");
-            return;
-        }
+        crate::arena::register_shared_cpu_arena_for_model(&def.name).expect("arena registration");
         let handle = crate::metrics::test_prometheus_handle();
         let series = |name: &str, model: &str| {
             let needle = format!("{name}{{model=\"{model}\"}}");
@@ -2249,12 +2275,8 @@ mod pad_call_site_tests {
         };
 
         for memory_pattern in [false, true] {
-            cfg.models[0].memory_pattern = memory_pattern;
-            let def = &cfg.models[0];
-            let Ok(model) = EmbedModel::load(def, 1, true, 1, 0) else {
-                eprintln!("SKIP pad call-site test: model not loadable");
-                return;
-            };
+            def.memory_pattern = memory_pattern;
+            let model = EmbedModel::load(&def, 1, true, 1, 0).expect("load tiny embed fixture");
             let multiple = seq_pad_multiple(memory_pattern);
             assert_eq!(
                 series("embed_seq_pad_multiple", &def.name),
