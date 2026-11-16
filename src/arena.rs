@@ -113,7 +113,7 @@ pub fn assert_arena_registered_before_session() {
 /// better than a cgroup OOM-kill (whole container restarts, all in-flight
 /// requests fail). The default favours the former over the latter; the
 /// compose limit controls which actually occurs.
-const DEFAULT_MAX_MEM_BYTES: usize = 6 * 1024 * 1024 * 1024;
+pub const DEFAULT_MAX_MEM_BYTES: usize = 6 * 1024 * 1024 * 1024;
 
 /// Default initial chunk size: 1 MiB.
 const DEFAULT_INITIAL_CHUNK_BYTES: usize = 1024 * 1024;
@@ -256,32 +256,66 @@ fn parse_usize_env(key: &str, default: usize) -> usize {
 ///
 /// Panics (with `env_key` in the message) on parse failure.
 pub(crate) fn parse_bytes_with_suffix(env_key: &str, s: &str) -> usize {
+    try_parse_bytes_with_suffix(s).unwrap_or_else(|e| panic!("{env_key}: {e}"))
+}
+
+/// Non-panicking core of [`parse_bytes_with_suffix`]; same grammar.
+pub(crate) fn try_parse_bytes_with_suffix(s: &str) -> Result<usize, String> {
     // Split at the first non-digit character to separate mantissa from suffix.
     let split_pos = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     let (digits, suffix_raw) = s.split_at(split_pos);
     let suffix = suffix_raw.trim().to_uppercase();
 
-    let mantissa: u64 = digits.parse().unwrap_or_else(|_| {
-        panic!("{env_key} must be a non-negative integer with optional suffix (B/K/KiB/M/MiB/G/GiB), got {s:?}");
-    });
+    let mantissa: u64 = digits.parse().map_err(|_| {
+        format!(
+            "must be a non-negative integer with optional suffix (B/K/KiB/M/MiB/G/GiB), got {s:?}"
+        )
+    })?;
 
     let multiplier: u64 = match suffix.as_str() {
         "" | "B" => 1,
         "K" | "KIB" => 1024,
         "M" | "MIB" => 1024 * 1024,
         "G" | "GIB" => 1024 * 1024 * 1024,
-        _ => panic!(
-            "{env_key}: unrecognised size suffix {suffix_raw:?}; accepted: B, K, KiB, M, MiB, G, GiB"
-        ),
+        _ => {
+            return Err(format!(
+                "unrecognised size suffix {suffix_raw:?}; accepted: B, K, KiB, M, MiB, G, GiB"
+            ));
+        }
     };
 
-    let result = mantissa.checked_mul(multiplier).unwrap_or_else(|| {
-        panic!("{env_key}: value {s:?} overflows usize");
-    });
+    let result = mantissa
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("value {s:?} overflows usize"))?;
 
-    usize::try_from(result).unwrap_or_else(|_| {
-        panic!("{env_key}: value {s:?} overflows usize on this platform");
-    })
+    usize::try_from(result).map_err(|_| format!("value {s:?} overflows usize on this platform"))
+}
+
+/// The arena ceiling a worker for `model_key` will register, resolved with the
+/// same lookup order as [`init_arena_config_for_model`] (per-model env, then
+/// the global env, then the compiled default) but without panicking: an
+/// unparsable value is returned as `Err` so the startup memory-budget check
+/// can report it instead of aborting the supervisor. `get` reads one env var.
+///
+/// An empty `model_key` resolves the supervisor's own (global) ceiling.
+pub fn resolve_max_mem_bytes(
+    model_key: &str,
+    get: &dyn Fn(&str) -> Option<String>,
+) -> Result<usize, String> {
+    let per_model = (!model_key.is_empty()).then(|| {
+        format!(
+            "EMBED_ARENA_MAX_MEM_BYTES_{}",
+            crate::config::model_env_key(model_key)
+        )
+    });
+    let (key, raw) = match per_model.as_deref().and_then(|k| get(k).map(|v| (k, v))) {
+        Some((k, v)) => (k, v),
+        None => match get("EMBED_ARENA_MAX_MEM_BYTES") {
+            Some(v) => ("EMBED_ARENA_MAX_MEM_BYTES", v),
+            None => return Ok(DEFAULT_MAX_MEM_BYTES),
+        },
+    };
+    try_parse_bytes_with_suffix(raw.trim()).map_err(|e| format!("{key}: {e}"))
 }
 
 fn parse_i32_env(key: &str, default: i32) -> i32 {
@@ -768,6 +802,56 @@ mod tests {
         assert_eq!(parse_bytes_with_suffix("TEST", "1gib"), 1024 * 1024 * 1024);
         assert_eq!(parse_bytes_with_suffix("TEST", "1Gib"), 1024 * 1024 * 1024);
         assert_eq!(parse_bytes_with_suffix("TEST", "1mib"), 1024 * 1024);
+    }
+
+    /// `resolve_max_mem_bytes` feeds the startup memory-budget check; if it
+    /// drifted from the resolver workers actually use, the check would sum the
+    /// wrong ceilings and stay green. The production resolver is the oracle.
+    #[test]
+    fn resolve_max_mem_bytes_matches_worker_resolver() {
+        let guard = EnvGuard::new(&[
+            "EMBED_ARENA_MAX_MEM_BYTES",
+            "EMBED_ARENA_MAX_MEM_BYTES_JINA_CODE_V2",
+            "EMBED_ARENA_MAX_MEM_BYTES_OTHER",
+        ]);
+        let get = |k: &str| std::env::var(k).ok();
+        // default
+        assert_eq!(
+            resolve_max_mem_bytes("jina-code-v2", &get).unwrap(),
+            init_arena_config_for_model("jina-code-v2").max_mem_bytes
+        );
+        // global only
+        guard.set("EMBED_ARENA_MAX_MEM_BYTES", "512MiB");
+        assert_eq!(
+            resolve_max_mem_bytes("jina-code-v2", &get).unwrap(),
+            init_arena_config_for_model("jina-code-v2").max_mem_bytes
+        );
+        assert_eq!(
+            resolve_max_mem_bytes("", &get).unwrap(),
+            init_arena_config_for_model("").max_mem_bytes
+        );
+        // per-model wins over global; other models keep the global
+        guard.set("EMBED_ARENA_MAX_MEM_BYTES_JINA_CODE_V2", "3758096384");
+        assert_eq!(
+            resolve_max_mem_bytes("jina-code-v2", &get).unwrap(),
+            3_758_096_384
+        );
+        assert_eq!(
+            resolve_max_mem_bytes("jina-code-v2", &get).unwrap(),
+            init_arena_config_for_model("jina-code-v2").max_mem_bytes
+        );
+        assert_eq!(
+            resolve_max_mem_bytes("other", &get).unwrap(),
+            init_arena_config_for_model("other").max_mem_bytes
+        );
+    }
+
+    #[test]
+    fn resolve_max_mem_bytes_reports_bad_value_instead_of_panicking() {
+        let get = |k: &str| (k == "EMBED_ARENA_MAX_MEM_BYTES_X").then(|| "2KB".to_string());
+        let err = resolve_max_mem_bytes("x", &get).unwrap_err();
+        assert!(err.contains("EMBED_ARENA_MAX_MEM_BYTES_X"), "{err}");
+        assert!(err.contains("unrecognised size suffix"), "{err}");
     }
 
     #[test]
