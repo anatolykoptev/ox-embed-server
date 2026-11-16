@@ -100,6 +100,16 @@ jobs:
         with:
           key: mutants-${{ matrix.shard }}
 
+      # model.rs, model_splade.rs, model_reranker/*, arena.rs, onnx_cache.rs and
+      # bin/worker.rs are in the mutation scope; their tests need the pinned
+      # ONNX Runtime (see preflight.yml, which carries the same two steps).
+      - name: Cache ONNX Runtime
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ort
+          key: ort-${{ runner.arch }}-${{ hashFiles('scripts/fetch-ort.sh') }}
+      - name: Fetch ONNX Runtime
+        run: echo "ORT_DYLIB_PATH=$(scripts/fetch-ort.sh "$HOME/.cache/ort")" >> "$GITHUB_ENV"
       - name: Install cargo-nextest
         run: |
           curl -sSfL "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/cargo-nextest-${NEXTEST_VERSION}-aarch64-unknown-linux-gnu.tar.gz" \

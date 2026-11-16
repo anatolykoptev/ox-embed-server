@@ -1,15 +1,19 @@
-//! Integration test for POST /v1/rerank. Requires a running embed-server.
+//! Manual smoke test for POST /v1/rerank against a RUNNING embed-server that
+//! has a real, trained reranker (semantic ordering needs real weights).
 //!
+//! Ignored by default so it shows up as "ignored" rather than a vacuous pass.
 //! Run:
-//!   EMBED_SERVER_URL=http://127.0.0.1:8082 cargo test --test rerank_smoke -- --nocapture
+//!   EMBED_SERVER_URL=http://127.0.0.1:8082 cargo test --test rerank_smoke -- --ignored --nocapture
 //!
-//! If EMBED_SERVER_URL is unset or the server is unreachable, tests print a
-//! visible skip message and return Ok — so the main test suite stays green.
+//! When run explicitly, an unset URL or an unreachable server FAILS the test.
+//! The `/v1/rerank` request/response contract, `top_n` and batch independence
+//! are covered on CI by `multi_process_rerank_e2e` against the tiny fixture.
 
 use serde_json::json;
 
-fn base_url() -> Option<String> {
-    std::env::var("EMBED_SERVER_URL").ok()
+fn base_url() -> String {
+    std::env::var("EMBED_SERVER_URL")
+        .expect("EMBED_SERVER_URL must name the running embed-server for this smoke test")
 }
 
 fn server_ready(base: &str) -> bool {
@@ -24,15 +28,10 @@ fn server_ready(base: &str) -> bool {
 }
 
 #[test]
+#[ignore = "manual smoke: needs EMBED_SERVER_URL and a trained reranker"]
 fn rerank_orders_relevant_above_unrelated() {
-    let Some(base) = base_url() else {
-        eprintln!("SKIP rerank_orders_relevant_above_unrelated: EMBED_SERVER_URL unset");
-        return;
-    };
-    if !server_ready(&base) {
-        eprintln!("SKIP rerank_orders_relevant_above_unrelated: server at {base} not reachable");
-        return;
-    }
+    let base = base_url();
+    assert!(server_ready(&base), "server at {base} not reachable");
 
     let body = json!({
         "model": "bge-reranker-v2-m3",
@@ -81,15 +80,10 @@ fn rerank_orders_relevant_above_unrelated() {
 }
 
 #[test]
+#[ignore = "manual smoke: needs EMBED_SERVER_URL and a trained reranker"]
 fn rerank_respects_top_n() {
-    let Some(base) = base_url() else {
-        eprintln!("SKIP rerank_respects_top_n: EMBED_SERVER_URL unset");
-        return;
-    };
-    if !server_ready(&base) {
-        eprintln!("SKIP rerank_respects_top_n: server at {base} not reachable");
-        return;
-    }
+    let base = base_url();
+    assert!(server_ready(&base), "server at {base} not reachable");
 
     let body = json!({
         "model": "bge-reranker-v2-m3",
