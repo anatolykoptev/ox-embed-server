@@ -255,10 +255,7 @@ pub const UNKNOWN_MODEL_LABEL: &str = "unknown";
 /// otherwise. Every `model` label written BEFORE the model lookup succeeds must
 /// go through this; after a successful lookup the name is already one of the
 /// configured set.
-pub fn bounded_model_label<'a>(
-    requested: &'a str,
-    is_configured: impl Fn(&str) -> bool,
-) -> &'a str {
+pub fn bounded_model_label(requested: &str, is_configured: impl Fn(&str) -> bool) -> &str {
     if is_configured(requested) {
         requested
     } else {
@@ -1546,8 +1543,8 @@ pub fn worker_respawn_failure_touch(model: &str) {
 /// Publish `embed_worker_info{model,kind,metrics_port} 1` on the supervisor.
 ///
 /// The worker-to-port assignment is positional (`EMBED_WORKER_METRICS_PORT_BASE`
-/// + spawn index), so a scrape target list kept by hand drifts when a model is
-/// added. This is the supervisor's own statement of which port serves which
+/// plus the spawn index), so a scrape target list kept by hand drifts when a
+/// model is added. This is the supervisor's own statement of which port serves which
 /// model: compare it with what Prometheus actually scrapes. `metrics_port` is
 /// `none` when worker metrics are disabled. Labels come from configured
 /// models, so cardinality is the number of workers.
