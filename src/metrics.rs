@@ -887,6 +887,25 @@ pub fn set_arena_gauges(
     .set(extend_strategy as f64);
 }
 
+/// Publish the startup memory-budget verdict (see `mem_budget`). `limit` is
+/// `None` when no cgroup limit is readable; the ratio gauge is then left unset
+/// rather than reported as a misleading 0.
+pub fn set_memory_budget(
+    ceilings_sum: u64,
+    limit: Option<u64>,
+    headroom: u64,
+    ratio: Option<f64>,
+    exceeded: bool,
+) {
+    metrics::gauge!("embed_arena_ceilings_sum_bytes").set(ceilings_sum as f64);
+    metrics::gauge!("embed_memory_limit_bytes").set(limit.unwrap_or(0) as f64);
+    metrics::gauge!("embed_memory_budget_headroom_bytes").set(headroom as f64);
+    if let Some(r) = ratio {
+        metrics::gauge!("embed_memory_budget_ratio").set(r);
+    }
+    metrics::gauge!("embed_memory_budget_exceeded").set(if exceeded { 1.0 } else { 0.0 });
+}
+
 /// Increment the counter tracking how many times arena allocator
 /// registration was skipped because the env already had one registered.
 ///

@@ -2,9 +2,14 @@
 //!
 //! `/health` is a constant liveness probe — it answers `ok` as long as the
 //! process is up and the listener is bound. It touches no model, no worker,
-//! no queue. Container orchestrators use it for restart-on-crash.
+//! no queue, on purpose: a liveness probe that depends on the workers would
+//! turn a slow model load into a restart loop. Anything that needs to know
+//! whether the server can serve (the container `HEALTHCHECK`, deploy smoke
+//! tests) asks `/ready`.
 //!
-//! `/ready` is a readiness probe — it dispatches a single 1-word embed to
+//! `/ready` is a readiness probe — in multi-process mode it first requires
+//! every worker to have a live connection (all models loaded, none between
+//! respawns), then it dispatches a single 1-word embed to
 //! the default model and waits up to `EMBED_READY_PROBE_TIMEOUT_MS` (default
 //! 2 s). If the worker is wedged (busy-spin with zero throughput), the
 //! dispatch hangs, the probe times out, and `/ready` returns 503. This lets
@@ -62,6 +67,21 @@ pub async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
     // Multi-process mode: dispatch via worker pool.
     if let Some(pool) = state.worker_pool.as_ref() {
+        // Every worker must be up, not only the default model's: a worker that
+        // is still loading or respawning makes its model unservable even
+        // though the default-model probe below would pass.
+        let down = pool.down_models().await;
+        if !down.is_empty() {
+            crate::metrics::record_ready_probe("workers_down");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ReadyResponse {
+                    status: "not ready",
+                    model: None,
+                    error: Some(format!("workers not up: {}", down.join(", "))),
+                }),
+            );
+        }
         let result = crate::ipc::gate::with_priority(
             crate::ipc::gate::Priority::Probe,
             tokio::time::timeout(
@@ -359,6 +379,38 @@ mod tests {
         let (status, body) = call_ready(state).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("ready"));
+    }
+
+    // A worker that is not up (still loading, or between respawns) must fail
+    // /ready even when it is not the default model's worker: its model cannot
+    // be served. The default model has no supervisor here, so only the
+    // down-workers check can produce this exact message.
+    #[tokio::test]
+    async fn ready_returns_503_when_any_worker_is_down() {
+        use crate::supervisor::WorkerPool;
+        use crate::supervisor::handle::{SpawnSpec, WorkerKind, WorkerSupervisor};
+        use std::path::PathBuf;
+        let spec = SpawnSpec {
+            model: "other-model".to_string(),
+            kind: WorkerKind::Embed,
+            worker_bin: PathBuf::from("/bin/true"),
+            socket_dir: PathBuf::from("/tmp"),
+            pool_size: 1,
+            intra_threads: 1,
+            env_extra: vec![],
+        };
+        let pool = Arc::new(WorkerPool::new());
+        pool.add(WorkerSupervisor::for_test_no_client(spec)).await;
+        let mut state = Arc::try_unwrap(make_state(false, HashMap::new()))
+            .ok()
+            .expect("sole owner");
+        state.worker_pool = Some(pool);
+        let (status, body) = call_ready(Arc::new(state)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            body.contains("workers not up: other-model"),
+            "body should name the down worker, got {body}"
+        );
     }
 
     // ── hard test: wedged worker → /ready 503 ──────────────────────────────

@@ -239,6 +239,21 @@ impl WorkerPool {
         self.workers.read().await.keys().cloned().collect()
     }
 
+    /// Models whose worker has no live connection right now (not yet loaded,
+    /// or between respawns), sorted. Empty means every worker is up.
+    pub async fn down_models(&self) -> Vec<String> {
+        let sups: Vec<Arc<WorkerSupervisor>> =
+            self.workers.read().await.values().cloned().collect();
+        let mut down = Vec::new();
+        for sup in sups {
+            if sup.client().await.is_none() {
+                down.push(sup.model().to_string());
+            }
+        }
+        down.sort();
+        down
+    }
+
     /// Snapshot of (model_name, pid) pairs for currently live workers.
     ///
     /// Workers between respawns have `pid == 0` and are excluded from the
@@ -272,6 +287,45 @@ mod tests {
     use crate::supervisor::util::resolve_duration_secs_env;
     use serial_test::serial;
     use std::time::Duration;
+
+    fn spec(model: &str) -> crate::supervisor::handle::SpawnSpec {
+        crate::supervisor::handle::SpawnSpec {
+            model: model.to_string(),
+            kind: crate::supervisor::handle::WorkerKind::Embed,
+            worker_bin: std::path::PathBuf::from("/bin/true"),
+            socket_dir: std::path::PathBuf::from("/tmp"),
+            pool_size: 1,
+            intra_threads: 1,
+            env_extra: vec![],
+        }
+    }
+
+    /// `/ready` trusts this list: it must name exactly the workers without a
+    /// live client, sorted, and nothing else.
+    #[tokio::test]
+    async fn down_models_lists_only_workers_without_a_client() {
+        use crate::supervisor::handle::WorkerSupervisor;
+        let pool = super::WorkerPool::new();
+        assert!(pool.down_models().await.is_empty());
+
+        let sock = std::env::temp_dir().join(format!("pool-down-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let _listener = tokio::net::UnixListener::bind(&sock).expect("bind");
+        let client = std::sync::Arc::new(
+            crate::ipc::client::WorkerClient::connect(sock.clone(), 1)
+                .await
+                .expect("connect"),
+        );
+        pool.add(WorkerSupervisor::for_test(spec("up"), client))
+            .await;
+        pool.add(WorkerSupervisor::for_test_no_client(spec("zeta")))
+            .await;
+        pool.add(WorkerSupervisor::for_test_no_client(spec("alpha")))
+            .await;
+
+        assert_eq!(pool.down_models().await, vec!["alpha", "zeta"]);
+        let _ = std::fs::remove_file(&sock);
+    }
 
     #[test]
     fn dispatch_error_reason_and_retryability() {

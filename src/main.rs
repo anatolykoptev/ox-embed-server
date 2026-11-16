@@ -8,8 +8,10 @@ mod cache;
 mod cache_flow;
 mod config;
 mod evictable_pool;
+mod healthcheck;
 #[allow(dead_code)] // ipc items used by supervisor submodule; unused from main.rs directly
 mod ipc;
+mod mem_budget;
 mod metrics;
 mod mlock;
 mod model;
@@ -152,6 +154,12 @@ async fn drain_batchers(state: Arc<AppState>, timeout: Duration) {
 
 #[tokio::main]
 async fn main() {
+    // `embed-server healthcheck`: container probe, no server startup (see
+    // healthcheck.rs). Must run before logging/ORT init: it is a one-shot.
+    if std::env::args().nth(1).as_deref() == Some("healthcheck") {
+        std::process::exit(healthcheck::run());
+    }
+
     // Phase H.18 — OTEL when OTEL_EXPORTER_OTLP_ENDPOINT is set, plain
     // JSON logs otherwise. The handle is held until the end of main so
     // the batch exporter gets `shutdown()` on graceful termination.
@@ -226,6 +234,19 @@ async fn main() {
         eprintln!("config error: {e}");
         std::process::exit(1);
     });
+
+    // Advisory: arena ceilings + headroom vs the cgroup memory limit. Logs one
+    // error line and sets gauges on a violation; never blocks startup.
+    {
+        let names: Vec<String> = cfg
+            .models
+            .iter()
+            .map(|m| m.name.clone())
+            .chain(cfg.rerankers.iter().map(|r| r.name.clone()))
+            .chain(cfg.splades.iter().map(|s| s.name.clone()))
+            .collect();
+        mem_budget::check_at_startup(&names, cfg.multi_process);
+    }
 
     // Warn operators about per-model env vars that are silently unsupported.
     // RERANKER_SESSION_POOL_SIZE_* and SPLADE_SESSION_POOL_SIZE_* patterns look
