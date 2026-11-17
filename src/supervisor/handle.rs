@@ -2552,4 +2552,68 @@ mod tests {
             "own_priority must report the process's real nice"
         );
     }
+
+    /// Run `f` under a local metrics recorder and return the rendered text.
+    fn counted(f: impl FnOnce()) -> String {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, f);
+        handle.render()
+    }
+
+    /// `apply_nice` reports a clamp under the variable name, and ONLY a
+    /// clamp: a request below our own nice is counted, one at or above it is
+    /// not. The thread nice is raised first (unprivileged) so a positive
+    /// request below it exists even on a nice-0 runner.
+    ///
+    /// RED-proven: `nice != requested` -> `nice == requested` fails both
+    /// assertions (counts the free request, misses the clamped one).
+    #[test]
+    #[serial]
+    fn apply_nice_counts_only_a_real_clamp() {
+        let own = if own_priority() >= 10 { 19 } else { 10 };
+        let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS as _, 0, own) };
+        assert_eq!(rc, 0, "raising own nice to {own} needs no privilege");
+        let run = |requested: i32| {
+            counted(|| {
+                let mut cmd = Command::new("true");
+                apply_nice(&mut cmd, requested, "NICE_CLAMP_PROBE");
+            })
+        };
+        let clamped = run(own - 1);
+        let free = run(own);
+        assert!(
+            clamped.contains("embed_config_fallback_total{env_var=\"NICE_CLAMP_PROBE\"} 1"),
+            "a request below our own nice must be counted:\n{clamped}"
+        );
+        assert!(
+            !free.contains("NICE_CLAMP_PROBE"),
+            "a request at our own nice is not a clamp:\n{free}"
+        );
+    }
+
+    /// A failing `setpriority` in the child must fail the spawn, not be
+    /// swallowed. Make it fail deterministically: compute the hook's nice at
+    /// our current nice (no clamp), then raise THIS thread to 19 before
+    /// forking, so the child starts at 19 and asking for a lower nice needs
+    /// CAP_SYS_NICE (EACCES).
+    ///
+    /// RED-proven: `== -1` -> `== 1` at the pre_exec check lets the spawn
+    /// succeed.
+    #[tokio::test]
+    #[serial]
+    async fn apply_nice_surfaces_a_failed_setpriority() {
+        let own = own_priority();
+        assert!(own <= 17, "precondition: runner nice {own} leaves no room");
+        let requested = own + 1;
+        let mut cmd = Command::new("true");
+        apply_nice(&mut cmd, requested, "NICE_FAIL_PROBE");
+        let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS as _, 0, 19) };
+        assert_eq!(rc, 0, "raising own nice to 19 needs no privilege");
+        let res = cmd.spawn();
+        assert!(
+            res.is_err(),
+            "the child cannot lower its nice from 19 to {requested}; the spawn must report it"
+        );
+    }
 }

@@ -196,4 +196,11 @@ exclude_re = [
     "launch",
     "watchdog_loop",
     "spawn_one",
+    # own_priority: the `getpriority` error branch (`p == -1 && errno != 0`).
+    # Its mutants differ from the real code only when getpriority fails
+    # (unreachable for PRIO_PROCESS/0) or the process nice is exactly -1,
+    # which needs CAP_SYS_NICE or a raised RLIMIT_NICE that a CI test cannot
+    # arrange. The `-> 0` whole-function mutant stays in scope and is killed
+    # by own_priority_reports_raised_nice.
+    "(&&|==|!=|delete -).* in own_priority",
 ]
