@@ -147,15 +147,27 @@ pub fn free_port() -> u16 {
         .port()
 }
 
-/// Block until `GET {base}/health` succeeds. Panics on timeout — a server that
-/// never becomes healthy is a failure, never a skip.
-pub fn wait_healthy(base: &str, timeout: Duration) {
+/// Worker-socket wait handed to every spawned supervisor. The production
+/// default is far longer than any test needs: a worker that never binds its
+/// socket (crash, wrong env) must take the supervisor down in seconds, not
+/// leave the test waiting out [`wait_healthy`]'s whole budget. The tiny
+/// fixtures load in about a second.
+pub const WORKER_SOCKET_WAIT_SECS: (&str, &str) = ("EMBED_WORKER_SOCKET_WAIT_SECS", "30");
+
+/// Block until `GET {base}/health` succeeds. Panics on timeout, and as soon as
+/// `child` (the server) has exited — a server that dies or never becomes
+/// healthy is a failure, never a skip, and a dead one must not cost the full
+/// timeout.
+pub fn wait_healthy(base: &str, timeout: Duration, child: &mut Child) {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
         .expect("build reqwest client");
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
+        if let Some(status) = child.try_wait().expect("poll server child") {
+            panic!("server exited early ({status}) before {base} became healthy");
+        }
         if client
             .get(format!("{base}/health"))
             .send()
@@ -255,17 +267,22 @@ pub fn spawn_server(env: &Setup, tag: &str, server_bin: &str, worker_bin: &str) 
         // The supervisor's own batcher is off in multi-process mode anyway;
         // keep the worker path the only thing under test.
         .env("BATCHING_ENABLED", "false")
+        .env(WORKER_SOCKET_WAIT_SECS.0, WORKER_SOCKET_WAIT_SECS.1)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .process_group(0)
         .spawn()
         .expect("spawn embed-server");
-    let guard = ChildGuard {
+    let mut guard = ChildGuard {
         child: Some(child),
         socket: socket_dir.join("__guard_noop__"),
     };
     let base = format!("http://127.0.0.1:{port}");
-    wait_healthy(&base, Duration::from_secs(90));
+    wait_healthy(
+        &base,
+        Duration::from_secs(90),
+        guard.child.as_mut().expect("child just stored"),
+    );
     Server {
         base,
         worker_metrics_base,

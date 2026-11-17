@@ -130,10 +130,13 @@ Environment variables (parsed in `src/config.rs`):
 | `BATCH_WAIT_MS` | `10` | Coalesce window. |
 | `MAX_QUEUE_SIZE` | `256` | Queue cap → 503. |
 | `EMBED_MAX_WAITERS` | `8×pool_size` (floor 16) | Worker waiter-queue cap per worker. Set higher (e.g. `64`) to absorb bulk-indexing bursts without touching `EMBED_SESSION_POOL_SIZE`. |
+| `EMBED_WORKER_NICE_<MODEL>` | `0` | Multi-process only. Scheduling priority (nice, `0..=19`) of that model's worker, e.g. `EMBED_WORKER_NICE_JINA_CODE_V2=10` so a bulk worker yields CPU to the latency-sensitive one. Applied before `exec`, so every worker thread inherits it. `<MODEL>` is the model name upper-cased with `-` as `_`. |
 | `DRAIN_TIMEOUT_S` | `10` | SIGTERM drain window. |
 | `ORT_DYLIB_PATH` | `/usr/lib/libonnxruntime.so` | Required with `load-dynamic`. |
 | `EMBED_VERSION` | `dev` | Stamped into `embed_build_info`. |
 | `AUTO_TRUNCATE` | `true` | TEI-compat. Only literal `false` (case-insensitive) disables; `0`/`no`/`off`/empty leave it enabled. |
+
+A value that cannot be used (garbage, `0` where zero is meaningless, out of range) does not stop the server for the tuning knobs: the default is used, one `warn` line names the variable and the value, and `embed_config_fallback_total{env_var}` is incremented. A few knobs are strict and refuse to start instead (`EMBED_PORT`, `EMBED_MODELS`, `EMBED_INTRA_THREADS`, `EMBED_DEFAULT_MODEL`, `RERANKER_MODELS`, `SPLADE_MODELS`, `EMBED_ARENA_*`, `BATCH_LENGTH_RATIO_THRESHOLD`, `EMBED_BATCH_INVARIANT*`, `EMBED_INPUT_PREFIX_<KEY>`, and the worker's `EMBED_WORKER_{KIND,INTRA_THREADS,POOL_SIZE}`). A set per-model variable whose suffix matches no loaded model (typo, lower case, `-` instead of `_`) is reported the same way at startup. Alert on `embed_config_fallback_total > 0`: a series is created by its first increment, so it is born at 1 and `increase(...)` never sees a step.
 
 Current production `EMBED_MODELS`:
 

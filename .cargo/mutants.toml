@@ -44,7 +44,14 @@
 # Widening this list is the goal, not the exception: when a module gains
 # model-free coverage, add it here in the same PR.
 examine_globs = [
+    # HTTP handlers: status mapping, cache scatter and error classification
+    # live here, and their tests are model-free (they build `AppState` on a
+    # mock worker pool). All three compile into the bin target only, which
+    # `--bins` below runs.
+    "src/api.rs",
     "src/api_health.rs",
+    "src/api_rerank.rs",
+    "src/api_splade.rs",
     "src/arena.rs",
     "src/batcher.rs",
     "src/cache.rs",
@@ -52,6 +59,9 @@ examine_globs = [
     "src/config.rs",
     "src/drain.rs",
     "src/evictable_pool.rs",
+    # IPC client: deadline / framing / error mapping against an in-process
+    # UDS peer, no model needed.
+    "src/ipc/client.rs",
     "src/healthcheck.rs",
     "src/ipc/frame.rs",
     "src/ipc/protocol.rs",
@@ -186,4 +196,11 @@ exclude_re = [
     "launch",
     "watchdog_loop",
     "spawn_one",
+    # own_priority: the `getpriority` error branch (`p == -1 && errno != 0`).
+    # Its mutants differ from the real code only when getpriority fails
+    # (unreachable for PRIO_PROCESS/0) or the process nice is exactly -1,
+    # which needs CAP_SYS_NICE or a raised RLIMIT_NICE that a CI test cannot
+    # arrange. The `-> 0` whole-function mutant stays in scope and is killed
+    # by own_priority_reports_raised_nice.
+    "(&&|==|!=|delete -).* in own_priority",
 ]

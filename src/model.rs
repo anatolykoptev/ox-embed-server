@@ -93,11 +93,7 @@ pub fn configure_truncation(
 /// `GraphOptimizationLevel`. Defaults to `Level3` (all optimizations) when
 /// the variable is unset or unparseable.
 fn parse_opt_level() -> GraphOptimizationLevel {
-    let raw = std::env::var("ORT_OPT_LEVEL")
-        .ok()
-        .and_then(|s| s.parse::<u8>().ok())
-        .unwrap_or(3);
-    match raw {
+    match crate::env_parse::ort_opt_level() {
         0 => GraphOptimizationLevel::Disable,
         1 => GraphOptimizationLevel::Level1,
         2 => GraphOptimizationLevel::Level2,
@@ -832,8 +828,10 @@ fn resolve_batch_invariant(model_key: &str) -> Result<bool, String> {
         "EMBED_BATCH_INVARIANT_{}",
         crate::config::model_env_key(model_key)
     );
+    // env-strict: an unparseable value is an error (parse_batch_invariant)
     let raw = std::env::var(&per_model)
         .ok()
+        // env-strict: same parse_batch_invariant error for the global
         .or_else(|| std::env::var("EMBED_BATCH_INVARIANT").ok());
     parse_batch_invariant(raw.as_deref()).map_err(|e| format!("model '{model_key}': {e}"))
 }
@@ -867,30 +865,35 @@ pub(crate) fn plan_request(lens: &[usize], ratio: f32, batch_invariant: bool) ->
 /// the same typo-guard posture the other knobs in this crate take, because a
 /// silent 0.0 here would disable the split and look identical to "off by
 /// choice" on the dashboard.
-fn resolve_subbatch_ratio(model_key: &str) -> f32 {
+pub(crate) fn resolve_subbatch_ratio(model_key: &str) -> f32 {
     let per_model = format!(
         "EMBED_SUBBATCH_RATIO_{}",
         crate::config::model_env_key(model_key)
     );
-    let raw = std::env::var(&per_model)
-        .ok()
-        .or_else(|| std::env::var("EMBED_SUBBATCH_RATIO").ok());
-    parse_subbatch_ratio(raw.as_deref(), "EMBED_SUBBATCH_RATIO*")
+    // The per-model var wins; a set-but-garbage per-model value is noted under
+    // its own name rather than silently handing over to the global.
+    // parsed-by: parse_subbatch_ratio
+    if let Some(raw) = crate::env_parse::raw(&per_model).filter(|r| !r.trim().is_empty()) {
+        return parse_subbatch_ratio(Some(&raw), &per_model);
+    }
+    // parsed-by: parse_subbatch_ratio
+    let raw = crate::env_parse::raw("EMBED_SUBBATCH_RATIO");
+    parse_subbatch_ratio(raw.as_deref(), "EMBED_SUBBATCH_RATIO")
 }
 
 /// Pure half of [`resolve_subbatch_ratio`], split out so the fallback
 /// behaviour is testable without mutating process env.
 pub(crate) fn parse_subbatch_ratio(raw: Option<&str>, var: &str) -> f32 {
-    match raw {
-        None | Some("") => DEFAULT_SUBBATCH_RATIO,
+    match raw.filter(|s| !s.trim().is_empty()) {
+        None => DEFAULT_SUBBATCH_RATIO,
         Some(s) => match s.trim().parse::<f32>() {
             Ok(v) if v.is_finite() && v >= 0.0 => v,
             _ => {
-                tracing::warn!(
-                    raw = %s,
+                crate::env_parse::note_fallback(
                     var,
-                    default = DEFAULT_SUBBATCH_RATIO,
-                    "sub-batch ratio is not a finite non-negative float; using default"
+                    s,
+                    "a finite non-negative float",
+                    &DEFAULT_SUBBATCH_RATIO,
                 );
                 DEFAULT_SUBBATCH_RATIO
             }
@@ -1169,7 +1172,7 @@ fn build_one_session(
 mod seq_pad_tests {
     use super::{
         DEFAULT_SUBBATCH_RATIO, parse_batch_invariant, parse_subbatch_ratio, plan_request,
-        plan_subbatches,
+        plan_subbatches, resolve_batch_invariant, resolve_subbatch_ratio,
     };
     use crate::pool::{SEQ_PAD_MULTIPLE, round_up_seq_len};
 
@@ -1322,6 +1325,99 @@ mod seq_pad_tests {
         );
     }
 
+    /// Save/restore of env vars around an env-mutating test, same pattern
+    /// as `opt_level_tests::with_env` but for a fixed set of keys.
+    fn saved_env(vars: &[&str]) -> Vec<(String, Option<String>)> {
+        vars.iter()
+            .map(|k| (k.to_string(), std::env::var(k).ok()))
+            .collect()
+    }
+
+    fn restore_env(saved: Vec<(String, Option<String>)>) {
+        for (k, prev) in saved {
+            unsafe {
+                match prev {
+                    Some(v) => std::env::set_var(&k, v),
+                    None => std::env::remove_var(&k),
+                }
+            }
+        }
+    }
+
+    /// `resolve_batch_invariant` reads the env itself: per-model var first,
+    /// then the global, then off. A return-const mutant (`-> Ok(true)` /
+    /// `-> Ok(false)`) survives every test that only exercises the pure
+    /// `parse_batch_invariant`, so the env path is asserted end to end.
+    #[test]
+    #[serial_test::serial]
+    fn batch_invariant_env_resolution_per_model_then_global() {
+        const PER: &str = "EMBED_BATCH_INVARIANT_BINV_PROBE";
+        const GLOBAL: &str = "EMBED_BATCH_INVARIANT";
+        let saved = saved_env(&[PER, GLOBAL]);
+
+        unsafe {
+            std::env::remove_var(PER);
+            std::env::remove_var(GLOBAL);
+        }
+        let unset = resolve_batch_invariant("binv-probe");
+
+        unsafe { std::env::set_var(GLOBAL, "1") };
+        let global_on = resolve_batch_invariant("binv-probe");
+
+        unsafe { std::env::set_var(PER, "0") };
+        let per_model_off = resolve_batch_invariant("binv-probe");
+
+        unsafe { std::env::set_var(PER, "yes") };
+        let garbage = resolve_batch_invariant("binv-probe");
+
+        restore_env(saved);
+
+        assert_eq!(unset, Ok(false), "unset must default to off");
+        assert_eq!(global_on, Ok(true), "the global var must apply");
+        assert_eq!(
+            per_model_off,
+            Ok(false),
+            "per-model 0 must override global 1"
+        );
+        assert!(
+            garbage.is_err(),
+            "an unparseable value is an error, not a quiet default"
+        );
+    }
+
+    /// `resolve_subbatch_ratio`'s per-model var must win over the global.
+    /// The `!r.trim().is_empty()` filter is what decides whether a SET
+    /// per-model value is read at all: deleting the `!` makes a real value
+    /// invisible (falls through to the global) and treats whitespace as a
+    /// value (falls back to the default, skipping the global).
+    #[test]
+    #[serial_test::serial]
+    fn per_model_subbatch_ratio_wins_over_global() {
+        const PER: &str = "EMBED_SUBBATCH_RATIO_RATIO_PROBE";
+        const GLOBAL: &str = "EMBED_SUBBATCH_RATIO";
+        let saved = saved_env(&[PER, GLOBAL]);
+
+        unsafe {
+            std::env::set_var(PER, "3.0");
+            std::env::remove_var(GLOBAL);
+        }
+        let per_only = resolve_subbatch_ratio("ratio-probe");
+
+        unsafe {
+            std::env::set_var(PER, "   ");
+            std::env::set_var(GLOBAL, "4.0");
+        }
+        let blank_per_falls_to_global = resolve_subbatch_ratio("ratio-probe");
+
+        restore_env(saved);
+
+        assert_eq!(per_only, 3.0, "a set per-model ratio must be honoured");
+        assert_eq!(
+            blank_per_falls_to_global, 4.0,
+            "a blank per-model value falls through to the global exactly like unset"
+        );
+    }
+
     #[test]
     fn zero_and_one_stay_one() {
         // An empty batch must not produce a 0-dim tensor.
@@ -1448,7 +1544,8 @@ mod session_load_decision_tests {
 /// `EMBED_MEMORY_PATTERN_<MODEL>` convention.
 pub(crate) fn arena_shrink_enabled_for_model(model_name: &str, memory_pattern: bool) -> bool {
     let key = crate::config::model_env_key(model_name);
-    let env_val = std::env::var(format!("EMBED_ARENA_SHRINK_{key}")).ok();
+    // parsed-by: arena_shrink_enabled_for_model
+    let env_val = crate::env_parse::raw(&format!("EMBED_ARENA_SHRINK_{key}"));
     match env_val.as_deref() {
         Some("true") | Some("1") => {
             tracing::info!(
@@ -1470,10 +1567,11 @@ pub(crate) fn arena_shrink_enabled_for_model(model_name: &str, memory_pattern: b
             // Operator typo (e.g. "yes" / "on" / "enabled"). Mirror the
             // warn-on-failure pattern from `parse_memory_pattern` (config.rs)
             // so misconfiguration is visible rather than silently auto-gated.
-            tracing::warn!(
-                model = %model_name,
-                value = %other,
-                "EMBED_ARENA_SHRINK_{key} unrecognised value (expected true/false/1/0/auto/empty); falling back to auto-gate (memory_pattern={memory_pattern})"
+            crate::env_parse::note_fallback(
+                &format!("EMBED_ARENA_SHRINK_{key}"),
+                other,
+                "true/false/1/0/auto/empty",
+                &format!("auto-gate (shrink={})", !memory_pattern),
             );
             !memory_pattern
         }

@@ -178,6 +178,7 @@ pub fn init_arena_config_for_model(model_key: &str) -> ArenaCfg {
         let suffix = crate::config::model_env_key(model_key);
         let per_model_key = format!("EMBED_ARENA_MAX_MEM_BYTES_{suffix}");
         match std::env::var(&per_model_key) {
+            // env-strict: unparseable value panics in parse_bytes_with_suffix
             Ok(raw) => {
                 let trimmed = raw.trim();
                 // Use the same suffix-aware parser as the global path so
@@ -244,6 +245,7 @@ pub fn init_arena_config_for_model(model_key: &str) -> ArenaCfg {
 /// Panics if the variable is set but cannot be parsed.
 fn parse_usize_env(key: &str, default: usize) -> usize {
     match std::env::var(key) {
+        // env-strict: unparseable value panics in parse_bytes_with_suffix
         Ok(v) => parse_bytes_with_suffix(key, v.trim()),
         Err(_) => default,
     }
@@ -320,6 +322,7 @@ pub fn resolve_max_mem_bytes(
 
 fn parse_i32_env(key: &str, default: i32) -> i32 {
     match std::env::var(key) {
+        // env-strict: unparseable value panics
         Ok(v) => v.trim().parse::<i32>().unwrap_or_else(|_| {
             panic!("{key} must be an integer, got {v:?}");
         }),
@@ -339,9 +342,19 @@ fn parse_i32_env(key: &str, default: i32) -> i32 {
 /// Shared by all three model kinds (embed, reranker, splade) so the
 /// env knob is consistent across the process.
 pub(crate) fn parse_intra_op_spinning() -> bool {
-    matches!(
-        std::env::var("ORT_INTRA_OP_SPINNING").as_deref(),
-        Ok("1") | Ok("true") | Ok("yes")
+    // parsed-by: parse_intra_op_spinning_from
+    parse_intra_op_spinning_from(crate::env_parse::raw("ORT_INTRA_OP_SPINNING").as_deref())
+}
+
+/// Pure half of [`parse_intra_op_spinning`]. Anything that is not a
+/// recognised boolean (`on`, `Yes`, a typo) is noted and keeps spinning off.
+fn parse_intra_op_spinning_from(raw: Option<&str>) -> bool {
+    crate::env_parse::flag(
+        "ORT_INTRA_OP_SPINNING",
+        raw,
+        false,
+        &["1", "true", "yes"],
+        &["0", "false", "no"],
     )
 }
 
@@ -885,5 +898,28 @@ mod tests {
         let cfg = init_arena_config();
         drop(guard);
         assert_eq!(cfg.max_dead_bytes, 64 * 1024 * 1024);
+    }
+
+    // -----------------------------------------------------------------
+    // parse_intra_op_spinning — the env-reading wrapper. The pure `_from`
+    // half is exercised through flag() tests; a whole-function return-const
+    // mutant (`-> true` / `-> false`) skips the env read entirely, so the
+    // knob's own name must be asserted end to end.
+    // -----------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn intra_op_spinning_reads_env() {
+        let guard = EnvGuard::new(&["ORT_INTRA_OP_SPINNING"]);
+        assert!(
+            !parse_intra_op_spinning(),
+            "unset must keep spinning off (shared host)"
+        );
+        guard.set("ORT_INTRA_OP_SPINNING", "1");
+        assert!(parse_intra_op_spinning(), "1 opts into spinning");
+        guard.set("ORT_INTRA_OP_SPINNING", "0");
+        assert!(!parse_intra_op_spinning(), "explicit 0 stays off");
+        guard.set("ORT_INTRA_OP_SPINNING", "perhaps");
+        assert!(!parse_intra_op_spinning(), "garbage keeps the safe default");
     }
 }

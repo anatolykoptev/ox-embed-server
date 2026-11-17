@@ -23,7 +23,7 @@
 //! - Graceful shutdown via ControlMessage::Shutdown before kill_on_drop SIGKILL.
 
 use crate::ipc::client::WorkerClient;
-use crate::supervisor::util::resolve_duration_secs_env;
+use crate::supervisor::util::{resolve_duration_secs_env, resolve_worker_nice, worker_nice_var};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -261,6 +261,71 @@ pub struct SpawnSpec {
     pub env_extra: Vec<(String, String)>,
 }
 
+/// This process's own nice value (`getpriority(PRIO_PROCESS, 0)`).
+fn own_priority() -> i32 {
+    // getpriority returns -1 both for nice -1 and for an error: clear errno
+    // first and look at it afterwards. Any failure reads as 0 (no clamp).
+    // SAFETY: plain libc calls; `__errno_location` is the thread's errno slot.
+    unsafe {
+        *libc::__errno_location() = 0;
+        let p = libc::getpriority(libc::PRIO_PROCESS as _, 0);
+        if p == -1 && *libc::__errno_location() != 0 {
+            0
+        } else {
+            p
+        }
+    }
+}
+
+/// The nice value a child may actually be given: `setpriority(2)` is
+/// absolute, and moving a process to a nice value LOWER than its current one
+/// (a higher priority) needs CAP_SYS_NICE. A request below our own nice
+/// (e.g. 5 under a supervisor at 10) would fail the child's `pre_exec` with
+/// EACCES and the model would never come up, so it is raised to our own.
+fn effective_nice(target: i32, current: i32) -> i32 {
+    target.max(current)
+}
+
+/// Lower the scheduling priority of the child to `nice` BEFORE it execs.
+///
+/// Must be a `pre_exec` hook, not a `setpriority(pid)` after `spawn`: the
+/// worker is `#[tokio::main]`, so by the time the parent could act the child
+/// already has runtime and ORT threads, and `setpriority(PRIO_PROCESS, pid)`
+/// moves only the main thread. A nice value set before `exec` is inherited by
+/// every thread the worker ever creates.
+///
+/// `0` installs nothing: the worker keeps the supervisor's priority. A value
+/// below our own nice is clamped to it in the PARENT, before fork (counted
+/// under `var` in `embed_config_fallback_total`), so the hook never asks for a
+/// privileged raise.
+fn apply_nice(cmd: &mut Command, requested: i32, var: &str) {
+    if requested == 0 {
+        return;
+    }
+    let nice = effective_nice(requested, own_priority());
+    if nice != requested {
+        crate::env_parse::note_fallback(
+            var,
+            &requested.to_string(),
+            "an integer not below the supervisor's own nice (a higher priority than the \
+             supervisor needs CAP_SYS_NICE)",
+            &nice,
+        );
+    }
+    // SAFETY: the closure runs in the forked child before exec and calls only
+    // setpriority(2) (a raw syscall wrapper) and, on failure, reads errno; it
+    // allocates nothing and takes no locks. The value was clamped to at least
+    // our own nice above, so the call needs no privilege.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::setpriority(libc::PRIO_PROCESS as _, 0, nice) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 /// Actor that owns a single worker process and its UDS client.
 ///
 /// Callers query the live client via [`WorkerSupervisor::client`]; the field
@@ -350,44 +415,16 @@ impl WorkerSupervisor {
             Duration::from_secs(HEARTBEAT_INTERVAL_SECS),
             &format!("HEARTBEAT_INTERVAL_SECS ({HEARTBEAT_INTERVAL_SECS})"),
         );
-        let heartbeat_max_fails = match std::env::var("EMBED_WORKER_HEARTBEAT_MAX_FAILS") {
-            Ok(s) => match s.trim().parse::<u32>() {
-                Ok(0) => {
-                    tracing::warn!(
-                        "EMBED_WORKER_HEARTBEAT_MAX_FAILS=0 is invalid; defaulting to {HEARTBEAT_MAX_FAILS}"
-                    );
-                    HEARTBEAT_MAX_FAILS
-                }
-                Ok(v) => v,
-                Err(_) => {
-                    tracing::warn!(
-                        "EMBED_WORKER_HEARTBEAT_MAX_FAILS={s:?} is not a valid u32; defaulting to {HEARTBEAT_MAX_FAILS}"
-                    );
-                    HEARTBEAT_MAX_FAILS
-                }
-            },
-            Err(_) => HEARTBEAT_MAX_FAILS,
-        };
-        let heartbeat_probe_timeout = Duration::from_millis(
-            match std::env::var("EMBED_WORKER_HEARTBEAT_PROBE_TIMEOUT_MS") {
-                Ok(s) => match s.trim().parse::<u64>() {
-                    Ok(0) => {
-                        tracing::warn!(
-                            "EMBED_WORKER_HEARTBEAT_PROBE_TIMEOUT_MS=0 is invalid; defaulting to {HEARTBEAT_PROBE_TIMEOUT_MS}"
-                        );
-                        HEARTBEAT_PROBE_TIMEOUT_MS
-                    }
-                    Ok(v) => v,
-                    Err(_) => {
-                        tracing::warn!(
-                            "EMBED_WORKER_HEARTBEAT_PROBE_TIMEOUT_MS={s:?} is not a valid u64; defaulting to {HEARTBEAT_PROBE_TIMEOUT_MS}"
-                        );
-                        HEARTBEAT_PROBE_TIMEOUT_MS
-                    }
-                },
-                Err(_) => HEARTBEAT_PROBE_TIMEOUT_MS,
-            },
+        let heartbeat_max_fails = crate::env_parse::positive(
+            "EMBED_WORKER_HEARTBEAT_MAX_FAILS",
+            crate::env_parse::raw("EMBED_WORKER_HEARTBEAT_MAX_FAILS").as_deref(), // parsed-by: positive
+            HEARTBEAT_MAX_FAILS,
         );
+        let heartbeat_probe_timeout = Duration::from_millis(crate::env_parse::positive(
+            "EMBED_WORKER_HEARTBEAT_PROBE_TIMEOUT_MS",
+            crate::env_parse::raw("EMBED_WORKER_HEARTBEAT_PROBE_TIMEOUT_MS").as_deref(), // parsed-by: positive
+            HEARTBEAT_PROBE_TIMEOUT_MS,
+        ));
 
         // Freshness window — distinct from the probe interval. Default is
         // 3× the resolved interval so retuning the interval scales the window
@@ -525,6 +562,11 @@ impl WorkerSupervisor {
             .kill_on_drop(true);
         for (k, v) in &spec.env_extra {
             cmd.env(k, v);
+        }
+        let nice = resolve_worker_nice(&spec.model);
+        apply_nice(&mut cmd, nice, &worker_nice_var(&spec.model));
+        if nice != 0 {
+            tracing::info!(model = %spec.model, nice, "worker scheduling priority lowered");
         }
         let mut child = cmd.spawn().map_err(|e| {
             tracing::error!(model = %spec.model, error = %e, "worker spawn failed");
@@ -2338,6 +2380,240 @@ mod tests {
         assert!(
             !freshness_window_is_inert(Duration::from_secs(90), Duration::from_secs(15)),
             "the 90s default window with a 15s probe timeout is healthy"
+        );
+    }
+
+    /// Field 19 (`nice`) of a `/proc/<pid>/stat` line. The `comm` field may
+    /// contain spaces, so count from the closing paren.
+    fn nice_from_stat(stat: &str) -> i32 {
+        let after = &stat[stat.rfind(')').expect("comm paren") + 2..];
+        // `after` starts at field 3 (state); nice is field 19.
+        after
+            .split_whitespace()
+            .nth(16)
+            .expect("nice field")
+            .parse()
+            .expect("nice is an integer")
+    }
+
+    fn own_nice() -> i32 {
+        nice_from_stat(&std::fs::read_to_string("/proc/self/stat").expect("read own stat"))
+    }
+
+    /// A nice value that differs from the test process's own, so the
+    /// assertion cannot pass by inheritance (CI and the build box both run
+    /// tests under `nice`).
+    fn distinct_nice() -> i32 {
+        if own_nice() >= 10 { 19 } else { 10 }
+    }
+
+    /// `apply_nice` must set the child's nice before exec. A `sleep` child is
+    /// enough: the hook is the only thing that can make it differ from ours.
+    ///
+    /// RED-proven: deleting the `cmd.pre_exec(..)` statement in `apply_nice`
+    /// leaves the child at our own nice and fails the assertion
+    /// "child nice must be ...".
+    #[tokio::test]
+    async fn apply_nice_sets_child_priority_before_exec() {
+        let want = distinct_nice();
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30").kill_on_drop(true);
+        apply_nice(&mut cmd, want, "EMBED_WORKER_NICE_TEST");
+        let child = cmd.spawn().expect("spawn sleep");
+        let pid = child.id().expect("child pid");
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read child stat");
+        assert_eq!(
+            nice_from_stat(&stat),
+            want,
+            "child nice must be {want} (own nice {}): {stat}",
+            own_nice()
+        );
+    }
+
+    /// A target BELOW our own nice (0 < target < own) is not a privileged
+    /// raise: `apply_nice` clamps it to our own value in the parent, so the
+    /// spawn succeeds and the child runs at `max(target, own)`. Unclamped,
+    /// the child's `setpriority` fails with EACCES and the spawn errors (the
+    /// build box runs tests at nice 10, so target 5 reproduces it).
+    ///
+    /// RED-proven: making `effective_nice` return `target` fails with
+    /// "spawn must succeed" (EACCES) on a box running tests under nice.
+    #[tokio::test]
+    async fn apply_nice_clamps_target_below_own_priority() {
+        let own = own_nice();
+        let target = if own >= 2 { own - 1 } else { 5 };
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30").kill_on_drop(true);
+        apply_nice(&mut cmd, target, "EMBED_WORKER_NICE_TEST");
+        let child = cmd
+            .spawn()
+            .expect("spawn must succeed: a request below our own nice is clamped, not EACCES");
+        let pid = child.id().expect("child pid");
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read child stat");
+        assert_eq!(
+            nice_from_stat(&stat),
+            target.max(own),
+            "child nice must be max(target {target}, own {own}): {stat}"
+        );
+    }
+
+    #[test]
+    fn effective_nice_never_asks_for_a_raise() {
+        assert_eq!(effective_nice(5, 10), 10);
+        assert_eq!(effective_nice(10, 10), 10);
+        assert_eq!(effective_nice(15, 10), 15);
+        assert_eq!(effective_nice(7, 0), 7);
+    }
+
+    /// `apply_nice(_, 0)` installs no hook: the child keeps our priority.
+    #[tokio::test]
+    async fn apply_nice_zero_leaves_priority_unchanged() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30").kill_on_drop(true);
+        apply_nice(&mut cmd, 0, "EMBED_WORKER_NICE_TEST");
+        let child = cmd.spawn().expect("spawn sleep");
+        let pid = child.id().expect("child pid");
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read child stat");
+        assert_eq!(nice_from_stat(&stat), own_nice(), "{stat}");
+    }
+
+    /// The SPAWN PATH: `spawn_one` must resolve `EMBED_WORKER_NICE_<MODEL>`
+    /// and apply it to the worker it launches. A fake worker records its own
+    /// `/proc/self/stat` and then never opens the socket, so `spawn_one`
+    /// returns Err after `socket_wait`; the recording is what is asserted.
+    ///
+    /// RED-proven: deleting the `apply_nice(&mut cmd, nice);` call in
+    /// `spawn_one` makes the recorded nice equal our own and fails with
+    /// "worker spawned by spawn_one must run at nice ...".
+    #[tokio::test]
+    #[serial]
+    async fn spawn_one_applies_worker_nice_from_env() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let want = distinct_nice();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("worker-stat.txt");
+        let script = dir.path().join("fake-worker.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncat /proc/$$/stat > \"$FAKE_WORKER_OUT\"\nexec sleep 30\n",
+        )
+        .expect("write script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod script");
+        let spec = SpawnSpec {
+            model: "nice-probe".into(),
+            kind: WorkerKind::Embed,
+            worker_bin: script,
+            socket_dir: dir.path().to_path_buf(),
+            pool_size: 1,
+            intra_threads: 1,
+            env_extra: vec![("FAKE_WORKER_OUT".into(), out.to_string_lossy().into_owned())],
+        };
+        let var = "EMBED_WORKER_NICE_NICE_PROBE";
+        unsafe { std::env::set_var(var, want.to_string()) };
+        let res = WorkerSupervisor::spawn_one(
+            &spec,
+            Duration::from_millis(1500),
+            Duration::from_secs(60),
+        )
+        .await;
+        unsafe { std::env::remove_var(var) };
+        assert!(res.is_err(), "the fake worker never opens a socket");
+        let stat = std::fs::read_to_string(&out).expect("fake worker recorded its stat");
+        assert_eq!(
+            nice_from_stat(&stat),
+            want,
+            "worker spawned by spawn_one must run at nice {want} (own nice {}): {stat}",
+            own_nice()
+        );
+    }
+
+    /// `own_priority` must read the real process nice — `apply_nice`'s
+    /// clamp is only as good as the value it clamps against. `-> 0` is
+    /// invisible on a nice-0 runner (CI), so this test first raises its
+    /// own nice: raising is unprivileged (only LOWERING needs
+    /// CAP_SYS_NICE), and nextest runs each test in its own process, so
+    /// the raise cannot leak into a sibling test.
+    ///
+    /// RED-proven: `own_priority -> 0` fails the final assertion with
+    /// 0 != raised.
+    #[test]
+    #[serial]
+    fn own_priority_reports_raised_nice() {
+        let before = own_nice();
+        // Same shape as `distinct_nice()`: pick a value strictly above the
+        // current nice (a lower priority), which never needs CAP_SYS_NICE.
+        let raised = if before >= 10 { 19 } else { 10 };
+        let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS as _, 0, raised) };
+        assert_eq!(rc, 0, "raising own nice to {raised} needs no privilege");
+        assert_eq!(
+            own_priority(),
+            raised,
+            "own_priority must report the process's real nice"
+        );
+    }
+
+    /// Run `f` under a local metrics recorder and return the rendered text.
+    fn counted(f: impl FnOnce()) -> String {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, f);
+        handle.render()
+    }
+
+    /// `apply_nice` reports a clamp under the variable name, and ONLY a
+    /// clamp: a request below our own nice is counted, one at or above it is
+    /// not. The thread nice is raised first (unprivileged) so a positive
+    /// request below it exists even on a nice-0 runner.
+    ///
+    /// RED-proven: `nice != requested` -> `nice == requested` fails both
+    /// assertions (counts the free request, misses the clamped one).
+    #[test]
+    #[serial]
+    fn apply_nice_counts_only_a_real_clamp() {
+        let own = if own_priority() >= 10 { 19 } else { 10 };
+        let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS as _, 0, own) };
+        assert_eq!(rc, 0, "raising own nice to {own} needs no privilege");
+        let run = |requested: i32| {
+            counted(|| {
+                let mut cmd = Command::new("true");
+                apply_nice(&mut cmd, requested, "NICE_CLAMP_PROBE");
+            })
+        };
+        let clamped = run(own - 1);
+        let free = run(own);
+        assert!(
+            clamped.contains("embed_config_fallback_total{env_var=\"NICE_CLAMP_PROBE\"} 1"),
+            "a request below our own nice must be counted:\n{clamped}"
+        );
+        assert!(
+            !free.contains("NICE_CLAMP_PROBE"),
+            "a request at our own nice is not a clamp:\n{free}"
+        );
+    }
+
+    /// A failing `setpriority` in the child must fail the spawn, not be
+    /// swallowed. Make it fail deterministically: compute the hook's nice at
+    /// our current nice (no clamp), then raise THIS thread to 19 before
+    /// forking, so the child starts at 19 and asking for a lower nice needs
+    /// CAP_SYS_NICE (EACCES).
+    ///
+    /// RED-proven: `== -1` -> `== 1` at the pre_exec check lets the spawn
+    /// succeed.
+    #[tokio::test]
+    #[serial]
+    async fn apply_nice_surfaces_a_failed_setpriority() {
+        let own = own_priority();
+        assert!(own <= 17, "precondition: runner nice {own} leaves no room");
+        let requested = own + 1;
+        let mut cmd = Command::new("true");
+        apply_nice(&mut cmd, requested, "NICE_FAIL_PROBE");
+        let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS as _, 0, 19) };
+        assert_eq!(rc, 0, "raising own nice to 19 needs no privilege");
+        let res = cmd.spawn();
+        assert!(
+            res.is_err(),
+            "the child cannot lower its nice from 19 to {requested}; the spawn must report it"
         );
     }
 }

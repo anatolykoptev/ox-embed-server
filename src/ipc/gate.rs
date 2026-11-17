@@ -116,7 +116,8 @@ where
 /// Resolve the aging bound from `EMBED_BULK_AGING_MS`. Zero or garbage falls
 /// back to the default and bumps the config-fallback counter.
 pub fn bulk_aging_from_env() -> Duration {
-    parse_aging(std::env::var(BULK_AGING_ENV).ok().as_deref())
+    // parsed-by: parse_aging
+    parse_aging(crate::env_parse::raw(BULK_AGING_ENV).as_deref())
 }
 
 fn parse_aging(raw: Option<&str>) -> Duration {

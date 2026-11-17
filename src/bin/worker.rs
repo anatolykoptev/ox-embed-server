@@ -81,7 +81,7 @@ fn install_worker_metrics(model_name: &str) -> PrometheusHandle {
         .install_recorder()
         .expect("install Prometheus recorder in worker");
 
-    let port_str = std::env::var("EMBED_WORKER_METRICS_PORT").ok();
+    let port_str = std::env::var("EMBED_WORKER_METRICS_PORT").ok(); // env-strict: a bad value is noted in the Err arm below and disables the listener
     if let Some(raw) = port_str {
         match raw.trim().parse::<u16>() {
             Ok(port) => {
@@ -91,14 +91,16 @@ fn install_worker_metrics(model_name: &str) -> PrometheusHandle {
                 // scrape. Operator may set EMBED_WORKER_METRICS_BIND to
                 // "127.0.0.1" for host-only / single-process dev where
                 // exposure is undesired.
-                let bind = std::env::var("EMBED_WORKER_METRICS_BIND")
+                let bind = std::env::var("EMBED_WORKER_METRICS_BIND") // env-strict: a bad value is noted in the Err arm below
                     .unwrap_or_else(|_| "0.0.0.0".to_string());
                 let addr: std::net::SocketAddr = match format!("{}:{}", bind, port).parse() {
                     Ok(a) => a,
                     Err(e) => {
-                        tracing::error!(
-                            model = %model_name, port, bind = %bind, error = %e,
-                            "EMBED_WORKER_METRICS_BIND invalid; falling back to 0.0.0.0"
+                        embed_server::env_parse::note_fallback(
+                            "EMBED_WORKER_METRICS_BIND",
+                            &bind,
+                            &format!("an IP address ({e})"),
+                            &"0.0.0.0",
                         );
                         ([0u8, 0, 0, 0], port).into()
                     }
@@ -150,9 +152,11 @@ fn install_worker_metrics(model_name: &str) -> PrometheusHandle {
                 });
             }
             Err(_) => {
-                tracing::warn!(
-                    EMBED_WORKER_METRICS_PORT = %raw.trim(),
-                    "EMBED_WORKER_METRICS_PORT is not a valid port; metrics HTTP server disabled"
+                embed_server::env_parse::note_fallback(
+                    "EMBED_WORKER_METRICS_PORT",
+                    raw.trim(),
+                    "a TCP port 0..=65535",
+                    &"metrics HTTP server disabled",
                 );
             }
         }
@@ -223,6 +227,7 @@ fn register_arena_for_worker(model_name: &str) -> anyhow::Result<()> {
 
 fn require_env(var: &str) -> anyhow::Result<String> {
     std::env::var(var).map_err(|_e| {
+        // env-strict: missing aborts startup
         tracing::error!(var, "required environment variable missing");
         anyhow::anyhow!("required env var missing: {var}")
     })
@@ -249,15 +254,26 @@ impl LoadedModel {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let kind = std::env::var("EMBED_WORKER_KIND").unwrap_or_else(|_| "embed".into());
+    let kind = std::env::var("EMBED_WORKER_KIND") // env-strict: an unknown kind aborts startup below
+        .unwrap_or_else(|_| "embed".into());
     let model_name = require_env("EMBED_WORKER_MODEL")?;
     let socket_path: PathBuf = require_env("EMBED_WORKER_SOCKET")?.into();
-    let intra_threads: usize = std::env::var("EMBED_WORKER_INTRA_THREADS")
+    let intra_threads: usize = std::env::var("EMBED_WORKER_INTRA_THREADS") // env-strict: garbage aborts startup via `?`
         .unwrap_or_else(|_| INTRA_THREADS.to_string())
         .parse()?;
-    let pool_size: usize = std::env::var("EMBED_WORKER_POOL_SIZE")
+    let pool_size: usize = std::env::var("EMBED_WORKER_POOL_SIZE") // env-strict: garbage aborts startup via `?`
         .unwrap_or_else(|_| POOL_SIZE.to_string())
         .parse()?;
+
+    // Install the Prometheus recorder FIRST: everything below that can fall
+    // back on a bad env value (`resolve_max_waiters_for_model`,
+    // `Config::from_env`) counts it in `embed_config_fallback_total`, and a
+    // counter emitted before a recorder exists goes to the no-op recorder and
+    // is lost. If EMBED_WORKER_METRICS_PORT is set this also spawns a
+    // lightweight HTTP /metrics server for per-worker polling. Held for the
+    // process lifetime: dropping the handle shuts the server down.
+    // `source_order_installs_metrics_before_env_fallbacks` pins the order.
+    let _metrics_handle = install_worker_metrics(&model_name);
 
     // Initialize the ORT runtime explicitly BEFORE arena registration.
     // arena::register_shared_cpu_arena documents that it MUST be called
@@ -288,13 +304,6 @@ async fn main() -> anyhow::Result<()> {
         tracing::error!(error = %e, "config load failed");
         anyhow::anyhow!("config: {e}")
     })?;
-
-    // Install Prometheus recorder. If EMBED_WORKER_METRICS_PORT is set, also
-    // spawns a lightweight HTTP /metrics server for per-worker polling.
-    // Must happen before arena registration (which emits gauges).
-    // Held for process lifetime: dropping this handle shuts down the metrics
-    // HTTP server, making /metrics unreachable for the rest of the worker life.
-    let _metrics_handle = install_worker_metrics(&model_name);
 
     // Register the shared CPU arena BEFORE any Session::builder() call.
     // Each worker is a fresh process — the parent supervisor's registration
@@ -750,5 +759,37 @@ mod tests {
             val, WAITERS_FLOOR,
             "zero falls back to formula (2×mult=16, floor=16)"
         );
+    }
+
+    /// Call-site pin: the Prometheus recorder must exist before the first
+    /// env read that can fall back. `resolve_max_waiters_for_model` and
+    /// `Config::from_env` count a bad value in `embed_config_fallback_total`;
+    /// run before `install_worker_metrics`, the increment goes to the no-op
+    /// recorder and the counter stays 0 while the typo is live. The order is
+    /// a property of `main`, which needs a model to run, so it is asserted on
+    /// the source of `main` itself.
+    ///
+    /// RED-proven: moving the `install_worker_metrics` statement below the
+    /// `resolve_max_waiters_for_model` call fails with "metrics recorder
+    /// must be installed before ...".
+    #[test]
+    fn source_order_installs_metrics_before_env_fallbacks() {
+        let src = include_str!("worker.rs");
+        let prod = &src[..src.find("\n#[cfg(test)]").expect("test module marker")];
+        let main_at = prod.find("async fn main()").expect("main");
+        let body = &prod[main_at..];
+        let install = body
+            .find("let _metrics_handle = install_worker_metrics(")
+            .expect("install_worker_metrics call in main");
+        for later in ["resolve_max_waiters_for_model(", "Config::from_env()"] {
+            let at = body
+                .find(later)
+                .unwrap_or_else(|| panic!("{later} in main"));
+            assert!(
+                install < at,
+                "metrics recorder must be installed before `{later}` in main(): \
+                 its fallbacks would be counted into the no-op recorder"
+            );
+        }
     }
 }

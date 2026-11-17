@@ -15,32 +15,48 @@ pub(crate) fn resolve_duration_secs_env(
     default: Duration,
     source: &str,
 ) -> Duration {
-    match std::env::var(key) {
-        Err(_) => default,
-        Ok(raw) => match raw.trim().parse::<u64>() {
-            Ok(n) if n > 0 => Duration::from_secs(n),
-            Ok(_) => {
-                tracing::warn!(
-                    env_key = key,
-                    value = %raw,
-                    fallback = source,
-                    "{key}=0 is invalid; using default"
-                );
-                crate::metrics::record_config_fallback(key);
-                default
-            }
-            Err(_) => {
-                tracing::warn!(
-                    env_key = key,
-                    value = %raw,
-                    fallback = source,
-                    "{key} is not a valid u64; using default"
-                );
-                crate::metrics::record_config_fallback(key);
-                default
-            }
-        },
+    // parsed-by: resolve_duration_secs_env
+    let raw = crate::env_parse::raw(key);
+    let Some(text) = raw.as_deref().map(str::trim).filter(|t| !t.is_empty()) else {
+        return default;
+    };
+    match text.parse::<u64>() {
+        Ok(n) if n > 0 => Duration::from_secs(n),
+        _ => {
+            crate::env_parse::note_fallback(
+                key,
+                text,
+                "a positive integer number of seconds",
+                &source,
+            );
+            default
+        }
     }
+}
+
+/// Name of the per-model nice variable for `model`.
+pub(crate) fn worker_nice_var(model: &str) -> String {
+    format!("EMBED_WORKER_NICE_{}", crate::config::model_env_key(model))
+}
+
+/// Nice value for the worker of `model`, from `EMBED_WORKER_NICE_<MODEL_KEY>`
+/// (key = `config::model_env_key`, e.g. `EMBED_WORKER_NICE_JINA_CODE_V2`).
+///
+/// Only LOWERING priority is supported (`0..=19`): that never needs a
+/// privilege, so applying it cannot fail the spawn. Unset → `0` (the worker
+/// inherits the supervisor's priority, as before); negative, above 19 or
+/// non-numeric → noted and `0`.
+pub(crate) fn resolve_worker_nice(model: &str) -> i32 {
+    let var = worker_nice_var(model);
+    // parsed-by: resolve_worker_nice
+    let raw = crate::env_parse::raw(&var);
+    crate::env_parse::parse_or(
+        &var,
+        raw.as_deref(),
+        0i32,
+        |n| (0..=19).contains(n),
+        "an integer 0..=19 (higher = lower priority)",
+    )
 }
 
 /// Parse a millisecond delay from an environment variable.
@@ -55,31 +71,24 @@ pub(crate) fn resolve_duration_secs_env(
 /// Captured at startup; restart the container to pick up a new value.
 #[allow(dead_code)] // called from src/main.rs (bin) — lib crate can't see cross-crate call
 pub(crate) fn resolve_spawn_stagger_ms(key: &str, default_ms: u64) -> Option<std::time::Duration> {
-    match std::env::var(key) {
+    let default = || (default_ms != 0).then(|| std::time::Duration::from_millis(default_ms));
+    // parsed-by: resolve_spawn_stagger_ms
+    let raw = crate::env_parse::raw(key);
+    let Some(text) = raw.as_deref().map(str::trim).filter(|t| !t.is_empty()) else {
+        return default();
+    };
+    match text.parse::<u64>() {
+        Ok(0) => None,
+        Ok(n) => Some(std::time::Duration::from_millis(n)),
         Err(_) => {
-            if default_ms == 0 {
-                None
-            } else {
-                Some(std::time::Duration::from_millis(default_ms))
-            }
+            crate::env_parse::note_fallback(
+                key,
+                text,
+                "a non-negative integer number of milliseconds",
+                &default_ms,
+            );
+            default()
         }
-        Ok(raw) => match raw.trim().parse::<u64>() {
-            Ok(0) => None,
-            Ok(n) => Some(std::time::Duration::from_millis(n)),
-            Err(_) => {
-                tracing::warn!(
-                    env_key = key,
-                    value = %raw,
-                    fallback_ms = default_ms,
-                    "{key} is not a valid u64; using default"
-                );
-                if default_ms == 0 {
-                    None
-                } else {
-                    Some(std::time::Duration::from_millis(default_ms))
-                }
-            }
-        },
     }
 }
 
@@ -170,5 +179,43 @@ mod tests {
             let result = resolve_spawn_stagger_ms("EMBED_WORKER_SPAWN_DELAY_MS_TEST6", 0);
             assert_eq!(result, None);
         });
+    }
+
+    // --- resolve_worker_nice ---
+
+    #[test]
+    #[serial]
+    fn worker_nice_resolution_table() {
+        const VAR: &str = "EMBED_WORKER_NICE_NICE_TABLE";
+        // (raw value, expected nice, whether the value is noted as unusable)
+        let cases: [(Option<&str>, i32, bool); 9] = [
+            (None, 0, false),
+            (Some("10"), 10, false),
+            (Some(" 7 "), 7, false),
+            (Some("19"), 19, false),
+            (Some("0"), 0, false),
+            (Some(""), 0, false),
+            (Some("-5"), 0, true),
+            (Some("20"), 0, true),
+            (Some("abc"), 0, true),
+        ];
+        for (raw, want, noted) in cases {
+            match raw {
+                Some(v) => unsafe { std::env::set_var(VAR, v) },
+                None => unsafe { std::env::remove_var(VAR) },
+            }
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let mut got = -1;
+            metrics::with_local_recorder(&recorder, || got = resolve_worker_nice("nice-table"));
+            unsafe { std::env::remove_var(VAR) };
+            assert_eq!(got, want, "raw {raw:?}");
+            let line = format!("embed_config_fallback_total{{env_var=\"{VAR}\"}} 1");
+            assert_eq!(
+                handle.render().contains(&line),
+                noted,
+                "raw {raw:?}: an unusable value must be counted and a usable one must not"
+            );
+        }
     }
 }

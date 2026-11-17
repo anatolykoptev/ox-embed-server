@@ -48,6 +48,7 @@ impl std::error::Error for QueueFullError {}
 /// `BatcherConfig::length_ratio_threshold` for the full rationale.
 fn parse_length_ratio_threshold() -> f64 {
     match std::env::var("BATCH_LENGTH_RATIO_THRESHOLD") {
+        // env-strict: garbage panics below
         Ok(v) => {
             let trimmed = v.trim();
             let parsed = trimmed.parse::<f64>().unwrap_or_else(|_| {

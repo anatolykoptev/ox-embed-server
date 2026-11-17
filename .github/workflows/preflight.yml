@@ -262,7 +262,7 @@ jobs:
     needs: [docs-scope]
     if: ${{ !cancelled() && !(needs.docs-scope.result == 'success' && needs.docs-scope.outputs.docs_only == 'true') }}
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 60
+    timeout-minutes: 110
     steps:
       - uses: actions/checkout@v5
         with:
@@ -389,10 +389,8 @@ jobs:
         # PRs only: `--in-diff` needs a base to diff against, and a push to main
         # has already been through this gate on its PR.
         if: github.event_name == 'pull_request'
-        # 103 mutants for this PR's diff (arena.rs alone runs the model-backed
-        # integration tests per mutant); 25 min timed out with no output because
-        # the log is only printed at the end.
-        timeout-minutes: 45
+        # Large in-diff on a widened mutation scope: 25 min timed out with no verdict.
+        timeout-minutes: 90
         run: |
           set -euo pipefail
           # Diff against the merge-base, not the base tip: `...` gives the lines

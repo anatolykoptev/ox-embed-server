@@ -1,5 +1,6 @@
 //! Library facade — exposes modules to binaries (main + worker).
 pub mod config;
+pub mod env_parse;
 pub mod input_prefix;
 pub mod ipc;
 pub mod model;

@@ -145,6 +145,7 @@ pub fn init() -> Option<SdkTracerProvider> {
     global::set_text_map_propagator(TraceContextPropagator::new());
 
     let endpoint = match std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
+        // env-raw: a URL, no parse
         Ok(e) if !e.trim().is_empty() => e,
         _ => {
             // No exporter configured — fall back to plain JSON logs
@@ -196,7 +197,8 @@ pub fn init() -> Option<SdkTracerProvider> {
         .with_attribute(KeyValue::new("service.name", SERVICE_NAME))
         .with_attribute(KeyValue::new(
             "service.version",
-            std::env::var("EMBED_VERSION").unwrap_or_else(|_| "dev".to_string()),
+            std::env::var("EMBED_VERSION") // env-raw: a label, no parse
+                .unwrap_or_else(|_| "dev".to_string()),
         ))
         .build();
 

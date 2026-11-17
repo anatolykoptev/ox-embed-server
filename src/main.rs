@@ -9,6 +9,7 @@ mod cache_flow;
 mod calibration;
 mod config;
 mod drain;
+mod env_parse;
 mod evictable_pool;
 mod healthcheck;
 mod input_prefix;
@@ -246,7 +247,8 @@ async fn main() {
     // call. arena::register_shared_cpu_arena() below calls set_arena_gauges()
     // — without recorder installed first, those gauge writes are silently
     // dropped (FU-28).
-    let version = std::env::var("EMBED_VERSION").unwrap_or_else(|_| "dev".into());
+    let version = std::env::var("EMBED_VERSION") // env-raw: a label, no parse
+        .unwrap_or_else(|_| "dev".into());
     let prom_handle = std::sync::Arc::new(metrics::init(&version));
 
     // Register a shared CPU arena allocator with kSameAsRequested extend
@@ -302,9 +304,10 @@ async fn main() {
         }
     }
 
-    // Warn if EMBED_MAX_WAITERS_<KEY> is set for a model key that doesn't
-    // match any loaded model (embed + rerank + splade). This catches typos
-    // like EMBED_MAX_WAITERS_JINA_CODEV2 (missing underscore) early.
+    // Warn if a per-model variable (EMBED_MAX_WAITERS_<KEY>, ...) is set for a
+    // model key that doesn't match any loaded model (embed + rerank + splade).
+    // This catches typos like EMBED_MAX_WAITERS_JINA_CODEV2 (missing
+    // underscore) or a lowercase / hyphenated suffix early.
     {
         let known_keys: std::collections::HashSet<String> = cfg
             .models
@@ -321,26 +324,10 @@ async fn main() {
                     .map(|s| crate::config::model_env_key(&s.name)),
             )
             .collect();
-        let unknown_waiters: Vec<String> = std::env::vars()
-            .filter_map(|(k, _)| {
-                if let Some(suffix) = k.strip_prefix("EMBED_MAX_WAITERS_") {
-                    if !known_keys.contains(suffix) {
-                        Some(k)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if !unknown_waiters.is_empty() {
-            tracing::warn!(
-                vars = %unknown_waiters.join(", "),
-                known = ?known_keys,
-                "EMBED_MAX_WAITERS_<KEY> set for unknown model key(s); check for typos (key must be uppercase with dashes replaced by underscores)"
-            );
-        }
+        // Every per-model family (EMBED_MAX_WAITERS_<KEY>, BATCH_MAX_SEQ_<KEY>,
+        // EMBED_ARENA_*_<KEY>, ...): warn + count once per variable that no
+        // loaded model will ever read.
+        crate::env_parse::report_unknown_per_model_vars(&known_keys);
     }
 
     // When EMBED_MULTI_PROCESS=1 the supervisor must NOT load ONNX sessions —
@@ -712,9 +699,15 @@ async fn main() {
         .saturating_mul(cfg.reranker_intra_threads)
         .saturating_mul(8)
         .max(16);
-    let env_override = std::env::var("MAX_CONCURRENT_RERANK_REQUESTS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok());
+    // `0` is meaningful (semaphore off); garbage is noted and means "auto".
+    let env_override = crate::env_parse::raw("MAX_CONCURRENT_RERANK_REQUESTS") // parsed-by: parse_optional
+        .and_then(|s| {
+            env_parse::parse_optional(
+                "MAX_CONCURRENT_RERANK_REQUESTS",
+                &s,
+                "a non-negative integer",
+            )
+        });
     let rerank_semaphore = match env_override {
         Some(0) => {
             tracing::info!("rerank semaphore disabled via MAX_CONCURRENT_RERANK_REQUESTS=0");
@@ -743,8 +736,10 @@ async fn main() {
     // otherwise sizes `pool × intra × 8` floor 16 — headroom above the
     // steady-state concurrency the PriorityGate already admits, so the cap
     // sheds only pathological bursts, not today's traffic.
-    let global_embed_cap_raw = std::env::var("MAX_CONCURRENT_EMBED_REQUESTS").ok();
-    let global_embed_pool_raw = std::env::var("EMBED_SESSION_POOL_SIZE").ok();
+    // parsed-by: resolve_embed_concurrency_for_model
+    let global_embed_cap_raw = crate::env_parse::raw("MAX_CONCURRENT_EMBED_REQUESTS");
+    // parsed-by: parse_embed_pool_size
+    let global_embed_pool_raw = crate::env_parse::raw("EMBED_SESSION_POOL_SIZE");
     let embed_semaphores: HashMap<String, Arc<tokio::sync::Semaphore>> = cfg
         .models
         .iter()
@@ -777,13 +772,20 @@ async fn main() {
         //   Each worker gets base + index (across embed+rerank+splade in
         //   declaration order). Unset EMBED_WORKER_METRICS_PORT_BASE → metrics
         //   HTTP disabled for all workers (back-compat).
-        let metrics_port_base: Option<u16> = std::env::var("EMBED_WORKER_METRICS_PORT_BASE")
-            .ok()
-            .and_then(|s| s.trim().parse::<u16>().ok());
+        let metrics_port_base: Option<u16> =
+            crate::env_parse::raw("EMBED_WORKER_METRICS_PORT_BASE") // parsed-by: parse_optional
+                .and_then(|s| {
+                    env_parse::parse_optional(
+                        "EMBED_WORKER_METRICS_PORT_BASE",
+                        &s,
+                        "a TCP port 0..=65535",
+                    )
+                });
 
         // Read global pool size raw value once so per-model resolver can fall
         // back to it without re-reading the env var inside the loop.
-        let global_embed_pool_raw = std::env::var("EMBED_SESSION_POOL_SIZE").ok();
+        // parsed-by: parse_embed_pool_size
+        let global_embed_pool_raw = crate::env_parse::raw("EMBED_SESSION_POOL_SIZE");
         let mut specs: Vec<crate::supervisor::SpawnSpec> = Vec::new();
         let mut worker_index: u16 = 0;
         for model_def in &cfg.models {
