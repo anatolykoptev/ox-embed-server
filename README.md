@@ -81,6 +81,7 @@ Cohere-compatible JSON shape.
 - Results sorted by `relevance_score` DESCENDING.
 - `index` is the 0-based position in the original `documents` array.
 - Scores are raw logits (any real number) — higher = more relevant. Not a calibrated probability.
+- `calibration` — present only when a score calibration was applied to `relevance_score` (see [Score calibration](#score-calibration)); additive, ignore it if you do not need it.
 
 **Configure models via env:**
 ```
@@ -98,6 +99,21 @@ curl -s -X POST http://127.0.0.1:8082/v1/rerank \
 **Notes:**
 - The response cache (Phase D) is bypassed for `/v1/rerank` — query/doc pairs are near-unique and caching them would burn RAM for ~0 hit rate.
 - Each `(query, doc)` pair is tokenized together by the cross-encoder and scored; batcher coalesces pairs across requests the same way embeddings do.
+
+### Score calibration
+
+A cross-encoder's logits sit on a model-specific scale, so replacing a reranker behind the same `model` name moves every client-side threshold set on the sigmoid score. To keep a swap transparent, a reranker directory may hold an optional `calibration.json`: a monotone piecewise-linear map from this model's logit to the logit scale the clients were tuned against.
+
+```json
+{"schema": 1, "id": "new-to-old-2026-11-16", "knots_x": [-10.0, 0.0, 7.5], "knots_y": [-3.3, -0.4, 3.3]}
+```
+
+- Loaded once at startup from `<model dir>/calibration.json`, in the server process, so it covers in-process and worker modes alike.
+- Validation: `schema` is `1`; `knots_x` and `knots_y` have the same length, at least 2; all values finite; `knots_x` strictly increasing; `knots_y` strictly increasing; every segment slope finite and positive (a file whose arithmetic would overflow is rejected); `id` non-empty. **A file that is present but invalid aborts startup** rather than silently serving uncalibrated scores. A missing file means identity (logged once at info level).
+- Applied to the raw logit immediately before the sigmoid, so only when `normalize` is the default (`"sigmoid"`); `"normalize":"none"` still returns the raw logit. Linear between knots, linear extrapolation from the end segments. If extrapolating a far-out logit overflows to a non-finite value, that logit is kept raw and counted in `embed_rerank_calibration_fallback_total{model}` (expected 0). Ranking within a request is unchanged.
+- The applied `id` is returned as `calibration` in the `/v1/rerank` response, and `embed_rerank_calibration_info{model,id} 1` is published at startup (`id="none"` when the model has no file).
+- **Refit whenever the model file or the ONNX Runtime version changes**, with logits scored by the serving build (same quantization, same ORT, same CPU architecture). Logits differ by about 0.4 between runtimes on the same bytes, which moves every threshold crossing. Fit on paired logits of the old and new model over real traffic; a quantile map (matching quantiles of the new logits to quantiles of the old, about 200 knots) keeps the map strictly monotone. Do not ship an isotonic fit: it creates plateaus that tie documents.
+- Remove the file to roll back to raw sigmoid scores.
 
 ## Configuration
 
