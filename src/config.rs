@@ -3088,4 +3088,160 @@ mod env_fallback_tests {
             "blank values must not be counted as garbage:\n{out}"
         );
     }
+
+    /// A value of only separators (",,,", " , ,") is a quoting artefact
+    /// like a blank — nothing was parseable, but nothing was typed either,
+    /// so the fallback to defaults stays silent. The warn gate has two
+    /// conditions and both decide observable behaviour:
+    ///   - `&&` -> `||` counts ",,," as a typo;
+    ///   - `c != ','` -> `c == ','` suppresses the warn for real input
+    ///     without a comma (covered by the next test).
+    #[test]
+    fn warmup_batch_sizes_all_commas_falls_back_silently() {
+        let mut got = vec![];
+        let out = counted(|| got = parse_warmup_batch_sizes("W", Some(",,,"), &[2]));
+        assert_eq!(got, vec![2]);
+        assert!(
+            !out.contains("embed_config_fallback_total"),
+            "a value of only commas is a quoting artefact, not a typo:\n{out}"
+        );
+    }
+
+    /// The other half of that gate: a non-blank value with no valid
+    /// entries must be counted. `"0"` carries no comma, so the
+    /// `c != ','` -> `c == ','` mutation mutes the warn entirely.
+    #[test]
+    fn warmup_batch_sizes_all_invalid_counts_the_fallback() {
+        let mut got = vec![];
+        let out = counted(|| got = parse_warmup_batch_sizes("W", Some("0"), &[2]));
+        assert_eq!(got, vec![2]);
+        assert!(
+            out.contains("embed_config_fallback_total{env_var=\"W\"} 1"),
+            "a real value that cannot be used must be counted:\n{out}"
+        );
+    }
+
+    /// `EMBED_INTRA_THREADS=0` is unusable — 0 would mean ORT auto-select,
+    /// but the session pool expects an explicit count — so it falls back
+    /// to 2, while a valid value passes through. Asserted on the `Config`
+    /// field itself so the whole `from_env` line is covered.
+    ///
+    /// RED-proven: `raw == 0` -> `raw != 0` turns "0" into 0 and "5" into 2.
+    #[test]
+    #[serial_test::serial]
+    fn from_env_intra_threads_zero_falls_back_to_two() {
+        // Vars whose bad values abort startup; cleared so an ambient CI
+        // env cannot fail the parse for an unrelated reason.
+        const HARD_VARS: &[&str] = &[
+            "EMBED_PORT",
+            "EMBED_MODELS",
+            "EMBED_DEFAULT_MODEL",
+            "EMBED_INTRA_THREADS",
+            "RERANKER_MODELS",
+            "SPLADE_MODELS",
+            "EMBED_INPUT_PREFIX_PROBE_MDL",
+            "BATCH_MAX_SEQ_PROBE_MDL",
+            "EMBED_WARMUP_SEQ_LEN_PROBE_MDL",
+            "EMBED_MEMORY_PATTERN_PROBE_MDL",
+        ];
+        let saved: Vec<(&str, Option<String>)> = HARD_VARS
+            .iter()
+            .map(|k| {
+                let prev = env::var(k).ok();
+                unsafe { env::remove_var(k) };
+                (*k, prev)
+            })
+            .collect();
+        unsafe { env::set_var("EMBED_MODELS", "probe-mdl:/models:8:64:0:false") };
+
+        unsafe { env::set_var("EMBED_INTRA_THREADS", "0") };
+        let zero = Config::from_env().map(|c| c.intra_threads);
+        unsafe { env::set_var("EMBED_INTRA_THREADS", "5") };
+        let five = Config::from_env().map(|c| c.intra_threads);
+
+        for (k, prev) in saved {
+            unsafe {
+                match prev {
+                    Some(v) => env::set_var(k, v),
+                    None => env::remove_var(k),
+                }
+            }
+        }
+
+        assert_eq!(
+            zero.expect("from_env with EMBED_INTRA_THREADS=0"),
+            2,
+            "0 is unusable: the pool needs an explicit count"
+        );
+        assert_eq!(
+            five.expect("from_env with EMBED_INTRA_THREADS=5"),
+            5,
+            "a valid override must pass through, not fall back to 2"
+        );
+    }
+
+    /// The per-model `BATCH_MAX_SEQ_<KEY>` override announces itself with
+    /// exactly one info line — only when the resolved value differs from
+    /// the global. `!=` -> `==` at that gate would log an override that is
+    /// not there and stay silent for one that is.
+    ///
+    /// RED-proven: the mutant fails both assertions below.
+    #[test]
+    #[serial_test::serial]
+    fn per_model_batch_max_seq_logs_only_on_a_real_override() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct LogBuf(Arc<Mutex<Vec<u8>>>);
+        impl Write for LogBuf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("log buf").write(b)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.0.lock().expect("log buf").flush()
+            }
+        }
+
+        const VAR: &str = "BATCH_MAX_SEQ_LOG_PROBE";
+        let prev = env::var(VAR).ok();
+        let entry = "log-probe:/models:8:64:0:false";
+
+        // Parse under a subscriber capturing INFO lines, with VAR set to
+        // `raw` (None = unset, so the resolved value equals the global).
+        let run = |raw: Option<&str>| -> String {
+            match raw {
+                Some(v) => unsafe { env::set_var(VAR, v) },
+                None => unsafe { env::remove_var(VAR) },
+            }
+            let buf = LogBuf(Arc::new(Mutex::new(Vec::new())));
+            let writer = buf.clone();
+            let sub = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .without_time()
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(sub, || {
+                parse_one_model(entry, 256, None).expect("valid model entry")
+            });
+            String::from_utf8(buf.0.lock().expect("log buf").clone()).expect("utf8 logs")
+        };
+
+        let differing = run(Some("128"));
+        let equal = run(None);
+        match prev {
+            Some(v) => unsafe { env::set_var(VAR, v) },
+            None => unsafe { env::remove_var(VAR) },
+        }
+
+        assert!(
+            differing.contains("per-model BATCH_MAX_SEQ override"),
+            "an override differing from the global must be logged:\n{differing}"
+        );
+        assert!(
+            !equal.contains("per-model BATCH_MAX_SEQ override"),
+            "no override must not log one:\n{equal}"
+        );
+    }
 }

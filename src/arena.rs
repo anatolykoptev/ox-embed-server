@@ -815,4 +815,27 @@ mod tests {
         drop(guard);
         assert_eq!(cfg.max_dead_bytes, 64 * 1024 * 1024);
     }
+
+    // -----------------------------------------------------------------
+    // parse_intra_op_spinning — the env-reading wrapper. The pure `_from`
+    // half is exercised through flag() tests; a whole-function return-const
+    // mutant (`-> true` / `-> false`) skips the env read entirely, so the
+    // knob's own name must be asserted end to end.
+    // -----------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn intra_op_spinning_reads_env() {
+        let guard = EnvGuard::new(&["ORT_INTRA_OP_SPINNING"]);
+        assert!(
+            !parse_intra_op_spinning(),
+            "unset must keep spinning off (shared host)"
+        );
+        guard.set("ORT_INTRA_OP_SPINNING", "1");
+        assert!(parse_intra_op_spinning(), "1 opts into spinning");
+        guard.set("ORT_INTRA_OP_SPINNING", "0");
+        assert!(!parse_intra_op_spinning(), "explicit 0 stays off");
+        guard.set("ORT_INTRA_OP_SPINNING", "perhaps");
+        assert!(!parse_intra_op_spinning(), "garbage keeps the safe default");
+    }
 }

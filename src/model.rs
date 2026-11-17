@@ -1172,7 +1172,7 @@ fn build_one_session(
 mod seq_pad_tests {
     use super::{
         DEFAULT_SUBBATCH_RATIO, parse_batch_invariant, parse_subbatch_ratio, plan_request,
-        plan_subbatches,
+        plan_subbatches, resolve_batch_invariant, resolve_subbatch_ratio,
     };
     use crate::pool::{SEQ_PAD_MULTIPLE, round_up_seq_len};
 
@@ -1322,6 +1322,99 @@ mod seq_pad_tests {
         assert_eq!(
             parse_subbatch_ratio(Some("NaN"), "T"),
             DEFAULT_SUBBATCH_RATIO
+        );
+    }
+
+    /// Save/restore of env vars around an env-mutating test, same pattern
+    /// as `opt_level_tests::with_env` but for a fixed set of keys.
+    fn saved_env(vars: &[&str]) -> Vec<(String, Option<String>)> {
+        vars.iter()
+            .map(|k| (k.to_string(), std::env::var(k).ok()))
+            .collect()
+    }
+
+    fn restore_env(saved: Vec<(String, Option<String>)>) {
+        for (k, prev) in saved {
+            unsafe {
+                match prev {
+                    Some(v) => std::env::set_var(&k, v),
+                    None => std::env::remove_var(&k),
+                }
+            }
+        }
+    }
+
+    /// `resolve_batch_invariant` reads the env itself: per-model var first,
+    /// then the global, then off. A return-const mutant (`-> Ok(true)` /
+    /// `-> Ok(false)`) survives every test that only exercises the pure
+    /// `parse_batch_invariant`, so the env path is asserted end to end.
+    #[test]
+    #[serial_test::serial]
+    fn batch_invariant_env_resolution_per_model_then_global() {
+        const PER: &str = "EMBED_BATCH_INVARIANT_BINV_PROBE";
+        const GLOBAL: &str = "EMBED_BATCH_INVARIANT";
+        let saved = saved_env(&[PER, GLOBAL]);
+
+        unsafe {
+            std::env::remove_var(PER);
+            std::env::remove_var(GLOBAL);
+        }
+        let unset = resolve_batch_invariant("binv-probe");
+
+        unsafe { std::env::set_var(GLOBAL, "1") };
+        let global_on = resolve_batch_invariant("binv-probe");
+
+        unsafe { std::env::set_var(PER, "0") };
+        let per_model_off = resolve_batch_invariant("binv-probe");
+
+        unsafe { std::env::set_var(PER, "yes") };
+        let garbage = resolve_batch_invariant("binv-probe");
+
+        restore_env(saved);
+
+        assert_eq!(unset, Ok(false), "unset must default to off");
+        assert_eq!(global_on, Ok(true), "the global var must apply");
+        assert_eq!(
+            per_model_off,
+            Ok(false),
+            "per-model 0 must override global 1"
+        );
+        assert!(
+            garbage.is_err(),
+            "an unparseable value is an error, not a quiet default"
+        );
+    }
+
+    /// `resolve_subbatch_ratio`'s per-model var must win over the global.
+    /// The `!r.trim().is_empty()` filter is what decides whether a SET
+    /// per-model value is read at all: deleting the `!` makes a real value
+    /// invisible (falls through to the global) and treats whitespace as a
+    /// value (falls back to the default, skipping the global).
+    #[test]
+    #[serial_test::serial]
+    fn per_model_subbatch_ratio_wins_over_global() {
+        const PER: &str = "EMBED_SUBBATCH_RATIO_RATIO_PROBE";
+        const GLOBAL: &str = "EMBED_SUBBATCH_RATIO";
+        let saved = saved_env(&[PER, GLOBAL]);
+
+        unsafe {
+            std::env::set_var(PER, "3.0");
+            std::env::remove_var(GLOBAL);
+        }
+        let per_only = resolve_subbatch_ratio("ratio-probe");
+
+        unsafe {
+            std::env::set_var(PER, "   ");
+            std::env::set_var(GLOBAL, "4.0");
+        }
+        let blank_per_falls_to_global = resolve_subbatch_ratio("ratio-probe");
+
+        restore_env(saved);
+
+        assert_eq!(per_only, 3.0, "a set per-model ratio must be honoured");
+        assert_eq!(
+            blank_per_falls_to_global, 4.0,
+            "a blank per-model value falls through to the global exactly like unset"
         );
     }
 

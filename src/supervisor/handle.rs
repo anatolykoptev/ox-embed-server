@@ -2527,4 +2527,29 @@ mod tests {
             own_nice()
         );
     }
+
+    /// `own_priority` must read the real process nice — `apply_nice`'s
+    /// clamp is only as good as the value it clamps against. `-> 0` is
+    /// invisible on a nice-0 runner (CI), so this test first raises its
+    /// own nice: raising is unprivileged (only LOWERING needs
+    /// CAP_SYS_NICE), and nextest runs each test in its own process, so
+    /// the raise cannot leak into a sibling test.
+    ///
+    /// RED-proven: `own_priority -> 0` fails the final assertion with
+    /// 0 != raised.
+    #[test]
+    #[serial]
+    fn own_priority_reports_raised_nice() {
+        let before = own_nice();
+        // Same shape as `distinct_nice()`: pick a value strictly above the
+        // current nice (a lower priority), which never needs CAP_SYS_NICE.
+        let raised = if before >= 10 { 19 } else { 10 };
+        let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS as _, 0, raised) };
+        assert_eq!(rc, 0, "raising own nice to {raised} needs no privilege");
+        assert_eq!(
+            own_priority(),
+            raised,
+            "own_priority must report the process's real nice"
+        );
+    }
 }
