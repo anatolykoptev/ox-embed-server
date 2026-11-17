@@ -79,6 +79,10 @@ fn spawn(
         )
         .env("ORT_DYLIB_PATH", &env.ort)
         .env("BATCHING_ENABLED", "false")
+        .env(
+            common::WORKER_SOCKET_WAIT_SECS.0,
+            common::WORKER_SOCKET_WAIT_SECS.1,
+        )
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .process_group(0)
@@ -136,11 +140,15 @@ fn assert_calibrated(tag: &str, multi_process: bool) {
     };
     let dir = rerank_dir(&env, tag, Some(&shift_file()));
     let (child, base) = spawn(&env, tag, multi_process, &dir);
-    let _guard = common::ChildGuard {
+    let mut guard = common::ChildGuard {
         child: Some(child),
         socket: dir.join("__noop__"),
     };
-    common::wait_healthy(&base, Duration::from_secs(90));
+    common::wait_healthy(
+        &base,
+        Duration::from_secs(90),
+        guard.child.as_mut().expect("child just stored"),
+    );
 
     let raw = rerank(&base, Some("none"));
     assert!(
@@ -186,11 +194,15 @@ fn missing_calibration_file_serves_identity() {
     };
     let dir = rerank_dir(&env, "cal-none", None);
     let (child, base) = spawn(&env, "cal-none", true, &dir);
-    let _guard = common::ChildGuard {
+    let mut guard = common::ChildGuard {
         child: Some(child),
         socket: dir.join("__noop__"),
     };
-    common::wait_healthy(&base, Duration::from_secs(90));
+    common::wait_healthy(
+        &base,
+        Duration::from_secs(90),
+        guard.child.as_mut().expect("child just stored"),
+    );
 
     let raw = by_index(&rerank(&base, Some("none")));
     let served = rerank(&base, None);
