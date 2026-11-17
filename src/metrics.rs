@@ -246,6 +246,39 @@ pub fn stamp_build_info(version: &str) {
     .set(1.0);
 }
 
+/// Publish `embed_rerank_calibration_info{model,id} 1` for one reranker at
+/// startup. `id` is the calibration file's id, or `none` when the model serves
+/// uncalibrated scores — so "which fit is live" is one query, and a swapped
+/// model without its fit shows up as `none`.
+pub fn set_rerank_calibration_info(model: &str, id: Option<&str>) {
+    metrics::gauge!(
+        "embed_rerank_calibration_info",
+        "model" => model.to_string(),
+        "id" => id.unwrap_or("none").to_string(),
+    )
+    .set(1.0);
+}
+
+/// Pre-touch `embed_rerank_calibration_fallback_total{model}` to 0 at startup,
+/// so "no overflow" is distinguishable from "the counter was never wired".
+pub fn touch_rerank_calibration_fallback(model: &str) {
+    metrics::counter!(
+        "embed_rerank_calibration_fallback_total",
+        "model" => model.to_string(),
+    )
+    .absolute(0);
+}
+
+/// Count logits left uncalibrated because the map overflowed to a non-finite
+/// value (extrapolation far past the end knots). Should stay 0.
+pub fn record_rerank_calibration_fallback(model: &str, n: usize) {
+    metrics::counter!(
+        "embed_rerank_calibration_fallback_total",
+        "model" => model.to_string(),
+    )
+    .increment(n as u64);
+}
+
 /// Record a completed request.
 pub fn record_request(model: &str, status: &str, duration: Duration, texts: usize) {
     metrics::counter!(
@@ -2353,6 +2386,66 @@ mod memory_budget_gauge_tests {
         assert!(
             out.contains("embed_ready_probe_total{result=\"workers_down\"} 0"),
             "{out}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod rerank_calibration_metric_tests {
+    use super::{
+        record_rerank_calibration_fallback, set_rerank_calibration_info, test_prometheus_handle,
+        touch_rerank_calibration_fallback,
+    };
+
+    /// Value of the series `name` whose label set contains every `labels` entry.
+    fn series(rendered: &str, name: &str, labels: &[&str]) -> Option<f64> {
+        rendered
+            .lines()
+            .filter(|l| l.starts_with(name) && l[name.len()..].starts_with('{'))
+            .find(|l| labels.iter().all(|x| l.contains(x)))
+            .and_then(|l| l.rsplit(' ').next())
+            .and_then(|v| v.parse().ok())
+    }
+
+    #[test]
+    fn calibration_info_gauge_carries_model_and_id() {
+        let handle = test_prometheus_handle();
+        set_rerank_calibration_info("t_cal_a", Some("fit-1"));
+        set_rerank_calibration_info("t_cal_b", None);
+        let r = handle.render();
+        let n = "embed_rerank_calibration_info";
+        assert_eq!(
+            series(&r, n, &["model=\"t_cal_a\"", "id=\"fit-1\""]),
+            Some(1.0)
+        );
+        assert_eq!(
+            series(&r, n, &["model=\"t_cal_b\"", "id=\"none\""]),
+            Some(1.0),
+            "a model without a file publishes id=none"
+        );
+    }
+
+    #[test]
+    fn calibration_fallback_counter_is_pretouched_then_increments_per_model() {
+        let handle = test_prometheus_handle();
+        let n = "embed_rerank_calibration_fallback_total";
+        touch_rerank_calibration_fallback("t_fb_a");
+        touch_rerank_calibration_fallback("t_fb_b");
+        let r = handle.render();
+        assert_eq!(
+            series(&r, n, &["model=\"t_fb_a\""]),
+            Some(0.0),
+            "pre-touch publishes 0"
+        );
+
+        record_rerank_calibration_fallback("t_fb_a", 2);
+        record_rerank_calibration_fallback("t_fb_a", 3);
+        let r = handle.render();
+        assert_eq!(series(&r, n, &["model=\"t_fb_a\""]), Some(5.0));
+        assert_eq!(
+            series(&r, n, &["model=\"t_fb_b\""]),
+            Some(0.0),
+            "another model must stay at zero"
         );
     }
 }
