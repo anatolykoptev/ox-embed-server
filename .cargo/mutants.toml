@@ -62,8 +62,10 @@ examine_globs = [
     # IPC client: deadline / framing / error mapping against an in-process
     # UDS peer, no model needed.
     "src/ipc/client.rs",
+    "src/healthcheck.rs",
     "src/ipc/frame.rs",
     "src/ipc/protocol.rs",
+    "src/mem_budget.rs",
     "src/metrics.rs",
     "src/model.rs",
     "src/model_reranker/*.rs",
@@ -147,6 +149,8 @@ additional_cargo_test_args = [
     "multi_process_splade_e2e",
     "--test",
     "supervisor_dispatch",
+    "--test",
+    "healthcheck_cli",
 ]
 
 # --locked mirrors every other gate in this repo: a mutation run that quietly
