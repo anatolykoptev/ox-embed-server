@@ -495,6 +495,7 @@ async fn main() {
             ),
         }
         metrics::set_rerank_calibration_info(&def.name, cal.as_ref().map(|c| c.id()));
+        metrics::touch_rerank_calibration_fallback(&def.name);
         reranker_calibrations.insert(def.name.clone(), cal);
     }
     if !cfg.multi_process {
