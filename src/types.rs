@@ -68,6 +68,9 @@ pub struct RerankerEntry {
     /// back to a direct `spawn_blocking(score_pairs)` call.
     #[allow(dead_code)] // consumed by /v1/rerank handler (E3)
     pub batcher: Option<Arc<DynamicBatcher>>,
+    /// Optional logit-space calibration from `<model dir>/calibration.json`.
+    /// `None` = identity. Applied before the sigmoid, in both modes.
+    pub calibration: Option<Arc<crate::calibration::Calibration>>,
 }
 
 impl RerankerEntry {
@@ -331,6 +334,7 @@ mod tests {
         let entry = RerankerEntry {
             model: None,
             batcher: None,
+            calibration: None,
         };
         assert!(
             entry.model.is_none(),
@@ -373,6 +377,7 @@ mod tests {
         let entry = RerankerEntry {
             model: None,
             batcher: None,
+            calibration: None,
         };
         let _ = entry.require_model();
     }

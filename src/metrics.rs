@@ -246,6 +246,19 @@ pub fn stamp_build_info(version: &str) {
     .set(1.0);
 }
 
+/// Publish `embed_rerank_calibration_info{model,id} 1` for one reranker at
+/// startup. `id` is the calibration file's id, or `none` when the model serves
+/// uncalibrated scores — so "which fit is live" is one query, and a swapped
+/// model without its fit shows up as `none`.
+pub fn set_rerank_calibration_info(model: &str, id: Option<&str>) {
+    metrics::gauge!(
+        "embed_rerank_calibration_info",
+        "model" => model.to_string(),
+        "id" => id.unwrap_or("none").to_string(),
+    )
+    .set(1.0);
+}
+
 /// Record a completed request.
 pub fn record_request(model: &str, status: &str, duration: Duration, texts: usize) {
     metrics::counter!(

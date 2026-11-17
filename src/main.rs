@@ -6,6 +6,7 @@ mod arena;
 mod batcher;
 mod cache;
 mod cache_flow;
+mod calibration;
 mod config;
 mod drain;
 mod evictable_pool;
@@ -467,6 +468,35 @@ async fn main() {
     // When EMBED_MULTI_PROCESS=1, reranker sessions are skipped (worker
     // handles inference); metadata-only entries keep the name lookup working.
     let mut reranker_entries: HashMap<String, RerankerEntry> = HashMap::new();
+    // Per-model score calibration (`<dir>/calibration.json`), loaded in the
+    // supervisor in both modes: it is applied to the scores the worker (or the
+    // in-process session) returns, so workers never see it. An invalid file
+    // aborts startup — a silent identity would serve uncalibrated scores.
+    let mut reranker_calibrations: HashMap<String, Option<Arc<calibration::Calibration>>> =
+        HashMap::new();
+    for def in &cfg.rerankers {
+        let cal = match calibration::Calibration::load_from_dir(std::path::Path::new(&def.dir)) {
+            Ok(c) => c.map(Arc::new),
+            Err(e) => {
+                eprintln!("reranker '{}': {e}", def.name);
+                std::process::exit(1);
+            }
+        };
+        match &cal {
+            Some(c) => tracing::info!(
+                reranker = %def.name,
+                calibration_id = c.id(),
+                knots = c.len(),
+                "reranker score calibration loaded"
+            ),
+            None => tracing::info!(
+                reranker = %def.name,
+                "no calibration.json; reranker scores are uncalibrated"
+            ),
+        }
+        metrics::set_rerank_calibration_info(&def.name, cal.as_ref().map(|c| c.id()));
+        reranker_calibrations.insert(def.name.clone(), cal);
+    }
     if !cfg.multi_process {
         for def in &cfg.rerankers {
             tracing::info!(reranker = %def.name, dir = %def.dir, "loading reranker");
@@ -531,6 +561,7 @@ async fn main() {
                 RerankerEntry {
                     model: Some(model_arc),
                     batcher,
+                    calibration: reranker_calibrations.get(&def.name).cloned().flatten(),
                 },
             );
         }
@@ -542,6 +573,7 @@ async fn main() {
                 RerankerEntry {
                     model: None,
                     batcher: None,
+                    calibration: reranker_calibrations.get(&def.name).cloned().flatten(),
                 },
             );
         }

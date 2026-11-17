@@ -184,7 +184,30 @@ pub struct RerankResponse {
     /// correlated across distributed traces.
     pub id: String,
     pub model: String,
+    /// Id of the calibration applied to `relevance_score` (additive field).
+    /// Absent when the model has no `calibration.json`, or when the request
+    /// asked for raw logits (`"normalize":"none"`) — then nothing was applied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calibration: Option<String>,
     pub results: Vec<RerankResult>,
+}
+
+/// Map raw logits through the model's calibration, immediately before
+/// `apply_normalize`. Sigmoid mode only: `NormalizeMode::None` is the raw-logit
+/// contract and must come back untouched. Returns the calibration id when the
+/// map was applied, for the response field.
+pub(crate) fn calibrate_scores(
+    scores: &mut [f32],
+    mode: NormalizeMode,
+    calibration: Option<&crate::calibration::Calibration>,
+) -> Option<String> {
+    match (mode, calibration) {
+        (NormalizeMode::Sigmoid, Some(c)) => {
+            c.apply(scores);
+            Some(c.id().to_string())
+        }
+        _ => None,
+    }
 }
 
 /// Pure sort+truncate: zip scores with positional indices, sort by
@@ -421,6 +444,11 @@ pub async fn rerank(
         match resp {
             Ok(crate::ipc::protocol::WorkerResponse::Rerank(r)) => {
                 let mut scores = r.scores;
+                let calibration = calibrate_scores(
+                    &mut scores,
+                    normalize.unwrap_or_default(),
+                    entry.calibration.as_deref(),
+                );
                 apply_normalize(&mut scores, normalize.unwrap_or_default());
                 let echo_docs: Option<&[String]> = if return_documents {
                     Some(&documents)
@@ -431,6 +459,7 @@ pub async fn rerank(
                 let response = Json(RerankResponse {
                     id: opaque_request_id(),
                     model: model_name.clone(),
+                    calibration,
                     results,
                 })
                 .into_response();
@@ -565,6 +594,11 @@ pub async fn rerank(
     // G2-server: apply optional score normalization before sort. Sigmoid
     // is monotonic so sort order is preserved — safe to run pre-sort.
     let mut scores = scores;
+    let calibration = calibrate_scores(
+        &mut scores,
+        normalize.unwrap_or_default(),
+        entry.calibration.as_deref(),
+    );
     apply_normalize(&mut scores, normalize.unwrap_or_default());
 
     let echo_docs: Option<&[String]> = if return_documents {
@@ -577,6 +611,7 @@ pub async fn rerank(
     let response = Json(RerankResponse {
         id: opaque_request_id(),
         model: model_name.clone(),
+        calibration,
         results,
     })
     .into_response();
@@ -952,6 +987,42 @@ mod tests {
     // -----------------------------------------------------------------
 
     #[test]
+    fn calibrate_scores_sigmoid_maps_and_names_the_fit() {
+        let cal = crate::calibration::Calibration::new(
+            "fit-x".into(),
+            vec![-10.0, 10.0],
+            vec![-7.0, 13.0],
+        )
+        .unwrap();
+        let mut scores = [0.0_f32, 2.0];
+        let id = calibrate_scores(&mut scores, NormalizeMode::Sigmoid, Some(&cal));
+        assert_eq!(id.as_deref(), Some("fit-x"));
+        assert_eq!(scores, [3.0, 5.0]);
+    }
+
+    #[test]
+    fn calibrate_scores_none_mode_returns_raw_logits_untouched() {
+        let cal = crate::calibration::Calibration::new(
+            "fit-x".into(),
+            vec![-10.0, 10.0],
+            vec![-7.0, 13.0],
+        )
+        .unwrap();
+        let mut scores = [0.0_f32, 2.0];
+        let id = calibrate_scores(&mut scores, NormalizeMode::None, Some(&cal));
+        assert_eq!(id, None, "no calibration applied, none claimed");
+        assert_eq!(scores, [0.0, 2.0]);
+    }
+
+    #[test]
+    fn calibrate_scores_without_calibration_is_identity() {
+        let mut scores = [0.0_f32, 2.0];
+        let id = calibrate_scores(&mut scores, NormalizeMode::Sigmoid, None);
+        assert_eq!(id, None);
+        assert_eq!(scores, [0.0, 2.0]);
+    }
+
+    #[test]
     fn apply_normalize_none_is_identity() {
         let mut scores = vec![-15.0, -1.0, 0.0, 1.0, 15.0];
         apply_normalize(&mut scores, NormalizeMode::None);
@@ -1242,6 +1313,7 @@ mod tests {
                 crate::types::RerankerEntry {
                     model: None,
                     batcher: None,
+                    calibration: None,
                 },
             )]),
             splades: HashMap::new(),
