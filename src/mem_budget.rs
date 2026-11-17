@@ -171,6 +171,7 @@ fn report(budget: &Budget) {
 
 /// Run the check once at startup. Never fails and never blocks startup.
 pub fn check_at_startup(model_names: &[String], multi_process: bool) {
+    // env-raw: parsed by collect_ceilings / headroom_from; advisory check, never blocks startup
     let get = |k: &str| std::env::var(k).ok();
     let budget = Budget {
         ceilings: collect_ceilings(model_names, multi_process, &get),

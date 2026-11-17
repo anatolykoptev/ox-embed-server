@@ -63,12 +63,14 @@ pub fn probe(addr: SocketAddr, path: &str, timeout: Duration) -> Result<(), Stri
 
 /// Entry point for the `healthcheck` subcommand; returns the process exit code.
 pub fn run() -> i32 {
+    // env-raw: the probe runs in a bare subprocess with no metrics; an unusable port falls back to 8082 by design
     let port: u16 = std::env::var("EMBED_PORT")
         .ok()
         .and_then(|p| p.trim().parse().ok())
         .unwrap_or(8082);
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let budget = probe_budget(
+        // env-raw: parsed and clamped by probe_budget; the probe subprocess has no metrics sink
         std::env::var("EMBED_READY_PROBE_TIMEOUT_MS")
             .ok()
             .as_deref(),
