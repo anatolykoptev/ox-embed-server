@@ -42,6 +42,8 @@ pub struct Calibration {
     id: String,
     xs: Vec<f64>,
     ys: Vec<f64>,
+    /// `slopes[i]` is the slope of segment `[i, i+1]`: finite and > 0, checked at load.
+    slopes: Vec<f64>,
 }
 
 impl Calibration {
@@ -69,10 +71,28 @@ impl Calibration {
                 i + 1
             ));
         }
-        if let Some(i) = ys.windows(2).position(|w| w[1] < w[0]) {
-            return Err(format!("knots_y decreasing at index {}", i + 1));
+        // Strictly increasing: a flat segment would tie documents the model ranks apart.
+        if let Some(i) = ys.windows(2).position(|w| w[1] <= w[0]) {
+            return Err(format!(
+                "knots_y not strictly increasing at index {}",
+                i + 1
+            ));
         }
-        Ok(Self { id, xs, ys })
+        // Finite knots can still overflow in the arithmetic: reject any segment
+        // whose rise or slope is not finite, so evaluation cannot create NaN/inf.
+        let mut slopes = Vec::with_capacity(xs.len() - 1);
+        for i in 0..xs.len() - 1 {
+            let (dx, dy) = (xs[i + 1] - xs[i], ys[i + 1] - ys[i]);
+            let slope = dy / dx;
+            if !dy.is_finite() || !dx.is_finite() || !slope.is_finite() || slope <= 0.0 {
+                return Err(format!(
+                    "segment {i}..{} has a non-finite or non-positive slope",
+                    i + 1
+                ));
+            }
+            slopes.push(slope);
+        }
+        Ok(Self { id, xs, ys, slopes })
     }
 
     /// Identifier of the fit, surfaced in responses and metrics.
@@ -86,7 +106,9 @@ impl Calibration {
     }
 
     /// Map one logit. Linear between knots, linear extrapolation from the end
-    /// segments. NaN passes through.
+    /// segments. NaN passes through. A finite input can still overflow when it
+    /// is extrapolated far past the end knots; the result may then be non-finite
+    /// (see `apply` for the policy).
     pub fn map(&self, x: f64) -> f64 {
         if x.is_nan() {
             return x;
@@ -94,16 +116,27 @@ impl Calibration {
         let n = self.xs.len();
         // Segment [i-1, i] containing x; clamp so ends reuse the edge segment.
         let i = self.xs.partition_point(|&k| k <= x).clamp(1, n - 1);
-        let (x0, x1) = (self.xs[i - 1], self.xs[i]);
-        let (y0, y1) = (self.ys[i - 1], self.ys[i]);
-        y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+        self.ys[i - 1] + self.slopes[i - 1] * (x - self.xs[i - 1])
     }
 
-    /// Calibrate a slice of logits in place.
-    pub fn apply(&self, scores: &mut [f32]) {
+    /// Calibrate a slice of logits in place. Policy: a finite logit whose
+    /// calibrated value is not finite as f32 (extrapolation overflow) is left
+    /// as the raw logit, and counted in the return value so the caller can
+    /// export it. Non-finite inputs pass through. Returns the fallback count.
+    pub fn apply(&self, scores: &mut [f32]) -> usize {
+        let mut fallbacks = 0;
         for s in scores.iter_mut() {
-            *s = self.map(f64::from(*s)) as f32;
+            if !s.is_finite() {
+                continue;
+            }
+            let y = self.map(f64::from(*s)) as f32;
+            if y.is_finite() {
+                *s = y;
+            } else {
+                fallbacks += 1;
+            }
         }
+        fallbacks
     }
 
     /// Load `<dir>/calibration.json`. `Ok(None)` when the file does not exist;
@@ -179,7 +212,7 @@ mod tests {
     fn apply_maps_each_score_in_place() {
         let c = cal(&[0.0, 1.0], &[10.0, 12.0]);
         let mut s = [0.0_f32, 0.5, 1.0];
-        c.apply(&mut s);
+        assert_eq!(c.apply(&mut s), 0);
         assert_eq!(s, [10.0, 11.0, 12.0]);
     }
 
@@ -196,6 +229,7 @@ mod tests {
             ),
             (vec![1.0, 0.0], ok_y.clone(), "x decreasing"),
             (vec![0.0, 1.0], vec![1.0, 0.0], "y decreasing"),
+            (vec![0.0, 1.0], vec![1.0, 1.0], "y flat"),
             (vec![0.0, f64::NAN], ok_y.clone(), "NaN x"),
             (vec![0.0, 1.0], vec![0.0, f64::INFINITY], "inf y"),
         ];
@@ -209,8 +243,38 @@ mod tests {
     }
 
     #[test]
-    fn new_allows_flat_y_segments() {
-        assert!(Calibration::new("t".into(), vec![0.0, 1.0, 2.0], vec![0.0, 0.0, 1.0]).is_ok());
+    fn new_rejects_flat_y_segments() {
+        assert!(
+            Calibration::new("t".into(), vec![0.0, 1.0, 2.0], vec![0.0, 0.0, 1.0]).is_err(),
+            "y1 == y0 must be rejected: strict monotonicity"
+        );
+    }
+
+    #[test]
+    fn new_rejects_overflowing_rise() {
+        // y1 - y0 overflows to inf; evaluating at x0 would give inf * 0 = NaN.
+        assert!(Calibration::new("t".into(), vec![0.0, 1.0], vec![-1e308, 1e308]).is_err());
+    }
+
+    #[test]
+    fn new_rejects_infinite_slope() {
+        // dx is subnormal, so the slope overflows to inf.
+        assert!(Calibration::new("t".into(), vec![0.0, 1e-320], vec![0.0, 1.0]).is_err());
+    }
+
+    #[test]
+    fn apply_falls_back_to_raw_logit_when_extrapolation_overflows() {
+        // Valid: slope 1e37 is finite. A far logit extrapolates past f32::MAX.
+        let c = cal(&[0.0, 1.0], &[0.0, 1e37]);
+        let mut s = [0.5_f32, 100.0, f32::NAN];
+        let fb = c.apply(&mut s);
+        assert_eq!(fb, 1, "only the overflowing logit falls back");
+        assert_eq!(s[1], 100.0, "raw logit kept");
+        assert!(
+            s[0].is_finite() && s[0] != 0.5,
+            "in-range logit still mapped"
+        );
+        assert!(s[2].is_nan(), "NaN passes through untouched");
     }
 
     #[test]

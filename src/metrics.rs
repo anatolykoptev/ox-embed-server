@@ -259,6 +259,16 @@ pub fn set_rerank_calibration_info(model: &str, id: Option<&str>) {
     .set(1.0);
 }
 
+/// Count logits left uncalibrated because the map overflowed to a non-finite
+/// value (extrapolation far past the end knots). Should stay 0.
+pub fn record_rerank_calibration_fallback(model: &str, n: usize) {
+    metrics::counter!(
+        "embed_rerank_calibration_fallback_total",
+        "model" => model.to_string(),
+    )
+    .increment(n as u64);
+}
+
 /// Record a completed request.
 pub fn record_request(model: &str, status: &str, duration: Duration, texts: usize) {
     metrics::counter!(

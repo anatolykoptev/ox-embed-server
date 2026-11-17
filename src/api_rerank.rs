@@ -197,13 +197,18 @@ pub struct RerankResponse {
 /// contract and must come back untouched. Returns the calibration id when the
 /// map was applied, for the response field.
 pub(crate) fn calibrate_scores(
+    model: &str,
     scores: &mut [f32],
     mode: NormalizeMode,
     calibration: Option<&crate::calibration::Calibration>,
 ) -> Option<String> {
     match (mode, calibration) {
         (NormalizeMode::Sigmoid, Some(c)) => {
-            c.apply(scores);
+            let fallbacks = c.apply(scores);
+            if fallbacks > 0 {
+                tracing::warn!(model, fallbacks, "calibration overflowed; raw logits kept");
+                metrics::record_rerank_calibration_fallback(model, fallbacks);
+            }
             Some(c.id().to_string())
         }
         _ => None,
@@ -445,6 +450,7 @@ pub async fn rerank(
             Ok(crate::ipc::protocol::WorkerResponse::Rerank(r)) => {
                 let mut scores = r.scores;
                 let calibration = calibrate_scores(
+                    &model_name,
                     &mut scores,
                     normalize.unwrap_or_default(),
                     entry.calibration.as_deref(),
@@ -595,6 +601,7 @@ pub async fn rerank(
     // is monotonic so sort order is preserved — safe to run pre-sort.
     let mut scores = scores;
     let calibration = calibrate_scores(
+        &model_name,
         &mut scores,
         normalize.unwrap_or_default(),
         entry.calibration.as_deref(),
@@ -995,7 +1002,7 @@ mod tests {
         )
         .unwrap();
         let mut scores = [0.0_f32, 2.0];
-        let id = calibrate_scores(&mut scores, NormalizeMode::Sigmoid, Some(&cal));
+        let id = calibrate_scores("m", &mut scores, NormalizeMode::Sigmoid, Some(&cal));
         assert_eq!(id.as_deref(), Some("fit-x"));
         assert_eq!(scores, [3.0, 5.0]);
     }
@@ -1009,7 +1016,7 @@ mod tests {
         )
         .unwrap();
         let mut scores = [0.0_f32, 2.0];
-        let id = calibrate_scores(&mut scores, NormalizeMode::None, Some(&cal));
+        let id = calibrate_scores("m", &mut scores, NormalizeMode::None, Some(&cal));
         assert_eq!(id, None, "no calibration applied, none claimed");
         assert_eq!(scores, [0.0, 2.0]);
     }
@@ -1017,7 +1024,7 @@ mod tests {
     #[test]
     fn calibrate_scores_without_calibration_is_identity() {
         let mut scores = [0.0_f32, 2.0];
-        let id = calibrate_scores(&mut scores, NormalizeMode::Sigmoid, None);
+        let id = calibrate_scores("m", &mut scores, NormalizeMode::Sigmoid, None);
         assert_eq!(id, None);
         assert_eq!(scores, [0.0, 2.0]);
     }
