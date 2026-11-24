@@ -115,3 +115,7 @@ release-please on push to `main`. Conventional commits → auto PR + tag. Do not
 - A cargo wrapper that shares ONE target dir across all worktrees of a repo (as on the shared build host), and cargo's mtime fingerprints do not tell worktrees apart: a build or test run can silently use another worktree's artifacts. Set `CARGO_TARGET_DIR` to a private dir when the result must be about YOUR tree.
 - Worker child process must call `arena::register_shared_cpu_arena()` before any `Session::builder()` — supervisor's registration doesn't carry across fork. (Handled in `src/bin/worker.rs`.)
 - Per-request UDS conn (not persistent pool) — see `docs/architecture/multi-process.md` for cancel-safety rationale.
+- Latency differs per model by a wide margin (multilingual-e5-large, 24 layers, is far slower than jina-code-v2 on a 4-core ARM CPU): alert and tune with per-model bands, never one threshold.
+- A `memory_pattern=true` model (e5, SPLADE, reranker defaults) must run `warmup()` in its loader, including every `Standalone*` loader in multi-process mode, or its arena ratchets to the cap. jina avoids this by running `memory_pattern=false`.
+- Do not enable the ONNX optimized-graph cache for e5-large (`ONNX_OPT_CACHE_DIR_MULTILINGUAL_E5_LARGE`, or the global `ONNX_OPT_CACHE_DIR`): its optimized graph fails Protobuf serialization (`src/onnx_cache.rs`).
+- Reranker latency is dominated by `max_len` (attention is O(seq²)): 256 is the sweet spot; benchmark with real document rows, never short synthetic strings.
