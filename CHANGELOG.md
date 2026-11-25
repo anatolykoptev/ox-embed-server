@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.10.0](https://github.com/anatolykoptev/ox-embed-server/compare/embed-server-v0.9.0...embed-server-v0.10.0) (2026-11-25)
+
+
+### Features
+
+* **embed:** opt-in e5 prefix and batch-invariant vectors (items 19, 20) ([#205](https://github.com/anatolykoptev/ox-embed-server/issues/205)) ([8088748](https://github.com/anatolykoptev/ox-embed-server/commit/808874891c267e35353f098e5e55b59058708739))
+* **rerank:** optional per-model score calibration from calibration.json ([#215](https://github.com/anatolykoptev/ox-embed-server/issues/215)) ([fc704fc](https://github.com/anatolykoptev/ox-embed-server/commit/fc704fc45cdaa23ac8b9567167cb8130c8bff807))
+
+
+### Bug Fixes
+
+* bound the embed path and drain until idle (tech-debt items 6, 7) ([#200](https://github.com/anatolykoptev/ox-embed-server/issues/200)) ([42ad235](https://github.com/anatolykoptev/ox-embed-server/commit/42ad23504f708087343c0cdb1f9f90fd58522813))
+* **container:** verified downloads, non-root user, real readiness, memory-budget check (tech-debt 13, 14, 16) ([#204](https://github.com/anatolykoptev/ox-embed-server/issues/204)) ([db60d7b](https://github.com/anatolykoptev/ox-embed-server/commit/db60d7b5b07a76543db08a83bc5ef64c71e2e12a))
+* **deps:** bump url to 2.5.9 (RUSTSEC-2026-0592) ([#220](https://github.com/anatolykoptev/ox-embed-server/issues/220)) ([cfa5a72](https://github.com/anatolykoptev/ox-embed-server/commit/cfa5a72af5edabecd0ec2f8b91e309c0e86ef749))
+
 ## [0.9.0](https://github.com/anatolykoptev/ox-embed-server/compare/embed-server-v0.8.5...embed-server-v0.9.0) (2026-11-15)
 
 
